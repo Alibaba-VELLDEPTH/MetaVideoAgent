@@ -1,0 +1,91 @@
+{
+  "artifact_type": "metavideoagent_runtime_abi_witness",
+  "schema_version": 1,
+  "runtime_dir": "execution/action_runtime",
+  "module_protocol_version": "metavideoagent_module_protocol",
+  "modules": {
+    "video_structuring": {
+      "base_class": "VideoStructuringBase",
+      "base_import": "from video_structuring_modules import VideoStructuringBase",
+      "methods": {
+        "__init__": "(self, workspace_dir, video_id, struct_type='', custom_config=None, requires_vector_db=False)",
+        "addStructure": "(self, **kwargs)",
+        "retrieveStructure": "(self, query='', start_sec=0.0, end_sec=None, top_k=5, **_kwargs)",
+        "_get_api_params": "(self, tool_name)"
+      }
+    },
+    "localization": {
+      "base_class": "LocalizationBase",
+      "base_import": "from localization_modules import LocalizationBase",
+      "methods": {
+        "__init__": "(self, env, struct_db=None, custom_config=None)",
+        "make_localization_result": "(self, tool_name, *, status, time_ranges=None, structure_records=None, perception_requests=None, evidence=None, error='', request=None)"
+      }
+    },
+    "perception": {
+      "base_class": "PerceptionBase",
+      "base_import": "from perception_modules import PerceptionBase",
+      "methods": {
+        "__init__": "(self, env, struct_db=None, custom_config=None)",
+        "make_perception_result": "(self, tool_name, *, status, time_ranges=None, evidence=None, error='', request=None)",
+        "_parse_time_ranges": "(self, value)"
+      }
+    },
+    "memory": {
+      "base_class": "WorkMemoryBase",
+      "base_import": "from memory_modules import WorkMemoryBase",
+      "methods": {
+        "__init__": "(self, workspace_dir, video_id, question, custom_config=None)",
+        "set_combo": "(self, combo)",
+        "update": "(self, *, thought, action, observation, execution_status='ok', error_code='', producer_module='', output_protocol='', output_contract_valid=None, evidence_event_ids=None, active_time_windows=None, tool_params_summary=None, tool_request=None, module_result=None)",
+        "get_context": "(self)",
+        "get_context_packet": "(self)",
+        "export_trajectory": "(self)",
+        "save_session": "(self, final_answer, steps)"
+      }
+    },
+    "thinking": {
+      "base_class": "ThinkingBase",
+      "base_import": "from thinking_module import ThinkingBase",
+      "methods": {
+        "__init__": "(self, env, custom_config=None)",
+        "__call__": "(*args, **kwargs)",
+        "set_runtime_context": "(self, context)",
+        "get_runtime_context": "(self)",
+        "finish_payload": "(self, answer, answer_type='unknown', confidence=0.0, evidence_summary='')"
+      }
+    }
+  },
+  "call_witnesses": {
+    "video_structuring.retrieveStructure": {
+      "call": "structuring.retrieveStructure(query='generic object', start_sec=0.0, end_sec=5.0, top_k=3)",
+      "return_contract": "str"
+    },
+    "thinking": {
+      "call": "thinking(question, video_context, work_context, force_finish=False)",
+      "return_contract": "(thought: str, action: str, payload: list|dict)",
+      "act_subtask_contract": {
+        "required_keys": [
+          "subtask_id",
+          "instruction",
+          "target_tool",
+          "tool_params"
+        ],
+        "target_tool_rule": "bare suffix of a generated tool_<name> method; Agent dispatches to localization/perception",
+        "valid_examples": [
+          "retrieve_evidence",
+          "verify_ranges"
+        ],
+        "invalid_examples": [
+          "localization.retrieve_evidence",
+          "perception.verify_ranges",
+          "tool_retrieve_evidence"
+        ]
+      }
+    },
+    "localized_media": {
+      "call": "runtime_evidence.inspect_time_ranges(env, time_ranges, capability='vlm')",
+      "return_contract": "bounded evidence object with actual_time_ranges and capability events"
+    }
+  }
+}

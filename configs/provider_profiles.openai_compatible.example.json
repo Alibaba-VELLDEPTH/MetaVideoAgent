@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "manual_name": "OpenAI-compatible provider template",
+  "planning_policy": {
+    "profile_ids_are_the_only_selectable_runtime_models": true,
+    "generated_code_must_use_runtime_evidence_adapters": true,
+    "api_keys_are_environment_only": true,
+    "dynamic_provider_model_discovery_is_forbidden": true
+  },
+  "profiles": [
+    {
+      "profile_id": "custom.llm.reasoning",
+      "capability": "llm",
+      "provider": "configured_provider",
+      "model_id": "replace-with-reasoning-model",
+      "transport": "openai_chat_text",
+      "input_provenance": "bounded_text_context",
+      "output_contract": "text_or_json",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "custom.llm.evolution",
+      "capability": "llm",
+      "provider": "configured_provider",
+      "model_id": "replace-with-evolution-model",
+      "transport": "openai_chat_text",
+      "input_provenance": "bounded_text_context",
+      "output_contract": "text_or_json",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "custom.vlm.default",
+      "capability": "vlm",
+      "provider": "configured_provider",
+      "model_id": "replace-with-vision-model",
+      "transport": "openai_chat_vision",
+      "input_provenance": "active_time_window_frame",
+      "output_contract": "text_or_json_evidence",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "custom.asr.default",
+      "capability": "asr",
+      "provider": "configured_provider",
+      "model_id": "replace-with-audio-model",
+      "transport": "openai_chat_audio",
+      "input_provenance": "active_time_window_segment",
+      "output_contract": "segment_transcript",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "custom.ocr.default",
+      "capability": "ocr",
+      "provider": "configured_provider",
+      "model_id": "replace-with-ocr-or-vision-model",
+      "transport": "openai_chat_vision",
+      "input_provenance": "active_time_window_frame",
+      "output_contract": "recognized_text",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "custom.embedding.default",
+      "capability": "embedding",
+      "provider": "configured_provider",
+      "model_id": "replace-with-embedding-model",
+      "transport": "openai_embedding",
+      "input_provenance": "bounded_text_context",
+      "output_contract": "float_vector",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "enabled_by_default": true
+    }
+  ]
+}

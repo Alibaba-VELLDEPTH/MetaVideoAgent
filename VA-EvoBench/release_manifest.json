@@ -1,0 +1,36 @@
+{
+  "benchmark": "VA-EvoBench",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "package_type": "public_benchmark_release",
+  "release_date": "2026-08-04",
+  "source_dataset": "CG-Bench",
+  "media_included": false,
+  "metavideoagent_runtime_integration": false,
+  "licenses": {
+    "original_va_evobench_contributions": "Apache-2.0",
+    "selected_cg_bench_annotations": "See NOTICE.md and upstream CG-Bench terms",
+    "source_media": "Not included; original creator and platform rights apply"
+  },
+  "split_unit": "video_id",
+  "primary_metric": "macro_accuracy_percent_over_target_distributions",
+  "counts": {
+    "evolution": {"videos": 38, "questions": 356},
+    "held_out": {"videos": 92, "questions": 867}
+  },
+  "distribution_counts": {
+    "interview": {"evolution": {"videos": 5, "questions": 41}, "held_out": {"videos": 14, "questions": 135}},
+    "product_presentation": {"evolution": {"videos": 5, "questions": 50}, "held_out": {"videos": 12, "questions": 103}},
+    "software_tutorial": {"evolution": {"videos": 5, "questions": 50}, "held_out": {"videos": 14, "questions": 132}},
+    "dramatic_narrative": {"evolution": {"videos": 5, "questions": 50}, "held_out": {"videos": 12, "questions": 119}},
+    "stage_performance": {"evolution": {"videos": 5, "questions": 42}, "held_out": {"videos": 11, "questions": 103}},
+    "gameplay": {"evolution": {"videos": 5, "questions": 43}, "held_out": {"videos": 9, "questions": 85}},
+    "sports_broadcast": {"evolution": {"videos": 4, "questions": 44}, "held_out": {"videos": 8, "questions": 71}},
+    "course_lecture": {"evolution": {"videos": 4, "questions": 36}, "held_out": {"videos": 12, "questions": 119}}
+  },
+  "data_files": {
+    "data/evolution.jsonl": "b98505c6a27da7c4538a43a9b73190b61bb6c743aaca9360b1bb73753421bc20",
+    "data/held_out.jsonl": "dbd136e52d7a5a0f6f005d5ecbd77726ddec14688c5e1161251ad070d4473754",
+    "data/videos.jsonl": "b05b930ec962d79783239dd8963f98566377d52186eca08d82b0a61b80eb18f6"
+  }
+}

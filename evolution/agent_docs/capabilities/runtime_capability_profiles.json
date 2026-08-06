@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "manual_name": "MetaVideoAgent paper-reproduction capability profiles",
+  "manual_updated": "2026-07-17",
+  "planning_policy": {
+    "profile_ids_are_the_only_selectable_runtime_models": true,
+    "generated_code_must_use_runtime_evidence_adapters": true,
+    "api_keys_are_environment_only": true,
+    "dynamic_provider_model_discovery_is_forbidden": true,
+    "default_provider": "aliyun_bailian",
+    "custom_profile_file_supported": true
+  },
+  "profiles": [
+    {
+      "profile_id": "paper.llm.reasoning",
+      "capability": "llm",
+      "provider": "aliyun_bailian",
+      "model_id": "glm-5.2",
+      "transport": "openai_chat_text",
+      "input_provenance": "bounded_text_context",
+      "output_contract": "text_or_json",
+      "request_options": {
+        "enable_thinking": false
+      },
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/text-generation-model",
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "paper.llm.evolution",
+      "capability": "llm",
+      "provider": "aliyun_bailian",
+      "model_id": "qwen3.7-max",
+      "transport": "openai_chat_text",
+      "input_provenance": "bounded_text_context",
+      "output_contract": "text_or_json",
+      "request_options": {
+        "enable_thinking": false
+      },
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/text-generation-model",
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "paper.vlm.default",
+      "capability": "vlm",
+      "provider": "aliyun_bailian",
+      "model_id": "qwen3.7-plus",
+      "transport": "openai_chat_vision",
+      "input_provenance": "active_time_window_frame",
+      "output_contract": "text_or_json_evidence",
+      "request_options": {
+        "enable_thinking": false
+      },
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/vision-model",
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "paper.asr.default",
+      "capability": "asr",
+      "provider": "aliyun_bailian",
+      "model_id": "qwen3-asr-flash",
+      "transport": "openai_chat_audio",
+      "input_provenance": "active_time_window_segment",
+      "output_contract": "segment_transcript",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference",
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "paper.ocr.default",
+      "capability": "ocr",
+      "provider": "aliyun_bailian",
+      "model_id": "qwen-vl-ocr-2025-11-20",
+      "transport": "openai_chat_vision",
+      "input_provenance": "active_time_window_frame",
+      "output_contract": "recognized_text",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/qwen-vl-ocr-api-reference",
+      "enabled_by_default": true
+    },
+    {
+      "profile_id": "paper.embedding.default",
+      "capability": "embedding",
+      "provider": "aliyun_bailian",
+      "model_id": "qwen3-vl-embedding",
+      "transport": "dashscope_multimodal_embedding",
+      "input_provenance": "bounded_text_or_image_context",
+      "output_contract": "shared_multimodal_float_vector",
+      "api_key_env": ["METAVIDEOAGENT_API_KEY"],
+      "base_url_env": ["METAVIDEOAGENT_BASE_URL"],
+      "default_base_url": "https://dashscope.aliyuncs.com",
+      "cost_tier": "formal",
+      "source_url": "https://help.aliyun.com/zh/model-studio/multimodal-embedding-api-reference",
+      "enabled_by_default": true
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "benchmark": "VA-EvoBench",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "source_dataset": "CG-Bench",
+  "selection_protocol": {
+    "unit": "video",
+    "manual_review": "Ten uniformly spaced frames over each full candidate video were globally reviewed before assigning the video to a target distribution.",
+    "split_unit": "video_id",
+    "split_names": {
+      "evolution": "Used for distribution profiling and evolution under the annotation-access protocol.",
+      "held_out": "Used only for external reporting; annotations and outcomes are inaccessible to the evolution method."
+    },
+    "temporal_annotation_field": "time_reference"
+  },
+  "distributions": [
+    {"id": "interview", "name": "Interview", "content": "Interviews and dialogue-centered interactions", "evidence_requirements": "spoken content, speaker identity, and local visual interactions"},
+    {"id": "product_presentation", "name": "Product Presentation", "content": "Product demonstrations and sales presentations", "evidence_requirements": "product attributes, displayed text, orientation, and relative positions"},
+    {"id": "software_tutorial", "name": "Software Tutorial", "content": "Screen-based software instruction", "evidence_requirements": "interface text, operation order, and state changes"},
+    {"id": "dramatic_narrative", "name": "Dramatic Narrative", "content": "TV-drama and narrative scenes", "evidence_requirements": "characters, events, and relations across cuts"},
+    {"id": "stage_performance", "name": "Stage Performance", "content": "Magic and other stage interactions", "evidence_requirements": "event phases, ordinal relations, and brief actions"},
+    {"id": "gameplay", "name": "Gameplay", "content": "Game recordings", "evidence_requirements": "dynamic scene state, player/object actions, and interface evidence"},
+    {"id": "sports_broadcast", "name": "Sports Broadcast", "content": "Sports events and broadcasts", "evidence_requirements": "subject tracking across views, actions, scores, and localized events"},
+    {"id": "course_lecture", "name": "Course Lecture", "content": "Instructional lectures with slides", "evidence_requirements": "lecture content, on-screen text, concepts, and page--speech timing"}
+  ]
+}

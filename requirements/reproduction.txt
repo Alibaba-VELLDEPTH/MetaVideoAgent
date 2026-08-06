@@ -1,0 +1,7 @@
+# Maintained direct-dependency pins for the reproduction baseline.
+chromadb==0.5.23
+httpx==0.27.2
+imageio-ffmpeg==0.6.0
+openai==1.52.0
+opencv-python-headless==4.11.0.86
+Pillow==11.3.0

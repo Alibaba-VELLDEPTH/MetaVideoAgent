@@ -1,0 +1,10 @@
+{
+  "distribution_id": "example_target_distribution",
+  "splits": {
+    "train": "../data/train.jsonl",
+    "test": "../data/test.jsonl"
+  },
+  "budgets": {
+    "probe_first_n": 4
+  }
+}
