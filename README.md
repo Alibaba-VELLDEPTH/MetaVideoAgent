@@ -268,14 +268,10 @@ Project repository: [Alibaba-VELLDEPTH/MetaVideoAgent](https://github.com/Alibab
 
 ```bibtex
 @article{cui2026metavideoagent,
-  title         = {MetaVideoAgent: Automated Video-Agent Evolution for Long-Form Video Understanding},
-  author        = {Cui, Benlei and Wang, Ruize and Li, Junjie and Chen, Jinhao and Huang, Longtao and Chen, Yinghao and Zhai, Yuwen and Tang, Jingqun and Jia, Ruijian and Wu, Weiwei and Sun, Pengfei and Hong, Haiwen},
-  journal       = {arXiv preprint arXiv:2608.04587},
-  year          = {2026},
-  eprint        = {2608.04587},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.CV},
-  doi           = {10.48550/arXiv.2608.04587}
+  title={MetaVideoAgent: Automated Video-Agent Evolution for Long-Form Video Understanding},
+  author={Cui, Benlei and Wang, Ruize and Li, Junjie and Chen, Jinhao and Huang, Longtao and Chen, Yinghao and Zhai, Yuwen and Tang, Jingqun and Jia, Ruijian and Wu, Weiwei and others},
+  journal={arXiv preprint arXiv:2608.04587},
+  year={2026}
 }
 ```
 
