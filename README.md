@@ -4,118 +4,80 @@
 
 ### Automated Video-Agent Evolution for Long-Form Video Understanding
 
-Build a distribution-aware video agent from scratch, then improve it through
-execution evidence and a fully automatic Codex evolution loop.
+Build a distribution-aware video agent from scratch, then improve its code through evidence-grounded review, diagnosis, and iterative evolution.
 
-[Overview](#overview) · [Quick start](#quick-start) · [Automatic evolution](#primary-interface-codex-automatic) · [VA-EvoBench](#included-benchmark-va-evobench) · [Held-out reporting](#read-only-held-out-reporting) · [Paper](#paper)
+[![Paper](https://img.shields.io/badge/arXiv-2608.04587-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.04587) [![Code](https://img.shields.io/badge/GitHub-Code-24292f?logo=github&logoColor=white)](https://github.com/Alibaba-VELLDEPTH/MetaVideoAgent) [![Benchmark](https://img.shields.io/badge/Benchmark-VA--EvoBench-007a78)](VA-EvoBench/README.md) [![License](https://img.shields.io/badge/License-Apache_2.0-2563eb)](LICENSE)
+
+Benlei Cui<sup>1,&#42;</sup>, Ruize Wang<sup>2,&#42;</sup>, Junjie Li<sup>1,&dagger;</sup>, Jinhao Chen<sup>3</sup>, Longtao Huang<sup>1</sup>, Yinghao Chen<sup>1</sup>, Yuwen Zhai<sup>1</sup>, Jingqun Tang<sup>4</sup>, Ruijian Jia<sup>1</sup>, Weiwei Wu<sup>2</sup>, Pengfei Sun<sup>1,&Dagger;</sup>, Haiwen Hong<sup>1,&dagger;</sup>
+
+<sup>1</sup> Yuvion Team, Alibaba Group &nbsp; <sup>2</sup> Zhejiang University &nbsp; <sup>3</sup> Beihang University &nbsp; <sup>4</sup> ByteDance
+
+<sup>&#42;</sup> Equal contribution &nbsp; <sup>&dagger;</sup> Corresponding author &nbsp; <sup>&Dagger;</sup> Project leader
 
 </div>
 
-## Overview
+## 🔍 Overview
 
-MetaVideoAgent builds a five-module agent from observations of a target video
-distribution and evolves it from execution trajectories. This release contains
-one from-scratch initialization route. Its primary public interface is the
-Codex automatic workflow, which orchestrates initial authoring, validation, and
-multiple review, diagnosis, research, evolution, and evaluation rounds.
+Long-form videos differ in how visual, spoken, and temporal evidence is distributed. **MetaVideoAgent (MVA)** adapts the agent design to a target video distribution: sampled frames and queries guide initial research and modular agent construction, followed by code evolution grounded in execution trajectories. Teacher review, cross-sample diagnosis, and targeted research when needed guide updates across five modules: video structuring, localization, perception, memory, and reasoning. Minimal validation tasks and evolution-split evaluation test candidate changes before the next iteration.
 
-<p align="center">
-  <img src="assets/overview.jpg" alt="MetaVideoAgent framework overview" width="100%">
-</p>
+<p align="center"><img src="assets/overview.jpg" alt="MetaVideoAgent framework: distribution-aware design, Teacher review, cross-sample diagnosis, and modular code evolution" width="100%"></p>
 
-<p align="center"><em>Distribution-Aware Design initializes the Student Video Agent for a target video distribution. In each iteration, the Teacher Video Agent reviews failures, the Diagnosis Agent identifies recurring causes and responsible modules, and the Evolution Agent implements targeted code-level updates. A validated candidate becomes the Student for the next iteration.</em></p>
+<p align="center"><em>Distribution-Aware Design initializes the Student. Teacher review, cross-sample diagnosis, and modular code evolution form the improvement loop, with validation and evaluation guiding candidate acceptance.</em></p>
 
-### Highlights
+## ✨ Highlights
 
-| Capability | Public release behavior |
-| --- | --- |
-| Distribution-aware initialization | Profiles the training-video distribution and authors one complete five-module agent from scratch. |
-| Automatic evolution | Uses Codex for initial authoring and bounded multi-round repair, with explicit smoke, probe, and full-evaluation gates. |
-| Adaptive module scope | Evolves one module for a local failure, multiple modules for a coupled failure, and expands the changed set only when probe evidence supports the dependency. |
-| Current-best selection | Selects candidates using the evolution split and retains the accepted current-best bundle as the next round's base. |
-| Provider-independent runtime | Uses declarative capability profiles while preserving the paper-reproduction configuration as the shipped default. |
-| Reproducible benchmark release | Includes VA-EvoBench as a standalone source-repository artifact without coupling it to the MetaVideoAgent runtime. |
+- **Distribution-aware initialization.** Sampled frames and associated queries guide initial research and agent design for each target distribution.
+- **Evidence-grounded review.** The Teacher compares Student trajectories with a Gold Path grounded in evolution-split answers and annotated evidence.
+- **Cross-sample diagnosis.** Recurring failures are traced to responsible modules, with targeted research used when additional evidence is needed to guide improvements.
+- **Validated code evolution.** Updates focus on responsible modules and necessary dependencies; minimal validation tasks and full evolution-split evaluation assess candidate changes.
 
-No existing-agent initialization variants, benchmark-specific launchers,
-model weights, media, or generated outputs are included. The repository also
-publishes the standalone VA-EvoBench annotation package described below; it is
-not part of the MetaVideoAgent runtime input path.
+## 📊 VA-EvoBench
 
-## Repository layout
+**VA-EvoBench** evaluates distribution-adaptive video-agent evolution across **eight target video distributions** curated from CG-Bench. It contains **130 videos and 1,223 questions**, with video-disjoint evolution and held-out splits within each distribution. Across all eight distributions, the evolution split contains 38 videos and 356 questions, and the held-out split contains 92 videos and 867 questions.
 
-```text
-assets/                   README and repository media
-configs/                  distribution and provider examples
-VA-EvoBench/              standalone benchmark released with this repository
-evolution/                profiling, review, diagnosis, authoring and evaluation
-execution/                five-module runtime and workflow orchestration
-scripts/run_automatic.py  primary multi-round Codex interface
-scripts/run_held_out.py   read-only evaluation of a frozen agent
-examples/                 input examples
-requirements/             bounded core and development dependencies
-```
+With four evolution iterations per distribution, the [paper](https://arxiv.org/abs/2608.04587) reports an increase in held-out macro-average accuracy from **38.44% to 51.47%** (**+13.03 percentage points**) across the eight distributions.
 
-## Included benchmark: VA-EvoBench
+The [benchmark package](VA-EvoBench/README.md) includes annotations, split manifests, a validator, and an evaluator. See the [dataset card](VA-EvoBench/DATASET_CARD.md) for distribution details and the annotation-access protocol. Obtain videos separately from the [official CG-Bench release](https://huggingface.co/datasets/CG-Bench/CG-Bench) under its access conditions.
 
-[`VA-EvoBench/`](VA-EvoBench/) contains the benchmark annotations, fixed
-evolution/held-out membership, validation utility, evaluator, dataset card, and
-upstream-rights notice used for the accompanying evaluation. It contains no
-video files. Obtain source media separately through the official CG-Bench
-release and comply with its access conditions.
+## 🚀 Quick Start
 
-The benchmark is colocated for source-repository publication only and is not
-included in the Python wheel. MetaVideoAgent does not import, install, discover,
-or execute VA-EvoBench automatically, and its public runtime interfaces remain
-dataset-agnostic. See [`VA-EvoBench/README.md`](VA-EvoBench/README.md) for its
-independent data and annotation-access protocol.
+### 1. Install
 
-## Quick start
-
-### 1. Install MetaVideoAgent
-
-Python 3.10 or newer is required.
+Use Python 3.10 or newer, with FFmpeg and FFprobe available for video/audio processing. Automatic authoring requires an authenticated `codex` executable on `PATH` (or a path supplied through `--codex-cli`).
 
 ```bash
+git clone https://github.com/Alibaba-VELLDEPTH/MetaVideoAgent.git
+cd MetaVideoAgent
 python -m pip install -e .
 ```
 
-The default installation uses bounded dependency ranges. For the maintained
-direct-dependency reproduction baseline, install the pinned set first:
+<details>
+<summary>Pinned dependency baseline</summary>
 
 ```bash
 python -m pip install -r requirements/reproduction.txt
 python -m pip install -e . --no-deps
 ```
 
-Codex automatic authoring also requires an authenticated `codex` executable on
-`PATH`, or an explicit `--codex-cli` path. Internally, that executable is
-resolved through a single command adapter. Advanced deployments may point
-`--codex-cli` to a wrapper that implements the same Codex `exec` command
-contract; this replaces the implementation behind the automatic workflow and
-does not create another public route.
+</details>
 
-For development and release-contract checks, install the development dependency
-group and run the test suite:
+### 2. Configure Models
+
+The default [capability profiles](evolution/agent_docs/capabilities/runtime_capability_profiles.json) specify the paper's runtime models and Alibaba Cloud Model Studio endpoints. Set your Model Studio API key in the shell before running:
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest
+export METAVIDEOAGENT_API_KEY="your-api-key"
 ```
 
-### 2. Configure model providers
+[`.env.example`](.env.example) lists the supported environment variables; it is a template and is not loaded automatically. Runtime provider credentials are separate from Codex authentication.
 
-Runtime models are selected through the declarative capability profile file at
-`evolution/agent_docs/capabilities/runtime_capability_profiles.json`. The file
-shipped with the repository records the paper-reproduction configuration. It is
-a default, not a provider lock.
+<details>
+<summary>Use another model provider</summary>
 
-To use another provider, start from
-`configs/provider_profiles.openai_compatible.example.json`, fill in model IDs,
-and then set:
+Fill in the model IDs in the [OpenAI-compatible profile template](configs/provider_profiles.openai_compatible.example.json), then select its profiles and your provider endpoint:
 
 ```bash
 export METAVIDEOAGENT_CAPABILITY_PROFILES=configs/provider_profiles.openai_compatible.example.json
-export METAVIDEOAGENT_API_KEY=...
 export METAVIDEOAGENT_BASE_URL=https://provider.example/v1
 export METAVIDEOAGENT_LLM_PROFILE=custom.llm.reasoning
 export METAVIDEOAGENT_EVOLUTION_LLM_PROFILE=custom.llm.evolution
@@ -127,19 +89,11 @@ export METAVIDEOAGENT_OCR_PROFILE=custom.ocr.default
 export METAVIDEOAGENT_EMBEDDING_PROFILE=custom.embedding.default
 ```
 
-`.env.example` is a shell-variable template and is not loaded automatically.
-Copy or source only the values appropriate for your environment; never commit a
-populated credential file.
+The reasoning profile serves the execution agent; the evolution, review, and post-decision profiles serve the corresponding orchestration stages. Use provider-supported models for each capability and keep credentials in the environment.
 
-`METAVIDEOAGENT_LLM_PROFILE` selects the execution agent's reasoning model.
-The evolution, review, and post-decision variables select the DiagnosisAgent,
-Teacher, and post-evaluation decision models, respectively; they may all point
-to one profile. Prefer environment variables for credentials because
-command-line arguments may be visible to local process inspection tools. The
-CLI retains `--api-key` and `--base-url` only for controlled invocation
-environments; their values are redacted from the run journal.
+</details>
 
-### 3. Prepare the data contract
+### 3. Prepare Data
 
 Create a workspace containing raw videos and JSONL split files:
 
@@ -152,26 +106,15 @@ data/
   test.jsonl
 ```
 
-Each evolution JSONL record must contain `video_id`, `question`, `options` or
-`choices`, an answer field such as `gt_answer`, and one or more positive
-annotated intervals in `time_reference`. The canonical representation is a
-list of `[start_sec, end_sec]` pairs, for example `[[0.0, 30.0]]`; one flat pair
-is also accepted as a single interval. `options` is normalized to the canonical
-runtime field `choices`. Manifest-relative paths are resolved relative to the
-manifest file; see `configs/distribution_manifest.example.json`.
+Evolution JSONL records need `video_id`, `question`, `choices` (or `options`), an answer such as `gt_answer`, and evidence intervals in `time_reference`. Intervals are `[start_sec, end_sec]` pairs in seconds with `end_sec > start_sec >= 0`, for example `[[0.0, 30.0]]`; see the [example record](examples/question.example.jsonl). Held-out records use the same question and answer fields; evidence intervals are optional.
 
-Held-out records require the same video/question/options/answer fields. They do
-not require evidence intervals because held-out execution is reporting-only and
-never invokes Teacher review.
+Set the split paths in [the distribution manifest](configs/distribution_manifest.example.json). Paths are relative to that manifest. For VA-EvoBench, prepare one distribution per run using its released split membership and upstream videos.
 
-The training split is the evolution and candidate-selection split. The test
-split is held out and is never used to update the current-best agent.
+The manifest's `train` split drives evolution and candidate selection; `test` is reserved for held-out reporting. Student execution uses video, question, and choices; evolution labels and evidence intervals are used in post-execution Teacher review.
 
-## Primary interface: Codex automatic
+### 4. Run Automatic Evolution
 
-The following command builds one five-frame, query-aware record per evolution
-video, authors and evaluates the initial agent, and uses the paper's four-update
-budget by default:
+Initialize an agent from the target distribution and run four update rounds:
 
 ```bash
 python scripts/run_automatic.py \
@@ -180,69 +123,14 @@ python scripts/run_automatic.py \
   --run-id example_run \
   --output-root artifacts \
   --auto-rounds 4 \
-  --run \
-  --base-url "$METAVIDEOAGENT_BASE_URL"
+  --run
 ```
 
-Use `--check-only` instead of `--run` to validate the configuration and planned
-artifact paths without model calls.
+Use `--check-only` instead of `--run` to validate the configuration and planned artifact paths without model calls. Select a coding model available in your Codex environment with `--codex-model` and set its reasoning effort with `--codex-reasoning-effort`. See `python scripts/run_automatic.py --help` for additional options. Generated agent code executes locally; use an isolated environment for evolution runs.
 
-The shipped Codex model and reasoning effort are operational defaults, not
-model settings specified by the paper and not locks. Override them with
-`--codex-model` and `--codex-reasoning-effort` when your Codex installation
-supports the selection.
+## 🧪 Evaluation
 
-The final report contains `automatic_final_current_best`, including the frozen
-bundle, evolution-split report, results, and reference label. The public entry
-point defaults to four update rounds; `--auto-rounds` makes the requested update
-budget explicit for another evaluation protocol.
-
-Each later round records a non-empty `target_modules` set. A module-local
-failure may select and change one module; an interface-coupled failure may
-select multiple modules, and probe evidence may justify adding another related
-module during bounded repair. All cases use the same Codex automatic workflow
-and the same self-contained five-module candidate-bundle contract. Unchanged
-modules are retained exactly from the accepted current-best bundle.
-
-## Operational notes
-
-MetaVideoAgent's public workflow is fully automatic and uses Codex for initial
-authoring and evolution. A less capable coding-agent implementation may require
-an implementation review when a validation gate fails, when repeated probes
-remain inconclusive, or when technically valid rounds produce weaker-than-
-expected gains on the evolution split. Typical areas to inspect include:
-
-- producing all five modules with the exact runtime ABI and bundle schema;
-- preserving structured evidence across structuring, localization, perception,
-  memory, and thinking handoffs;
-- repairing import, syntax, schema, or runtime-smoke failures without adding
-  task-specific rules;
-- translating diagnosis and review evidence into a self-contained replacement
-  bundle while preserving unaffected behavior; and
-- interpreting complete probe trajectories when the first bounded repair does
-  not resolve the failure.
-
-If a generated implementation is corrected, record the changed artifact and
-rerun the same smoke and probe gates. Such troubleshooting does not define a
-separate evolution route and must not use held-out labels, benchmark-specific
-answers, video identifiers, or fixed timestamps. The repository does not ship
-a separate intervention interface.
-
-Codex authoring and research run with workspace-write sandboxing in isolated
-staging or run-artifact directories. MetaVideoAgent provider credentials and
-base URLs are removed from the coding-agent subprocess environment. Generated
-bundle code subsequently executes in the local Python runtime, which is not an
-operating-system security boundary for untrusted code. Review generated source
-and run MetaVideoAgent only in an environment whose runtime files and
-credentials may safely be exposed to that code.
-
-## Read-only held-out reporting
-
-After evolution, freeze the bundle named by `automatic_final_current_best` and
-evaluate it on the manifest's test split. The paired train report proves that
-the exact bundle completed evolution-split evaluation; held-out results are
-written under `<candidate-run>/held_out_evaluation` and never update the
-current-best ledger.
+After evolution, open the JSON report identified by the terminal's `report_path` output. In `automatic_final_current_best`, `bundle_path` supplies `--candidate-bundle` and `report_path` supplies `--train-diagnostic-report`; use the corresponding candidate-run directory for `--candidate-run`. The train report must attest a completed evolution-split evaluation of the exact frozen bundle being evaluated:
 
 ```bash
 python scripts/run_held_out.py \
@@ -253,33 +141,32 @@ python scripts/run_held_out.py \
   --train-diagnostic-report artifacts/frozen_train_full_eval_report.json
 ```
 
-Use `--check-only` to validate the frozen-bundle, train-report, test-data, and
-media contracts without executing models.
+Replace the example paths with your run artifacts. Held-out results are written under `<candidate-run>/held_out_evaluation` and do not affect evolution or candidate selection. Add `--check-only` to validate inputs without model calls.
 
-## Paper
+## 📂 Repository Structure
 
-**MetaVideoAgent: Automated Video-Agent Evolution for Long-Form Video
-Understanding**  
-Benlei Cui, Ruize Wang, Junjie Li, Jinhao Chen, Longtao Huang, Yinghao Chen,
-Yuwen Zhai, Jingqun Tang, Ruijian Jia, Weiwei Wu, Pengfei Sun, and Haiwen Hong.  
-[arXiv:2608.04587](https://arxiv.org/abs/2608.04587), 2026.
+```text
+evolution/    distribution profiling, review, diagnosis, and code evolution
+execution/    five-module agent runtime and workflow orchestration
+VA-EvoBench/  benchmark annotations, splits, and evaluation utilities
+scripts/      automatic evolution and held-out evaluation entry points
+configs/      distribution manifests and model-provider examples
+examples/     example inputs
+```
 
-Project repository: [Alibaba-VELLDEPTH/MetaVideoAgent](https://github.com/Alibaba-VELLDEPTH/MetaVideoAgent)
+## ✍️ Citation
+
+If you use MetaVideoAgent or VA-EvoBench in your research, please cite our [paper](https://arxiv.org/abs/2608.04587):
 
 ```bibtex
 @article{cui2026metavideoagent,
-  title={MetaVideoAgent: Automated Video-Agent Evolution for Long-Form Video Understanding},
+  title={Metavideoagent: Automated video-agent evolution for long-form video understanding},
   author={Cui, Benlei and Wang, Ruize and Li, Junjie and Chen, Jinhao and Huang, Longtao and Chen, Yinghao and Zhai, Yuwen and Tang, Jingqun and Jia, Ruijian and Wu, Weiwei and others},
   journal={arXiv preprint arXiv:2608.04587},
   year={2026}
 }
 ```
 
-## License and third parties
+## 📜 License
 
-MetaVideoAgent is released under the Apache License 2.0. See `LICENSE` and
-`THIRD_PARTY_NOTICES.md`; both are included in source distributions and wheel
-license metadata. Third-party libraries, models, media, and services are
-not bundled and remain subject to their own terms. The selected CG-Bench
-annotation fields distributed in `VA-EvoBench/` remain subject to the upstream
-terms documented in `VA-EvoBench/NOTICE.md`.
+MetaVideoAgent is released under the [Apache License 2.0](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md) for dependencies and the [VA-EvoBench notice](VA-EvoBench/NOTICE.md) for CG-Bench annotation and media terms. Research using VA-EvoBench should also cite CG-Bench as described in the [benchmark documentation](VA-EvoBench/README.md#licensing-and-citation).
