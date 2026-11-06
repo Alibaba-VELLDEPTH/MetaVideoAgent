@@ -22,10 +22,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--output-root", default="")
-    parser.add_argument("--auto-rounds", type=int, default=4)
+    parser.add_argument("--initialization", choices=("observe", "map"), default="observe")
+    parser.add_argument("--source-agent", default="", help="Source package to adapt with --initialization map.")
+    parser.add_argument("--auto-rounds", type=int, default=None,
+                        help="Total update-round budget; new runs default to 4 and resumptions keep the saved budget.")
+    parser.add_argument("--iteration-index", type=int, default=0,
+                        help="Iteration to continue; otherwise use the run's saved continuation point.")
+    parser.add_argument("--restart-from", choices=("diagnosis", "research", "codegen", "smoke", "probe", "full_eval"), default="")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--first-n", type=int, default=0)
     parser.add_argument("--structure-workers", type=int, default=4)
+    parser.add_argument("--repair-attempts", type=int, default=3,
+                        help="Additional source-assembly or smoke repair attempts before probe.")
+    parser.add_argument("--probe-repair-attempts", type=int, default=2,
+                        help="Candidate continuation attempts after probe or engineering feedback.")
     parser.add_argument(
         "--codex-cli",
         default="",
@@ -57,13 +67,18 @@ def main() -> int:
         "--distribution-manifest", args.distribution_manifest,
         "--workspace", args.workspace,
         "--stage", "automatic",
-        "--auto-rounds", str(max(1, args.auto_rounds)),
         "--concurrency", str(max(1, args.concurrency)),
         "--first-n", str(max(0, args.first_n)),
         "--structure-workers", str(max(1, args.structure_workers)),
+        "--repair-attempts", str(max(0, args.repair_attempts)),
+        "--probe-repair-attempts", str(max(0, args.probe_repair_attempts)),
     ]
+    if args.auto_rounds is not None:
+        forwarded.extend(["--auto-rounds", str(max(1, args.auto_rounds))])
     for flag, value in (
+        ("--initialization", args.initialization), ("--source-agent", args.source_agent),
         ("--run-id", args.run_id), ("--output-root", args.output_root),
+        ("--iteration-index", args.iteration_index), ("--restart-from", args.restart_from),
         ("--codex-cli", args.codex_cli),
         ("--research-codex-cli", args.research_codex_cli),
         ("--codex-model", args.codex_model),

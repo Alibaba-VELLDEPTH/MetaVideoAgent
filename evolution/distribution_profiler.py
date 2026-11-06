@@ -23,10 +23,12 @@ try:
     from .distribution_spec import prompt_safe_spec
     from .question_set_loader import dataset_files_from_path
     from .runtime_paths import metavideoagent_output_root
+    from .video_distribution_observer import observation_is_usable
 except ImportError:
     from distribution_spec import prompt_safe_spec
     from question_set_loader import dataset_files_from_path
     from runtime_paths import metavideoagent_output_root
+    from video_distribution_observer import observation_is_usable
 
 
 def _conda_sibling_binary(name: str) -> str:
@@ -156,6 +158,8 @@ def _distribution_records(video_ids: List[str], queries_by_video: Dict[str, List
             continue
         video_id = str(row.get("video_id") or "")
         model = row.get("model_observation") if isinstance(row.get("model_observation"), dict) else {}
+        if not observation_is_usable(model):
+            continue
         parsed = model.get("vlm_json") if isinstance(model.get("vlm_json"), dict) else {}
         asset = row.get("asset") if isinstance(row.get("asset"), dict) else {}
         timestamps = [
@@ -199,12 +203,8 @@ def _level(value: float, low: float, high: float) -> str:
     return "low"
 
 
-def _channel_hypothesis(channel_counter: Counter, tool_counts: Counter,
-                        structure_stats: Dict[str, Any], total_q: int,
-                        video_stats: Dict[str, Any] | None = None,
+def _channel_hypothesis(video_stats: Dict[str, Any],
                         semantic_stats: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    total_q = max(1, total_q)
-    density = structure_stats.get("density", {}) or {}
     video_summary = (video_stats or {}).get("summary", {}) or {}
     semantic_density = (semantic_stats or {}).get("density", {}) or {}
     audio_stream_ratio = video_summary.get("audio_stream_ratio")
@@ -217,33 +217,19 @@ def _channel_hypothesis(channel_counter: Counter, tool_counts: Counter,
     visual_motion_bonus = 0.15 if visual_dynamic_level == "high" else 0.05 if visual_dynamic_level == "medium" else 0.0
     scores = {
         "speech_or_audio": (
-            channel_counter["speech_or_dialogue_semantics"] / total_q
-            + density.get("speech_or_audio_mentions", 0)
-            + min(1.0, tool_counts.get("mentions_audio_or_speech", 0) / max(1, total_q))
-            + audio_bonus
+            audio_bonus
             + float(semantic_density.get("speech_or_audio", 0.0) or 0.0)
         ),
-        "screen_text_or_subtitle": (
-            channel_counter["screen_text_or_subtitle"] / total_q
-            + density.get("subtitle_or_transcript_mentions", 0)
-            + density.get("ocr_or_screen_text_mentions", 0)
-            + min(1.0, tool_counts.get("mentions_text_or_ocr", 0) / max(1, total_q))
-            + float(semantic_density.get("screen_text_or_subtitle", 0.0) or 0.0)
-        ),
+        "screen_text_or_subtitle": float(semantic_density.get("screen_text_or_subtitle", 0.0) or 0.0),
         "visual_action": (
-            channel_counter["visual_event_or_action"] / total_q
-            + density.get("visual_action_mentions", 0)
-            + float(semantic_density.get("visual_action", 0.0) or 0.0)
+            float(semantic_density.get("visual_action", 0.0) or 0.0)
             + visual_motion_bonus
             - static_visual_penalty
         ),
         "visual_object_detail": (
-            channel_counter["visual_detail_or_object"] / total_q
-            + density.get("visual_object_detail_mentions", 0)
-            + float(semantic_density.get("visual_object_detail", 0.0) or 0.0)
+            float(semantic_density.get("visual_object_detail", 0.0) or 0.0)
             + max(0.0, visual_motion_bonus / 2)
         ),
-        "long_context_reasoning": channel_counter["long_context_reasoning"] / total_q,
     }
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     primary = ranked[0][0] if ranked and ranked[0][1] > 0 else "mixed_or_unknown"
@@ -260,11 +246,7 @@ def _channel_hypothesis(channel_counter: Counter, tool_counts: Counter,
     }
 
 
-def _stable_channel_schema(channel_counter: Counter,
-                           total_q: int,
-                           interval_lengths: List[int],
-                           video_stats: Dict[str, Any],
-                           structure_stats: Dict[str, Any],
+def _stable_channel_schema(video_stats: Dict[str, Any],
                            semantic_stats: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Return the information-channel schema used by MetaVideoAgent prompts.
 
@@ -272,53 +254,32 @@ def _stable_channel_schema(channel_counter: Counter,
     video for visual dynamics and a short local audio segment for speech/audio
     activity. No VLM/LLM/API call is made here.
     """
-    total_q = max(1, total_q)
     video_summary = (video_stats or {}).get("summary", {}) or {}
     raw_video_available = (video_stats or {}).get("sampled_videos", 0) > 0 and video_summary.get("status") == "sampled_raw_videos"
-    density = (structure_stats or {}).get("density", {}) or {}
     semantic_density = (semantic_stats or {}).get("density", {}) or {}
     avg_motion = float(video_summary.get("avg_frame_delta") or 0.0) if raw_video_available else 0.0
     low_motion_ratio = float(video_summary.get("low_visual_motion_ratio") or 0.0) if raw_video_available else 0.0
     audio_stream_ratio = video_summary.get("audio_stream_ratio")
     audio_activity_ratio = float(video_summary.get("audio_activity_ratio") or 0.0)
-    text_density = (
-        channel_counter["screen_text_or_subtitle"] / total_q
-        + float(density.get("subtitle_or_transcript_mentions", 0.0) or 0.0)
-        + float(density.get("ocr_or_screen_text_mentions", 0.0) or 0.0)
-        + float(semantic_density.get("screen_text_or_subtitle", 0.0) or 0.0)
-    )
+    text_density = float(semantic_density.get("screen_text_or_subtitle", 0.0) or 0.0)
     visual_action_density = (
-        channel_counter["visual_event_or_action"] / total_q
-        + float(density.get("visual_action_mentions", 0.0) or 0.0)
-        + float(semantic_density.get("visual_action", 0.0) or 0.0)
+        float(semantic_density.get("visual_action", 0.0) or 0.0)
         + min(1.0, avg_motion * 8.0)
     )
     visual_detail_density = (
-        channel_counter["visual_detail_or_object"] / total_q
-        + float(density.get("visual_object_detail_mentions", 0.0) or 0.0)
-        + float(semantic_density.get("visual_object_detail", 0.0) or 0.0)
+        float(semantic_density.get("visual_object_detail", 0.0) or 0.0)
         + min(1.0, avg_motion * 4.0)
     )
     speech_density = (
-        channel_counter["speech_or_dialogue_semantics"] / total_q
-        + float(density.get("speech_or_audio_mentions", 0.0) or 0.0)
-        + float(semantic_density.get("speech_or_audio", 0.0) or 0.0)
+        float(semantic_density.get("speech_or_audio", 0.0) or 0.0)
         + audio_activity_ratio
     )
     scene_change_density = max(0.0, 1.0 - low_motion_ratio) if raw_video_available else 0.0
-    long_interval_ratio = (
-        sum(1 for x in interval_lengths if x >= 120) / max(1, len(interval_lengths))
-        if interval_lengths else 0.0
-    )
     channel_scores = {
         "audio_speech": round(speech_density, 3),
         "visual_motion": round(visual_action_density, 3),
         "visual_detail": round(visual_detail_density, 3),
         "text_subtitle_ocr": round(text_density, 3),
-        "long_context": round(
-            channel_counter["long_context_reasoning"] / total_q + long_interval_ratio,
-            3,
-        ),
     }
     dominant = max(channel_scores.items(), key=lambda item: item[1])[0] if channel_scores else "mixed"
     sorted_scores = sorted(channel_scores.values(), reverse=True)
@@ -341,7 +302,6 @@ def _stable_channel_schema(channel_counter: Counter,
         "subtitle_or_ocr_density": round(min(1.0, text_density), 3),
         "visual_action_density": round(min(1.0, visual_action_density), 3),
         "visual_detail_density": round(min(1.0, visual_detail_density), 3),
-        "long_context_density": round(min(1.0, long_interval_ratio), 3),
         "audio_visual_alignment_hint": (
             "audio_dominant_static_visual"
             if speech_density >= 0.5 and low_motion_ratio >= 0.5 else
@@ -625,8 +585,7 @@ def _semantic_observation_stats(path: str, budget: int) -> Dict[str, Any]:
     for row in rows:
         model_obs = row.get("model_observation", {}) if isinstance(row.get("model_observation"), dict) else {}
         vlm_json = model_obs.get("vlm_json", {}) if isinstance(model_obs.get("vlm_json"), dict) else {}
-        has_model_signal = bool(vlm_json or model_obs.get("vlm_raw"))
-        if not has_model_signal:
+        if not observation_is_usable(model_obs):
             continue
         usable += 1
         fields = [
@@ -681,7 +640,6 @@ def build_observed_distribution_profile(
     workspace_dir: str,
     distribution_spec: Dict[str, Any] | None = None,
     output_path: str | None = None,
-    include_execution_artifacts: bool = True,
 ) -> Dict[str, Any]:
     spec = distribution_spec or {}
     budgets = spec.get("budgets", {}) if isinstance(spec.get("budgets"), dict) else {}
@@ -700,15 +658,6 @@ def build_observed_distribution_profile(
         _queries_by_video_from_split(question_split_path)
         if question_split_path else {}
     )
-    channel_counter = Counter()
-    tool_counts = Counter()
-    interval_lengths: List[int] = []
-    structure_stats = {
-        "sampled_segments": 0,
-        "keyword_counts": {},
-        "density": {},
-        "skipped_reason": "initial_profile_excludes_execution_artifacts",
-    }
     video_signal_stats = _video_signal_stats(
         workspace_dir,
         video_ids,
@@ -729,7 +678,6 @@ def build_observed_distribution_profile(
     question_count = sum(len(items) for items in queries_by_video.values())
     semantic_sampling_plan = _semantic_sampling_plan(video_signal_stats)
 
-    total_videos = max(1, len(video_ids))
     profile = {
         "timestamp": int(time.time()),
         "profile_source": "five_frame_query_aware_train_distribution",
@@ -750,12 +698,8 @@ def build_observed_distribution_profile(
             ),
             "video_ids_profiled": min(len(video_ids), video_budget or len(video_ids)),
             "question_rows_profiled": question_count,
-            "baseline_trajectories_profiled": 0,
-            "structure_segments_profiled": 0,
             "raw_videos_profiled": video_signal_stats.get("sampled_videos", 0),
             "unique_videos_profiled": len(video_ids),
-            "include_execution_artifacts": False,
-            "ignored_include_execution_artifacts_arg": bool(include_execution_artifacts),
             "supervision_used": False,
             "query_context_used": True,
             "forbidden_inputs": [
@@ -767,45 +711,14 @@ def build_observed_distribution_profile(
         "distribution_records": distribution_records,
         "raw_video_signal_profile": video_signal_stats,
         "information_channel_schema": _stable_channel_schema(
-            channel_counter,
-            total_videos,
-            interval_lengths,
             video_signal_stats,
-            structure_stats,
             semantic_observation_stats,
         ),
-        "observed_information_channels": {
-            "source": "five_frame_query_aware_records",
-            "dominant_channels": [],
-            "note": (
-                "Questions and answer options are retained as unsupervised design "
-                "context; answers and evidence annotations are excluded."
-            ),
-        },
-        "observed_artifact_channels": structure_stats,
         "semantic_channel_observation_profile": semantic_observation_stats,
         "semantic_channel_sampling_plan": semantic_sampling_plan,
         "information_channel_hypothesis": _channel_hypothesis(
-            channel_counter, tool_counts, structure_stats, total_videos,
-            video_stats=video_signal_stats,
-            semantic_stats=semantic_observation_stats,
+            video_signal_stats, semantic_observation_stats,
         ),
-        "baseline_behavior_observed": {
-            "skipped": True,
-            "reason": "initial profile does not inspect execution trajectories",
-            "sampled_tool_counts": {},
-            "retrieval_heavy": False,
-            "mentions_audio_or_speech": 0,
-            "mentions_text_or_ocr": 0,
-        },
-        "diagnosis_guidance": {
-            "must_not_use_human_type_label": True,
-            "prompt_instruction": (
-                "Initial baseline design may use the five-frame per-video records, "
-                "their associated questions/options, and deep research. It must not "
-                "use answers, evidence windows, trajectories, or human type labels."
-            ),
-        },
     }
 
     if output_path:
@@ -843,13 +756,10 @@ def main() -> None:
         args.workspace,
         distribution_spec=spec,
         output_path=output,
-        include_execution_artifacts=False,
     )
     print(output)
     print(json.dumps({
-        "dominant_channels": (
-            profile.get("observed_information_channels", {}) or {}
-        ).get("dominant_channels", []),
+        "primary_channel": profile["information_channel_hypothesis"]["primary_observed_channel"],
         "profiled_questions": (
             profile.get("sampling", {}) or {}
         ).get("question_rows_profiled", 0),

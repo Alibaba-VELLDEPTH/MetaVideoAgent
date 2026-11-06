@@ -16,10 +16,7 @@ def run_dir(run_id: str, root: str = "") -> str:
     if not run_id:
         raise ValueError("run_id is required")
     root_abs = output_root(root)
-    # Explicit step-by-step runs sometimes pass an output root that already
-    # points at the run directory.  Avoid producing
-    # ``.../<run_id>/<run_id>`` because that mixes current artifacts with stale
-    # sibling runs and makes diagnosis/codex input paths ambiguous.
+    # Accept either the output root or this run's directory.
     if os.path.basename(os.path.normpath(root_abs)) == run_id:
         return root_abs
     return os.path.join(root_abs, run_id)

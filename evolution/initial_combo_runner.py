@@ -1,14 +1,9 @@
-"""Run an initial self-designed combo as the pre-evolution reference.
-
-It consumes an ``initial_combo_plan.json`` and evaluates the generated
-combo in an isolated sandbox, producing reference trajectories for the first
-Teacher/Diagnosis pass.
-"""
+"""Execute an initial bundle and retain trajectories for Teacher and Diagnosis."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import copy
 import json
 import os
 import sys
@@ -31,6 +26,7 @@ from runtime_paths import (
 
 RUNTIME_DIR = use_runtime_path()
 from capability_registry import DEFAULT_PROFILE_IDS, resolve_profile  # noqa: E402
+from combo_contract import require_complete_agent_combo  # noqa: E402
 
 DEFAULT_LLM_MODEL = str(resolve_profile("llm").get("model_id") or "")
 
@@ -40,25 +36,18 @@ from question_set_loader import (  # noqa: E402
 from question_set_loader import (
     select_questions_streaming,
 )
-from sandbox_evaluator import (  # noqa: E402  # noqa: E402  # noqa: E402
+from sandbox_evaluator import (
     _inspect_smoke_structure_quality,
     build_reference_lookup,
     compare_with_reference,
     detect_runtime_engineering_issues,
     evaluate_combo_multi_video,
-    inject_module_bundle,  # noqa: E402
+    inject_module_bundle,
     prebuild_isolated_video_structures,
-    preflight_bundle_runtime,  # noqa: E402
+    preflight_bundle_runtime,
     single_question_bundle_smoke_test,
 )
 
-REQUIRED_COMBO_KEYS = {
-    "video_structuring": "STRUCTURING_MAP",
-    "thinking": "THINKING_MAP",
-    "memory": "WORK_MEMORY_MAP",
-    "localization": "LOCALIZATION_MAP",
-    "perception": "PERCEPTION_MAP",
-}
 
 def _execution_vlm_concurrency(value: object) -> int:
     """Keep normal runs at 32; start-rate-gated full eval may retain 128 in flight."""
@@ -72,19 +61,6 @@ def _execution_vlm_concurrency(value: object) -> int:
     except (TypeError, ValueError):
         requested = 32
     return max(1, min(ceiling, requested))
-
-
-def _validate_combo_registered(combo: Dict) -> List[str]:
-    import module_map
-    issues = []
-    for combo_key, map_name in REQUIRED_COMBO_KEYS.items():
-        value = combo.get(combo_key, "")
-        registry = getattr(module_map, map_name, {})
-        if not value:
-            issues.append(f"missing combo key: {combo_key}")
-        elif value not in registry:
-            issues.append(f"{combo_key}={value!r} is not registered in {map_name}")
-    return issues
 
 
 def _read_json(path: str) -> Dict:
@@ -115,15 +91,10 @@ def _structure_artifact(structure_dir: str, combo: Dict, video_ids: List[str],
             path = os.path.join(materialized_dir, name)
             if not name.endswith(".jsonl") or not os.path.isfile(path):
                 continue
-            digest = hashlib.sha256()
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
             files.append({
                 "name": name,
                 "path": path,
                 "size": os.path.getsize(path),
-                "sha256": digest.hexdigest(),
             })
     return {
         "artifact_type": "metavideoagent_structure_artifact",
@@ -138,7 +109,7 @@ def _structure_artifact(structure_dir: str, combo: Dict, video_ids: List[str],
     }
 
 
-def _paths(workspace: str, run_id: str, output_root: str = "", artifact_prefix: str = "initial_combo") -> Dict[str, str]:
+def _paths(run_id: str, output_root: str = "") -> Dict[str, str]:
     run_dir = (
         os.path.abspath(output_root)
         if output_root else os.path.join(runtime_output_root(), "initial_combos", run_id)
@@ -146,11 +117,11 @@ def _paths(workspace: str, run_id: str, output_root: str = "", artifact_prefix: 
     return {
         "run_dir": run_dir,
         "sandbox_dir": os.path.join(run_dir, "sandbox"),
-        "results_path": os.path.join(run_dir, f"{artifact_prefix}_results.jsonl"),
-        "report_path": os.path.join(run_dir, f"{artifact_prefix}_report.json"),
+        "results_path": os.path.join(run_dir, "initial_baseline_results.jsonl"),
+        "report_path": os.path.join(run_dir, "initial_baseline_report.json"),
         "plan_snapshot": os.path.join(run_dir, "initial_combo_plan.json"),
         "bundle_snapshot": os.path.join(run_dir, "initial_baseline_bundle.json"),
-        "summary_path": os.path.join(run_dir, f"{artifact_prefix}_summary.md"),
+        "summary_path": os.path.join(run_dir, "initial_baseline_summary.md"),
     }
 
 
@@ -164,58 +135,6 @@ def _dedupe_results(results: List[dict], questions: List[dict]) -> List[dict]:
     seen = {row.get("task_id", "") for row in ordered}
     ordered.extend(row for row in results if row.get("task_id", "") not in seen)
     return ordered
-
-
-def _load_completed_sandbox_rows(sandbox_dir: str,
-                                 questions: List[dict]) -> tuple[List[dict], set[str]]:
-    """Read already-persisted task rows for an explicit resume run.
-
-    The evaluator appends one complete row only after an individual question
-    returns.  This lets an interrupted held-out evaluation resume without
-    rerunning completed questions or mixing a second copy of their
-    trajectories into the final report.  Duplicate task ids are fail-closed:
-    selecting one would conceal a contaminated prior run.
-    """
-    expected = {str(item.get("task_id") or "") for item in questions}
-    expected.discard("")
-    rows_by_task: Dict[str, dict] = {}
-    duplicates = set()
-    if os.path.isdir(sandbox_dir):
-        for name in sorted(os.listdir(sandbox_dir)):
-            if not name.endswith("_sandbox.jsonl"):
-                continue
-            path = os.path.join(sandbox_dir, name)
-            if not os.path.isfile(path):
-                continue
-            with open(path, "r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise RuntimeError(f"invalid persisted sandbox JSONL: {path}:{line_number}") from exc
-                    task_id = str(
-                        row.get("task_id")
-                        or (row.get("task_meta") or {}).get("task_id")
-                        or ""
-                    )
-                    if not task_id or task_id not in expected:
-                        continue
-                    if task_id in rows_by_task:
-                        duplicates.add(task_id)
-                    else:
-                        rows_by_task[task_id] = row
-    if duplicates:
-        raise RuntimeError(
-            "resume refused: existing sandbox artifacts contain duplicate task_ids; "
-            f"do not append a second evaluation pass ({sorted(duplicates)[:5]})"
-        )
-    ordered = [rows_by_task[item.get("task_id", "")] for item in questions
-               if item.get("task_id", "") in rows_by_task]
-    return ordered, set(rows_by_task)
-
-
 
 
 def _time_reference_bounds(question: Dict) -> tuple:
@@ -309,80 +228,19 @@ def _restore_env(old_values: Dict[str, str]) -> None:
             os.environ[key] = value
 
 
-def _bundle_fingerprint(bundle: Dict) -> str:
-    """Hash the executable five-module payload, not a mutable artifact path."""
-    records = []
-    raw_modules = (bundle or {}).get("modules") if isinstance(bundle, dict) else []
-    if isinstance(raw_modules, dict):
-        modules = [
-            dict(item, module_type=str(module_type))
-            for module_type, item in raw_modules.items()
-            if isinstance(item, dict)
-        ]
-    elif isinstance(raw_modules, list):
-        modules = [item for item in raw_modules if isinstance(item, dict)]
-    else:
-        modules = []
-    for module in modules:
-        records.append({
-            "module_type": str(module.get("module_type") or ""),
-            "name": str(module.get("name") or ""),
-            "code": str(module.get("code") or ""),
-        })
-    payload = {
-        "runtime_id": str((bundle or {}).get("runtime_id") or ""),
-        "combo": (bundle or {}).get("combo") or {},
-        "modules": sorted(records, key=lambda item: item["module_type"]),
-        "tool_surface": (bundle or {}).get("immutable_tool_surface") or {},
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-
-def _reassess_existing_bundle_smoke(bundle: Dict, smoke_result_path: str) -> Dict:
-    """Revalidate an already-executed smoke without any model invocation.
-
-    This is deliberately narrow: it accepts only an artifact from the exact
-    executable bundle, reuses its original trajectory/structure directory,
-    and reruns the deterministic structural-quality check.  It exists for
-    execution-layer checker fixes; it cannot turn a behavioral/API failure
-    into a pass or synthesize a smoke result.
-    """
+def _reassess_existing_bundle_smoke(smoke_result_path: str) -> Dict:
+    """Recheck captured structure evidence while retaining each case's runtime outcomes."""
     source_path = os.path.abspath(smoke_result_path or "")
     if not source_path or not os.path.isfile(source_path):
         raise RuntimeError(f"reusable smoke result does not exist: {smoke_result_path}")
     source = _read_json(source_path)
-    source_bundle_path = os.path.join(os.path.dirname(source_path), "initial_baseline_bundle.json")
-    if not os.path.isfile(source_bundle_path):
-        raise RuntimeError(
-            "reusable smoke requires its colocated initial_baseline_bundle.json: "
-            f"{source_bundle_path}"
-        )
-    source_bundle = _read_json(source_bundle_path)
-    if _bundle_fingerprint(bundle) != _bundle_fingerprint(source_bundle):
-        raise RuntimeError(
-            "reusable smoke bundle does not exactly match this full-eval bundle; "
-            "refusing cross-bundle smoke reuse"
-        )
+    source_bundle = source.get("tested_bundle")
+    if not isinstance(source_bundle, dict) or not source_bundle.get("modules") or not source_bundle.get("combo"):
+        raise RuntimeError("reusable smoke has no captured executable; rerun smoke")
 
     cases = source.get("smoke_case_results") or []
-    if not isinstance(cases, list) or len(cases) != 1 or not isinstance(cases[0], dict):
-        raise RuntimeError("reusable smoke must contain exactly one structured smoke case")
-    case = cases[0]
-    sandbox_dir = str(case.get("sandbox_dir") or "")
-    video_id = str(case.get("sample_video_id") or source.get("sample_video_id") or "")
-    if not sandbox_dir or not video_id:
-        raise RuntimeError("reusable smoke is missing its sandbox directory or video identity")
-
-    structure_quality = _inspect_smoke_structure_quality(
-        sandbox_dir, video_id, source_bundle, case.get("combo") or source.get("combo") or {},
-    )
-    original_issues = case.get("runtime_engineering_issues") or []
-    # Structure-quality rules evolve with the runtime.  Reassess their whole
-    # family from the persisted artifact, rather than preserving a stale
-    # checker verdict after the exact same smoke trace has been revalidated.
-    # Non-structure engineering failures remain fail-closed.
+    if not isinstance(cases, list) or not cases or any(not isinstance(case, dict) for case in cases):
+        raise RuntimeError("reusable smoke must contain structured smoke cases")
     structure_quality_issue_types = {
         "structure_artifact_missing",
         "structure_jsonl_missing",
@@ -390,36 +248,54 @@ def _reassess_existing_bundle_smoke(bundle: Dict, smoke_result_path: str) -> Dic
         "structure_canonical_record_missing",
         "structure_required_evidence_channel_absent",
     }
-    remaining_issues = [
-        issue for issue in original_issues
-        if isinstance(issue, dict)
-        and issue.get("issue_type") not in structure_quality_issue_types
-    ]
-    validation_passed = bool((case.get("validation") or {}).get("passed"))
-    behavior_passed = bool((case.get("behavioral_smoke") or {}).get("passed"))
-    passed = bool(
-        validation_passed
-        and behavior_passed
-        and not remaining_issues
-        and not (structure_quality.get("issues") or [])
-    )
+    reassessed_cases = []
+    for case in cases:
+        sandbox_dir = str(case.get("sandbox_dir") or "")
+        video_id = str(case.get("sample_video_id") or "")
+        if not sandbox_dir or not video_id:
+            raise RuntimeError("reusable smoke case is missing its sandbox directory or video identity")
+        structure_quality = _inspect_smoke_structure_quality(
+            sandbox_dir, video_id, source_bundle, case.get("combo") or source_bundle["combo"],
+        )
+        issues = [
+            issue for issue in (case.get("runtime_engineering_issues") or [])
+            if issue.get("issue_type") not in structure_quality_issue_types
+        ] + list(structure_quality.get("issues") or [])
+        passed = bool(
+            (case.get("validation") or {}).get("passed")
+            and (case.get("behavioral_smoke") or {}).get("passed")
+            and not issues
+        )
+        reassessed = {
+            **case,
+            "passed": passed,
+            "engineering_invalid": not passed,
+            "structure_quality": structure_quality,
+            "artifact_quality": structure_quality,
+            "runtime_engineering_issues": issues,
+        }
+        if passed:
+            reassessed.pop("failure_contract", None)
+            reassessed.pop("repair_instruction", None)
+        reassessed_cases.append(reassessed)
+    passed = all(case["passed"] for case in reassessed_cases)
+    first_case = reassessed_cases[0]
     return {
         "passed": passed,
         "stage": "reassessed_existing_bundle_smoke",
         "reassessment_policy": (
-            "deterministic recheck of an existing exact-bundle smoke; no model calls, retries, "
-            "or answer/correctness judgement"
+            "structure evidence recheck; original validation and behavioral outcomes retained"
         ),
         "reassessment_source": source_path,
-        "reassessment_source_bundle": source_bundle_path,
-        "bundle_fingerprint": _bundle_fingerprint(bundle),
-        "sample_task_id": case.get("sample_task_id") or source.get("sample_task_id") or "",
-        "sample_video_id": video_id,
-        "sandbox_dir": sandbox_dir,
-        "validation": case.get("validation") or {},
-        "behavioral_smoke": case.get("behavioral_smoke") or {},
-        "structure_quality": structure_quality,
-        "runtime_engineering_issues": remaining_issues + list(structure_quality.get("issues") or []),
+        "tested_bundle": source_bundle,
+        "smoke_case_results": reassessed_cases,
+        "smoke_suite_task_ids": [case.get("sample_task_id", "") for case in reassessed_cases],
+        "sample_task_id": first_case.get("sample_task_id", ""),
+        "sample_video_id": first_case["sample_video_id"],
+        "sandbox_dir": first_case["sandbox_dir"],
+        "runtime_engineering_issues": [
+            issue for case in reassessed_cases for issue in case["runtime_engineering_issues"]
+        ],
         "engineering_invalid": not passed,
     }
 
@@ -427,9 +303,8 @@ def _reassess_existing_bundle_smoke(bundle: Dict, smoke_result_path: str) -> Dic
 def _full_eval_admission(results: List[dict], questions: List[dict]) -> Dict:
     """Gate reference eligibility only after every scheduled task has returned.
 
-    Error rows remain in the authoritative result JSONL.  This function never
-    retries them; it records the exact task IDs that a later explicit replay
-    may target after the complete pass has finished.
+    Error rows and missing task IDs remain available for diagnosing the stage
+    before a complete evaluation rerun.
     """
     expected_ids = [str(question.get("task_id") or "") for question in questions]
     result_ids = [str(row.get("task_id") or "") for row in results]
@@ -458,7 +333,7 @@ def _full_eval_admission(results: List[dict], questions: List[dict]) -> Dict:
     passed = execution_complete and not error_rows and not runtime_issues
     return {
         "artifact_type": "initial_full_eval_admission", "schema_version": 1,
-        "retry_policy": "no automatic question retry; replay only after complete-pass artifact review",
+        "retry_policy": "rerun the complete evaluation after resolving recorded execution failures",
         "expected_task_count": len(questions),
         "returned_row_count": len(results),
         "execution_complete": execution_complete,
@@ -518,6 +393,8 @@ def _execution_layer_smoke_failure(smoke_result: Dict) -> str:
     availability.  Keep those failures out of the generated-code repair loop
     even when a downstream artifact check also detects missing evidence.
     """
+    if smoke_result.get("execution_layer_rerun_required") or smoke_result.get("failure_kind") == "execution_layer":
+        return str(smoke_result.get("error_code") or "runtime_provider_or_asset_failure")
     for issue in smoke_result.get("runtime_engineering_issues") or []:
         if not isinstance(issue, dict):
             continue
@@ -567,34 +444,30 @@ def run(args: argparse.Namespace) -> Dict:
             "initial_combo_plan is design context only and is not an executable baseline."
         )
 
-    bundle = _read_json(bundle_path) if bundle_path else {}
+    reusable_smoke_path = str(getattr(args, "reuse_smoke_result", "") or "")
+    if reusable_smoke_path:
+        bundle = _read_json(reusable_smoke_path).get("tested_bundle")
+        if not isinstance(bundle, dict) or not bundle.get("modules") or not bundle.get("combo"):
+            raise RuntimeError("reusable smoke has no captured executable; rerun smoke")
+    else:
+        bundle = _read_json(bundle_path)
     plan = _read_json(plan_path) if plan_path and os.path.exists(plan_path) else {}
-    combo_source = "initial_baseline_bundle" if bundle else "initial_combo_plan"
-    bundle_validation = {"validation_mode": "not_run"} if bundle else {}
-    combo = dict((bundle.get("combo") if bundle else plan.get("combo")) or {})
-    if not combo:
-        raise RuntimeError(f"{combo_source} does not contain combo")
-    custom_configs = plan.get("custom_configs") if isinstance(plan.get("custom_configs"), dict) else {}
+    combo_source = "initial_baseline_bundle"
+    bundle_validation = {"validation_mode": "not_run"}
+    combo = require_complete_agent_combo(bundle.get("combo"), "initial bundle")
     reuse_structure_raw = str(getattr(args, "reuse_structure_dir", "") or "").strip()
-    # ``abspath(\"\")`` resolves to the project cwd and accidentally turns an
-    # omitted reuse argument into a required, stale structure directory.
     reuse_structure_dir = os.path.abspath(reuse_structure_raw) if reuse_structure_raw else ""
     if reuse_structure_dir and not os.path.isdir(reuse_structure_dir):
         raise RuntimeError(f"--reuse-structure-dir is not a directory: {reuse_structure_dir}")
-    # An explicit recovered artifact is authoritative for answer-only
-    # continuation.  A generated bundle normally triggers a rebuild, but that
-    # would discard a separately audited ASR recovery and blur the two phases.
-    structure_rebuild = bool(args.rebuild_structure or (bundle and not reuse_structure_dir))
+    # An explicitly supplied library can serve the same bundle's evaluation;
+    # otherwise initialization builds the library from its structuring module.
+    structure_rebuild = bool(args.rebuild_structure or not reuse_structure_dir)
 
     run_id = args.run_id or f"initial_combo_{int(time.time())}"
-    artifact_prefix = "initial_baseline" if bundle else "initial_combo"
-    paths = _paths(workspace, run_id, getattr(args, "output_root", ""), artifact_prefix=artifact_prefix)
+    paths = _paths(run_id, getattr(args, "output_root", ""))
 
-    # A generated bundle must first prove that it can compile, inject, and be
-    # constructed by the *real* execution layer.  Keep this before dataset
-    # loading so a codegen/ABI failure remains dataset-free without inventing a
-    # synthetic five-module control flow.
-    if bundle and not args.check_only:
+    # Check runtime construction before loading the evaluation data.
+    if not args.check_only:
         os.makedirs(paths["run_dir"], exist_ok=True)
         if plan:
             _write_json(paths["plan_snapshot"], plan)
@@ -628,10 +501,8 @@ def run(args: argparse.Namespace) -> Dict:
     split = args.question_split
     training_slice_preflight = bool(getattr(args, "training_slice_preflight", False))
     if getattr(args, "smoke_only", False):
-        # Smoke needs one no-label case, not the complete split.  Stream the
-        # JSONL files and retain only the deterministic case we will execute.
+        # Stream only the configured no-label smoke cases into memory.
         questions, video_ids, split_spec = select_questions_streaming(
-            workspace,
             video_id=args.video_id,
             distribution_manifest=args.distribution_manifest,
             preferred_splits=(split,),
@@ -640,7 +511,6 @@ def run(args: argparse.Namespace) -> Dict:
         )
     else:
         questions, video_ids, split_spec = load_question_set(
-            workspace,
             video_id=args.video_id,
             distribution_manifest=args.distribution_manifest,
             preferred_splits=(split,),
@@ -662,20 +532,6 @@ def run(args: argparse.Namespace) -> Dict:
             )
 
     scheduled_questions = list(questions)
-    resumed_rows: List[dict] = []
-    resumed_task_ids: set[str] = set()
-    if getattr(args, "resume_existing_results", False):
-        if not args.output_root:
-            raise RuntimeError("--resume-existing-results requires an explicit --output-root")
-        resumed_rows, resumed_task_ids = _load_completed_sandbox_rows(
-            paths["sandbox_dir"], scheduled_questions,
-        )
-        questions = [
-            item for item in scheduled_questions
-            if str(item.get("task_id") or "") not in resumed_task_ids
-        ]
-
-    combo_registration_issues = [] if bundle else _validate_combo_registered(combo)
     readiness = {
         "ready": True,
         "workspace": workspace,
@@ -688,61 +544,43 @@ def run(args: argparse.Namespace) -> Dict:
         "question_split": split,
         "total_questions": len(scheduled_questions),
         "scheduled_question_count": len(questions),
-        "resumed_question_count": len(resumed_rows),
         "video_ids": video_ids,
         "combo": combo,
-        "combo_registration_issues": combo_registration_issues,
         "paths": paths,
         "results_path": paths["results_path"],
         "report_path": paths["report_path"],
         "sandbox_dir": paths["sandbox_dir"],
     }
-    if readiness["combo_registration_issues"]:
-        readiness["ready"] = False
     if args.check_only:
         return readiness
-    if readiness["combo_registration_issues"]:
-        raise RuntimeError(
-            "initial combo has unregistered modules: "
-            f"{readiness['combo_registration_issues']}"
-        )
 
     os.makedirs(paths["run_dir"], exist_ok=True)
     if plan:
         _write_json(paths["plan_snapshot"], plan)
-    if bundle:
-        _write_json(paths["bundle_snapshot"], bundle)
-        readiness["bundle_validation"] = bundle_validation
-    os.environ["METAVIDEOAGENT_LLM_MODEL"] = args.llm_model
+    _write_json(paths["bundle_snapshot"], bundle)
+    readiness["bundle_validation"] = bundle_validation
     os.environ.setdefault("VIDEO_STRUCT_REBUILD_WORKERS", str(args.structure_workers))
     if structure_rebuild:
         os.environ["SANDBOX_DISABLE_FULL_STRUCTURE_BUILD"] = "0"
         os.environ["SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD"] = "1"
         os.environ["SANDBOX_STRUCTURE_CHROMA_PER_VIDEO"] = "1"
-        os.environ.setdefault("VIDEO_STRUCT_RESUME_BUILD", "0")
     else:
         os.environ.setdefault("SANDBOX_DISABLE_FULL_STRUCTURE_BUILD", "1")
         os.environ.setdefault("SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD", "0")
         os.environ.setdefault("SANDBOX_STRUCTURE_CHROMA_PER_VIDEO", "0")
-        os.environ.setdefault("VIDEO_STRUCT_RESUME_BUILD", "0")
 
     combo_id = args.combo_id or f"InitialCombo_{int(time.time())}"
     smoke_result = {}
-    smoke_repair_history = []
-    reusable_smoke_path = str(getattr(args, "reuse_smoke_result", "") or "")
-    if bundle and reusable_smoke_path:
-        smoke_result = _reassess_existing_bundle_smoke(bundle, reusable_smoke_path)
-        _write_json(
-            os.path.join(paths["run_dir"], "bundle_smoke_reassessment.json"),
-            smoke_result,
-        )
+    if reusable_smoke_path:
+        smoke_result = _reassess_existing_bundle_smoke(reusable_smoke_path)
+        reassessment_path = os.path.join(paths["run_dir"], "bundle_smoke_reassessment.json")
+        _write_json(reassessment_path, smoke_result)
         if not smoke_result.get("passed"):
             failure = {
                 **readiness,
                 "ready": False,
                 "status": "reused_bundle_smoke_reassessment_failed",
                 "bundle_smoke_result": smoke_result,
-                "bundle_smoke_repair_history": smoke_repair_history,
                 "effective_initial_baseline_bundle": paths["bundle_snapshot"],
                 "engineering_invalid": True,
                 "error": "existing smoke did not pass deterministic reassessment",
@@ -757,148 +595,131 @@ def run(args: argparse.Namespace) -> Dict:
                 "run_id": run_id,
                 "combo_id": combo_id,
                 "bundle_smoke_result": smoke_result,
-                "bundle_smoke_repair_history": smoke_repair_history,
                 "effective_initial_baseline_bundle": paths["bundle_snapshot"],
                 "results_path": "",
                 "report_path": paths["report_path"],
                 "summary_path": paths["summary_path"],
                 "sandbox_dir": paths["sandbox_dir"],
-                "smoke_results_path": reusable_smoke_path,
+                "smoke_results_path": reassessment_path,
                 "smoke_sandbox_dir": smoke_result.get("sandbox_dir", ""),
-                "total_questions": 1,
+                "total_questions": len(smoke_result["smoke_case_results"]),
                 "full_eval_total_questions_pending": len(questions),
-                "note": "Reused an existing exact-bundle smoke after deterministic reassessment; no model calls were made.",
+                "note": "Reassessed the captured smoke executable and evidence; no model calls were made.",
             }
             _write_json(paths["report_path"], report)
             _write_summary(paths["summary_path"], report)
             return report
-    if bundle and not reusable_smoke_path and not getattr(args, "skip_bundle_smoke_test", False):
+    if not reusable_smoke_path and not getattr(args, "skip_bundle_smoke_test", False):
         strict_time_reference_smoke = bool(
             getattr(args, "smoke_time_reference_only", False)
         )
         smoke_questions = _smoke_suite_questions(
             questions, require_time_reference=strict_time_reference_smoke,
         )
-        attempt = 0
-        while True:
-            suite_results = []
-            smoke_case_results = []
-            trace_rows = []
-            failed_result = None
-            for case_index, smoke_question in enumerate(smoke_questions, start=1):
-                smoke_dir = os.path.join(
-                    paths["run_dir"], f"bundle_smoke_sandbox_attempt_{attempt}_case_{case_index}"
-                )
-                smoke_env_updates = {}
-                if strict_time_reference_smoke:
-                    # Total-attempt limits of one disable provider retries for
-                    # the bounded engineering smoke.
-                    smoke_env_updates.update({
-                        "LLM_MAX_RETRIES": "1",
-                        "VLM_MAX_RETRIES": "1",
-                        "EMBEDDING_MAX_RETRIES": "1",
-                        "OCR_MAX_RETRIES": "1",
-                        # This is an explicit runtime budget, never the
-                        # action-runtime's implicit 60-second default.  It is
-                        # recorded in the smoke provider audit as well.
-                        "METAVIDEOAGENT_PROVIDER_TIMEOUT_SEC": str(max(
-                            1, int(getattr(args, "provider_timeout_sec", 180) or 180)
-                        )),
-                        "RUNTIME_PROVIDER_AUDIT_PATH": os.path.join(paths["run_dir"], "provider_calls.jsonl"),
-                    })
-                if structure_rebuild:
-                    smoke_env_updates.update({
-                        "SANDBOX_STRUCTURE_TIME_REF_ONLY": "1",
-                        "VIDEO_STRUCT_REBUILD_WORKERS": "1",
-                    })
-                old_smoke_env = _set_env_temporarily(smoke_env_updates)
-                try:
-                    case_result = single_question_bundle_smoke_test(
-                        bundle,
-                        smoke_question,
-                        workspace,
-                        smoke_dir,
-                        combo_id=f"{combo_id}_smoke_attempt_{attempt}_case_{case_index}",
-                        llm_model=args.llm_model,
-                        force_rebuild=structure_rebuild,
-                        isolate_structure=True,
-                        runtime_time_reference_only=strict_time_reference_smoke,
-                        reference_structure_dir=reuse_structure_dir,
-                    )
-                finally:
-                    _restore_env(old_smoke_env)
-                suite_results.append({
-                    "case_index": case_index,
-                    "task_id": str(smoke_question.get("task_id") or ""),
-                    "video_id": str(smoke_question.get("video_id") or ""),
-                    "time_reference": smoke_question.get("time_reference"),
-                    "passed": bool(case_result.get("passed")),
-                    "failure_kind": case_result.get("failure_kind", ""),
-                    "sandbox_dir": case_result.get("sandbox_dir", ""),
-                })
-                case_record = dict(case_result)
-                case_trace = case_record.pop("engineering_execution_trace", None)
-                if isinstance(case_trace, dict):
-                    trace_rows.extend([
-                        row for row in (case_trace.get("rows") or []) if isinstance(row, dict)
-                    ])
-                smoke_case_results.append(case_record)
-                if not case_result.get("passed") and failed_result is None:
-                    failed_result = case_result
-            if failed_result is None:
-                smoke_result = {
-                    "passed": True,
-                    "stage": "bundle_smoke_suite",
-                    "smoke_suite": suite_results,
-                    "smoke_suite_task_ids": [item["task_id"] for item in suite_results],
-                }
-            else:
-                smoke_result = dict(failed_result)
-                smoke_result["smoke_suite"] = suite_results
-                smoke_result["smoke_suite_task_ids"] = [item["task_id"] for item in suite_results]
-            smoke_result["smoke_case_results"] = smoke_case_results
-            if trace_rows:
-                smoke_result["engineering_execution_trace"] = {
-                    "artifact_type": "engineering_smoke_execution_trace", "schema_version": 1,
-                    "trace_policy": (
-                        "complete no-label trajectories for every selected smoke case; "
-                        "not an accuracy or correctness artifact"
-                    ),
-                    "rows": trace_rows,
-                }
-            engineering_trace = smoke_result.pop("engineering_execution_trace", None)
-            if isinstance(engineering_trace, dict) and engineering_trace:
-                trace_path = os.path.join(
-                    paths["run_dir"], f"bundle_smoke_execution_trace_attempt_{attempt}.json",
-                )
-                _write_json(trace_path, engineering_trace)
-                smoke_result["engineering_execution_trace_path"] = trace_path
-            _write_json(
-                os.path.join(paths["run_dir"], f"bundle_smoke_result_attempt_{attempt}.json"),
-                smoke_result,
+        suite_results = []
+        smoke_case_results = []
+        trace_rows = []
+        failed_result = None
+        for case_index, smoke_question in enumerate(smoke_questions, start=1):
+            smoke_dir = os.path.join(
+                paths["run_dir"], f"bundle_smoke_sandbox_case_{case_index}"
             )
-            execution_error = _execution_layer_smoke_failure(smoke_result)
-            if execution_error:
-                smoke_result["failure_kind"] = "execution_layer"
-                smoke_result["error_code"] = execution_error
-                smoke_result["repair_route"] = "rerun_same_bundle_after_execution_layer_fix"
-                break
-            if smoke_result.get("passed"):
-                break
+            smoke_env_updates = {}
+            if strict_time_reference_smoke:
+                # Total-attempt limits of one disable provider retries for
+                # the bounded engineering smoke.
+                smoke_env_updates.update({
+                    "LLM_MAX_RETRIES": "1",
+                    "VLM_MAX_RETRIES": "1",
+                    "EMBEDDING_MAX_RETRIES": "1",
+                    "OCR_MAX_RETRIES": "1",
+                    # Use the configured smoke request deadline.
+                    "METAVIDEOAGENT_PROVIDER_TIMEOUT_SEC": str(max(
+                        1, int(getattr(args, "provider_timeout_sec", 180) or 180)
+                    )),
+                    "RUNTIME_PROVIDER_AUDIT_PATH": os.path.join(paths["run_dir"], "provider_calls.jsonl"),
+                })
+            if structure_rebuild:
+                smoke_env_updates.update({
+                    "SANDBOX_STRUCTURE_TIME_REF_ONLY": "1",
+                    "VIDEO_STRUCT_REBUILD_WORKERS": "1",
+                })
+            old_smoke_env = _set_env_temporarily(smoke_env_updates)
+            try:
+                case_result = single_question_bundle_smoke_test(
+                    bundle,
+                    smoke_question,
+                    workspace,
+                    smoke_dir,
+                    combo_id=f"{combo_id}_smoke_case_{case_index}",
+                    force_rebuild=structure_rebuild,
+                    isolate_structure=True,
+                    runtime_time_reference_only=strict_time_reference_smoke,
+                    reference_structure_dir=reuse_structure_dir,
+                )
+            finally:
+                _restore_env(old_smoke_env)
+            suite_results.append({
+                "case_index": case_index,
+                "task_id": str(smoke_question.get("task_id") or ""),
+                "video_id": str(smoke_question.get("video_id") or ""),
+                "time_reference": smoke_question.get("time_reference"),
+                "passed": bool(case_result.get("passed")),
+                "failure_kind": case_result.get("failure_kind", ""),
+                "sandbox_dir": case_result.get("sandbox_dir", ""),
+            })
+            case_record = dict(case_result)
+            case_trace = case_record.pop("engineering_execution_trace", None)
+            if isinstance(case_trace, dict):
+                trace_rows.extend([
+                    row for row in (case_trace.get("rows") or []) if isinstance(row, dict)
+                ])
+            smoke_case_results.append(case_record)
+            if not case_result.get("passed") and failed_result is None:
+                failed_result = case_result
+        if failed_result is None:
+            smoke_result = {
+                "passed": True,
+                "stage": "bundle_smoke_suite",
+                "smoke_suite": suite_results,
+                "smoke_suite_task_ids": [item["task_id"] for item in suite_results],
+            }
+        else:
+            smoke_result = dict(failed_result)
+            smoke_result["smoke_suite"] = suite_results
+            smoke_result["smoke_suite_task_ids"] = [item["task_id"] for item in suite_results]
+        smoke_result["smoke_case_results"] = smoke_case_results
+        # Carry the executable that actually ran, including failed
+        # attempts eligible for a later execution-checker reassessment.
+        smoke_result["tested_bundle"] = copy.deepcopy(bundle)
+        if trace_rows:
+            smoke_result["engineering_execution_trace"] = {
+                "artifact_type": "engineering_smoke_execution_trace", "schema_version": 1,
+                "trace_policy": (
+                    "complete no-label trajectories for every selected smoke case; "
+                    "not an accuracy or correctness artifact"
+                ),
+                "rows": trace_rows,
+            }
+        engineering_trace = smoke_result.pop("engineering_execution_trace", None)
+        if isinstance(engineering_trace, dict) and engineering_trace:
+            trace_path = os.path.join(
+                paths["run_dir"], "bundle_smoke_execution_trace.json",
+            )
+            _write_json(trace_path, engineering_trace)
+            smoke_result["engineering_execution_trace_path"] = trace_path
+        execution_error = _execution_layer_smoke_failure(smoke_result)
+        if execution_error:
+            smoke_result["failure_kind"] = "execution_layer"
+            smoke_result["error_code"] = execution_error
+            smoke_result["repair_route"] = "rerun_same_bundle_after_execution_layer_fix"
+        elif not smoke_result.get("passed"):
             smoke_result["repair_route"] = "automatic_initial_bundle_repair"
             smoke_result["repair_required"] = {
                 "bundle": paths["bundle_snapshot"],
-                "smoke_result": os.path.join(paths["run_dir"], f"bundle_smoke_result_attempt_{attempt}.json"),
-                "next_action": (
-                    "Return the emitted failure artifact to the configured automatic "
-                    "coding-agent adapter, then rerun this exact smoke gate."
-                ),
+                "smoke_result": os.path.join(paths["run_dir"], "bundle_smoke_result.json"),
+                "next_action": "Repair the bundle using the recorded smoke failure, then rerun smoke.",
             }
-            _write_json(
-                os.path.join(paths["run_dir"], f"bundle_smoke_result_attempt_{attempt}.json"),
-                smoke_result,
-            )
-            break
         _write_json(os.path.join(paths["run_dir"], "bundle_smoke_result.json"), smoke_result)
         if not smoke_result.get("passed"):
             failure = {
@@ -906,8 +727,7 @@ def run(args: argparse.Namespace) -> Dict:
                 "ready": False,
                 "status": "bundle_smoke_failed",
                 "bundle_smoke_result": smoke_result,
-                "bundle_smoke_repair_history": smoke_repair_history,
-                "effective_initial_baseline_bundle": paths["bundle_snapshot"] if bundle else "",
+                "effective_initial_baseline_bundle": paths["bundle_snapshot"],
                 "engineering_invalid": bool(smoke_result.get("engineering_invalid")),
                 "error": smoke_result.get("error", "bundle smoke test failed"),
             }
@@ -921,8 +741,7 @@ def run(args: argparse.Namespace) -> Dict:
                 "run_id": run_id,
                 "combo_id": combo_id,
                 "bundle_smoke_result": smoke_result,
-                "bundle_smoke_repair_history": smoke_repair_history,
-                "effective_initial_baseline_bundle": paths["bundle_snapshot"] if bundle else bundle_path,
+                "effective_initial_baseline_bundle": paths["bundle_snapshot"],
                 "results_path": "",
                 "report_path": paths["report_path"],
                 "summary_path": paths["summary_path"],
@@ -941,19 +760,14 @@ def run(args: argparse.Namespace) -> Dict:
     map_backups = _backup_maps(module_map_refs)
     injected_validation = {}
     try:
-        if bundle:
-            ok, injected_combo, bundle_custom_configs, injected_validation = inject_module_bundle(
-                bundle,
-                module_map_refs,
+        ok, combo, custom_configs, injected_validation = inject_module_bundle(
+            bundle, module_map_refs,
+        )
+        if not ok:
+            raise RuntimeError(
+                "initial baseline bundle injection failed: "
+                f"{injected_validation.get('issues')}"
             )
-            if not ok:
-                raise RuntimeError(
-                    "initial baseline bundle injection failed: "
-                    f"{injected_validation.get('issues')}"
-                )
-            combo = injected_combo
-            if bundle_custom_configs:
-                custom_configs.update(bundle_custom_configs)
         struct_name = combo.get("video_structuring")
         if structure_rebuild and struct_name and getattr(args, "structure_workers", 0):
             struct_cfg = dict(custom_configs.get(struct_name) or {})
@@ -962,11 +776,8 @@ def run(args: argparse.Namespace) -> Dict:
             physics.setdefault("parallel_batch_delay", 0.2)
             struct_cfg["physics"] = physics
             custom_configs[struct_name] = struct_cfg
-        # A full initial reference must capture the first outcome of every
-        # scheduled task.  In particular, do not spend a second/third request
-        # retrying a timeout while the rest of the training split has not yet
-        # finished.  Error rows are persisted and become an explicit, later
-        # replay manifest only after this complete pass returns.
+        # Evaluate the complete split once and retain each task's outcome,
+        # including execution failures, for the stage report.
         try:
             structure_vlm_start_rate_limit = max(
                 0, int(os.environ.get("METAVIDEOAGENT_VLM_STARTS_PER_SECOND", "0") or 0)
@@ -989,26 +800,14 @@ def run(args: argparse.Namespace) -> Dict:
             "METAVIDEOAGENT_LLM_MAX_CONCURRENCY": str(max(
                 1, min(16, int(getattr(args, "llm_max_concurrency", 8) or 8))
             )),
-            # Preserve the first complete-pass outcome per question, while
-            # making the transport deadline explicit and retaining a
-            # request-level audit for later, isolated provider-failure replay.
+            # Record the transport deadline and request-level execution audit.
             "METAVIDEOAGENT_PROVIDER_TIMEOUT_SEC": str(max(
                 1, int(getattr(args, "provider_timeout_sec", 180) or 180)
             )),
             "RUNTIME_PROVIDER_AUDIT_PATH": os.path.join(paths["run_dir"], "provider_calls.jsonl"),
         })
         try:
-            # Resume only submits missing task ids.  A JSONL file can be an
-            # interrupted, partial structure build, so its mere existence is
-            # never evidence that a scheduled video is ready to answer.  Keep
-            # the isolated artifact in VIDEO_STRUCT_RESUME_BUILD mode and
-            # invoke the builder for every video that still has questions; the
-            # builder de-duplicates recorded windows and fills only the gaps.
-            # Formal replays have a hard phase boundary: first materialize
-            # every full-video library, then schedule all questions through a
-            # single global worker pool.  Besides matching the evaluation
-            # protocol, this keeps a completed question from waiting for the
-            # rest of its video before the next question can start.
+            # Build this evaluation's video libraries before answering questions.
             structure_prebuild = []
             question_video_ids = sorted({
                 str(item.get("video_id") or "") for item in questions
@@ -1027,7 +826,7 @@ def run(args: argparse.Namespace) -> Dict:
             # answer workers follow their own global question concurrency and
             # must not inherit a build-only per-second throttle.
             os.environ["METAVIDEOAGENT_VLM_STARTS_PER_SECOND"] = "0"
-            fresh_results = evaluate_combo_multi_video(
+            results = evaluate_combo_multi_video(
                 workspace,
                 questions,
                 combo,
@@ -1042,29 +841,15 @@ def run(args: argparse.Namespace) -> Dict:
                 global_question_scheduler=True,
                 reference_structure_dir=reuse_structure_dir,
             ) if questions else []
-            results = list(resumed_rows) + list(fresh_results)
         finally:
             _restore_env(full_eval_env_backup)
     finally:
-        if bundle:
-            _restore_maps(module_map_refs, map_backups)
+        _restore_maps(module_map_refs, map_backups)
     full_eval_admission = _full_eval_admission(results, scheduled_questions)
     ordered = _dedupe_results(results, scheduled_questions)
     _write_jsonl(paths["results_path"], ordered)
-    replay_manifest_path = os.path.join(paths["run_dir"], "initial_full_eval_replay_manifest.json")
-    _write_json(replay_manifest_path, {
-        "artifact_type": "initial_full_eval_replay_manifest", "schema_version": 1,
-        "policy": "generated after the complete pass; this file never triggers an automatic replay",
-        "source_results_path": paths["results_path"],
-        "admission": full_eval_admission,
-        "task_ids_eligible_for_explicit_replay": sorted(set(
-            list(full_eval_admission.get("missing_task_ids") or [])
-            + [item.get("task_id", "") for item in full_eval_admission.get("error_tasks") or []]
-        ) - {""}),
-    })
-
     # Self-reference gives a zero-delta report with strict correctness counts.
-    reference_label = "initial_baseline" if bundle else "initial_combo"
+    reference_label = "initial_baseline"
     reference_lookup = build_reference_lookup(ordered, reference_label=reference_label)
     report = compare_with_reference(
         ordered,
@@ -1081,10 +866,9 @@ def run(args: argparse.Namespace) -> Dict:
         "combo_source": combo_source,
         "combo_plan": plan_path,
         "initial_baseline_bundle": bundle_path,
-        "effective_initial_baseline_bundle": paths["bundle_snapshot"] if bundle else "",
+        "effective_initial_baseline_bundle": paths["bundle_snapshot"],
         "bundle_validation": injected_validation or bundle_validation,
         "bundle_smoke_result": smoke_result,
-        "bundle_smoke_repair_history": smoke_repair_history,
         "validation_scope": (
             "training_slice_preflight"
             if training_slice_preflight else "initial_reference_multi_video"
@@ -1104,17 +888,13 @@ def run(args: argparse.Namespace) -> Dict:
         "engineering_invalid": not bool(full_eval_admission.get("passed")),
         "reference_eligible": reference_eligible,
         "ready": reference_eligible,
-        "replay_manifest_path": replay_manifest_path,
         "full_eval_retry_policy": full_eval_admission.get("retry_policy"),
         "concurrency": args.concurrency,
-        "resume_existing_results": bool(getattr(args, "resume_existing_results", False)),
-        "resumed_question_count": len(resumed_rows),
-        "fresh_question_count": len(questions),
-        "llm_model": args.llm_model,
+        "llm_model": DEFAULT_LLM_MODEL,
         "runtime_models": {
             "vlm_profile_id": DEFAULT_PROFILE_IDS["vlm"],
             "llm_profile_id": DEFAULT_PROFILE_IDS["llm"],
-            "llm_model": args.llm_model,
+            "llm_model": DEFAULT_LLM_MODEL,
             "asr_profile_id": DEFAULT_PROFILE_IDS["asr"],
             "embedding_profile_id": DEFAULT_PROFILE_IDS["embedding"],
         },
@@ -1129,7 +909,7 @@ def run(args: argparse.Namespace) -> Dict:
         "provider_transport_policy": {
             "provider_timeout_sec": max(1, int(getattr(args, "provider_timeout_sec", 180) or 180)),
             "initial_full_eval_attempts_per_provider_call": 1,
-            "question_replay_policy": "explicit_only_after_complete_pass",
+            "evaluation_retry_policy": "whole_stage_after_execution_fix",
             "provider_call_audit_path": os.path.join(paths["run_dir"], "provider_calls.jsonl"),
             "vlm_start_rate_limit_per_second": max(
                 0, int(os.environ.get("METAVIDEOAGENT_VLM_STARTS_PER_SECOND", "0") or 0)
@@ -1165,8 +945,8 @@ def run(args: argparse.Namespace) -> Dict:
             "Training-slice preflight completed; inspect its artifacts, then run a complete "
             "evolution-split full evaluation before entering evolution."
             if training_slice_preflight else
-            "Do not enter evolution: inspect the completed full-eval results and "
-            "run only the explicit replay tasks named in replay_manifest_path."
+            "Resolve the recorded execution failures and rerun the complete "
+            "initial evaluation before entering evolution."
         ),
     })
     _write_json(paths["report_path"], report)
@@ -1186,14 +966,12 @@ def main() -> int:
     parser.add_argument("--vlm-max-concurrency", type=int, default=32,
                         help="VLM in-flight ceiling (1-32 normally; up to 128 with explicit start-rate gate).")
     parser.add_argument("--provider-timeout-sec", type=int, default=180,
-                        help="Explicit per-provider request deadline; formal default is 180 seconds, not 60.")
+                        help="Provider request deadline in seconds (default: 180).")
     parser.add_argument("--first-n", type=int, default=0)
-    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
     parser.add_argument("--llm-max-concurrency", type=int, default=8,
                         help="Process-wide text-LLM HTTP ceiling (1-16; default 8; thinking disabled).")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--base-url", default="")
-    parser.add_argument("--asr-model", default="")
     parser.add_argument("--rebuild-structure", action="store_true")
     parser.add_argument("--reuse-structure-dir", default="",
                         help=("Use this verified split-local structure artifact for answer-only evaluation; "
@@ -1203,22 +981,15 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--output-root", default="",
                         help="Directory for initial-agent outputs")
-    parser.add_argument("--resume-existing-results", action="store_true",
-                        help="Run only task_ids absent from this output root's sandbox JSONL, then write one merged result set.")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--reuse-smoke-result", default="",
-                        help="Existing exact-bundle smoke JSON to deterministically reassess without model calls.")
+                        help="Reassess a recorded smoke and its captured executable without model calls.")
     parser.add_argument("--training-slice-preflight", action="store_true",
                         help="Run a training-only subset as a non-reference preflight; it can never enter evolution.")
     parser.add_argument("--smoke-only", action="store_true",
                         help="Run real bundle smoke only and stop before full initial reference evaluation")
     parser.add_argument("--smoke-time-reference-only", action="store_true",
                         help="Require every smoke case and media tool call to stay inside time_reference")
-    parser.set_defaults(
-        bundle_smoke_repair_attempts=0,
-        codex_cli="",
-        codegen_timeout=900,
-    )
     args = parser.parse_args()
     vlm_ceiling = 128 if int(os.environ.get("METAVIDEOAGENT_VLM_STARTS_PER_SECOND", "0") or 0) > 0 else 32
     if args.vlm_max_concurrency < 1 or args.vlm_max_concurrency > vlm_ceiling:

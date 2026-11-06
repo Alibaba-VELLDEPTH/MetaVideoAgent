@@ -21,9 +21,9 @@ the profile and enforces those formats.
 
 ## Active Media Window Contract
 
-Normal smoke/full evaluation exposes the complete raw video. Targeted probe
-exposes only the exact `time_reference` interval(s). All raw-media adapters
-must obey this boundary.
+Smoke uses the selected task's `time_reference` window; targeted probe uses
+its declared interval(s). Full evaluation makes the complete video available.
+All raw-media adapters operate within the environment's active media windows.
 
 - Read `env.get_active_time_windows()` only through a runtime adapter.
 - VLM/OCR image tools receive assets derived from `active_time_window_frame`.
@@ -34,7 +34,7 @@ must obey this boundary.
 
 ## Registered Runtime Adapters
 
-Generated code may import only:
+Generated code calls model/media capabilities through:
 
 ```python
 import runtime_evidence
@@ -44,6 +44,11 @@ Use these adapters with a documented `profile_id` when a different profile is
 actually needed. Omitting `profile_id` preserves the current default profile.
 
 - LLM: `runtime_evidence.call_text_llm(messages, profile_id=..., temperature=..., max_tokens=...)`
+- Native chat/tool calling: `runtime_evidence.call_chat_llm(messages, profile_id=..., temperature=..., max_tokens=..., request_options={"tools": [...], "tool_choice": "auto"})`.
+  The result contains `status`, the complete assistant `message` (including
+  native `tool_calls`), `text`, and `profile`. Other supported chat sampling
+  parameters can be supplied in `request_options`; the profile still selects
+  the model and transport. Keep the source agent's schemas and message IDs.
 - VLM: `runtime_evidence.inspect_active_frames(env, capability="vlm", prompt=..., max_windows=..., frames_per_window=..., profile_id=...)`
 - ASR: `runtime_evidence.transcribe_active_windows(env, max_windows=..., max_seconds_per_window=..., profile_id=...)`
 - OCR: `runtime_evidence.inspect_active_frames(env, capability="ocr", prompt=..., max_windows=..., frames_per_window=..., profile_id=...)`
@@ -53,6 +58,12 @@ actually needed. Omitting `profile_id` preserves the current default profile.
 Every adapter records profile ID, resolved provider/model, transport, input
 provenance, and status. If an adapter is unavailable or errors, return the
 structured fallback; never fabricate transcripts or visual observations.
+
+Agent-owned helpers and prompt/configuration files are carried in `support_files`
+under `agent/`. Use package-relative imports and `__file__`-relative resource
+paths. Module records contain complete source files and explicit selected class
+names. `agent.json` supplies those entrypoints during evolution, while
+`implementation.md` carries implementation reasoning and pending checks.
 
 ### Localized media calls
 
@@ -97,5 +108,3 @@ manual. A profile's existence does not make it mandatory or configured.
 - Keep all frame/window/call counts bounded.
 - A module that emits confidence or conflict must derive them from channel
   agreement and failures; never use constants.
-- A selected capability must be observed through its runtime event before smoke
-  or probe can pass.

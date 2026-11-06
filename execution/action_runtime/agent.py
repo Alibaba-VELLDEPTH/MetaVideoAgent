@@ -1,6 +1,7 @@
 import inspect
 
 try:
+    import runtime_evidence
     import utils
     from module_map import (
         AGENT_CONFIG,
@@ -11,7 +12,6 @@ try:
         WORK_MEMORY_MAP,
     )
     from module_protocol import (
-        PROTOCOL_VERSION,
         extract_export_values,
         make_thinking_context,
         make_tool_request,
@@ -21,7 +21,7 @@ try:
         result_is_usable,
     )
 except ImportError:  # pragma: no cover - package import
-    from . import utils
+    from . import runtime_evidence, utils
     from .module_map import (
         AGENT_CONFIG,
         LOCALIZATION_MAP,
@@ -31,7 +31,6 @@ except ImportError:  # pragma: no cover - package import
         WORK_MEMORY_MAP,
     )
     from .module_protocol import (
-        PROTOCOL_VERSION,
         extract_export_values,
         make_thinking_context,
         make_tool_request,
@@ -213,8 +212,6 @@ def _redact_runtime_log_meta(value):
     return value
 
 
-
-
 class MetaVideoAgent:
     """Coordinate the five generated modules for one MetaVideoAgent run."""
     def __init__(self, env, combo: dict, custom_configs: dict = None):
@@ -223,6 +220,7 @@ class MetaVideoAgent:
         self.video_id = env.video_id
         self.workspace_dir = env.workspace_dir
         self.config = AGENT_CONFIG.copy()
+        self.custom_configs = custom_configs or {}
         missing = [key for key in REQUIRED_COMBO_KEYS if not combo.get(key)]
         if missing:
             raise RuntimeError(
@@ -316,7 +314,10 @@ class MetaVideoAgent:
 
         work_mem_key = _require_combo_key(self.combo, 'memory', WORK_MEMORY_MAP)
         work_mem_cls = WORK_MEMORY_MAP[work_mem_key]
-        self.work_memory = work_mem_cls(self.workspace_dir, self.video_id, question)
+        self.work_memory = work_mem_cls(
+            self.workspace_dir, self.video_id, question,
+            custom_config=self.custom_configs.get(work_mem_key),
+        )
         self.work_memory.set_combo(self.combo)
 
         step = 0
@@ -333,38 +334,23 @@ class MetaVideoAgent:
             # Provide both the readable memory context and the lossless protocol
             # packet exposed through ThinkingBase.
             work_context = self.work_memory.get_context()
-            memory_packet_getter = getattr(self.work_memory, "get_context_packet", None)
-            memory_packet = (
-                memory_packet_getter() if callable(memory_packet_getter) else {
-                    "protocol_version": PROTOCOL_VERSION,
-                    "kind": "memory_context",
-                    "recent_events": list(getattr(self.work_memory, "raw_history", [])[-30:]),
-                }
-            )
+            memory_packet = self.work_memory.get_context_packet()
             if work_context != "No previous steps.":
-                try:
-                    import runtime_evidence
-                    runtime_evidence.mark_output_consumed(
-                        consumer="thinking", producer_module="memory",
-                        output_protocol="memory_context",
-                        output_fields=list(memory_packet.keys()) if isinstance(memory_packet, dict) else [],
-                    )
-                except Exception:
-                    pass
+                runtime_evidence.mark_output_consumed(
+                    consumer="thinking", producer_module="memory",
+                    output_protocol="memory_context",
+                    output_fields=list(memory_packet.keys()) if isinstance(memory_packet, dict) else [],
+                )
             if pending_output_tools:
-                try:
-                    import runtime_evidence
-                    for pending in pending_output_tools:
-                        runtime_evidence.mark_output_consumed(
-                            consumer="thinking",
-                            tool_name=pending["tool_name"],
-                            producer_module=pending["producer_module"],
-                            output_protocol=pending["output_protocol"],
-                            contract_valid=pending["output_contract_valid"],
-                            source_event_ids=pending.get("evidence_event_ids", []),
-                        )
-                except Exception:
-                    pass
+                for pending in pending_output_tools:
+                    runtime_evidence.mark_output_consumed(
+                        consumer="thinking",
+                        tool_name=pending["tool_name"],
+                        producer_module=pending["producer_module"],
+                        output_protocol=pending["output_protocol"],
+                        contract_valid=pending["output_contract_valid"],
+                        source_event_ids=pending.get("evidence_event_ids", []),
+                    )
                 pending_output_tools = []
             video_context = f"Video length: {self.env.video_length_secs}s; structure module: {self.combo.get('video_structuring')}."
             thinking_context = make_thinking_context(
@@ -375,34 +361,24 @@ class MetaVideoAgent:
                     "structure_type": str(self.combo.get("video_structuring") or ""),
                 },
                 memory_context=memory_packet,
-                recent_results=recent_module_results[-12:],
+                recent_results=recent_module_results,
             )
-            try:
-                import runtime_evidence
-                runtime_evidence.record_runtime_trace(
-                    "thinking.context", status="ok", payload=thinking_context,
-                )
-            except Exception:
-                pass
-            context_setter = getattr(self.thinker, "set_runtime_context", None)
-            if callable(context_setter):
-                context_setter(thinking_context)
+            runtime_evidence.record_runtime_trace(
+                "thinking.context", status="ok", payload=thinking_context,
+            )
+            self.thinker.set_runtime_context(thinking_context)
 
             # Unified thinking: one call determines act or finish
             thinking_return = self.thinker(
                 runtime_question, video_context, work_context, force_finish=is_last_step
             )
             thought, action, payload, thinking_error = normalize_thinking_return(thinking_return)
-            try:
-                import runtime_evidence
-                runtime_evidence.record_runtime_trace(
-                    "thinking.output", status="invalid" if thinking_error else "ok",
-                    payload={"thought": thought, "action": action, "payload": payload,
-                             "force_finish": is_last_step},
-                    result={"error": thinking_error},
-                )
-            except Exception:
-                pass
+            runtime_evidence.record_runtime_trace(
+                "thinking.output", status="invalid" if thinking_error else "ok",
+                payload={"thought": thought, "action": action, "payload": payload,
+                         "force_finish": is_last_step},
+                result={"error": thinking_error},
+            )
             if thinking_error:
                 print(f"   [Thinking Contract] {thinking_error}")
                 self.work_memory._log_reasoning(
@@ -435,6 +411,7 @@ class MetaVideoAgent:
 
             # Recording plans into working memory
             self.work_memory._log_planning(plan, "react")
+            recent_module_results = []
 
             for i, subtask in enumerate(plan):
                 if not isinstance(subtask, dict):
@@ -458,13 +435,9 @@ class MetaVideoAgent:
                 tool_request = {}
                 evidence_event_ids = []
                 active_time_windows = []
-                try:
-                    import runtime_evidence
-                    evidence_start = len(runtime_evidence.get_evidence_events())
-                    getter = getattr(self.env, "get_active_time_windows", None)
-                    active_time_windows = list(getter() if callable(getter) else [])
-                except Exception:
-                    evidence_start = 0
+                evidence_start = len(runtime_evidence.get_evidence_events())
+                getter = getattr(self.env, "get_active_time_windows", None)
+                active_time_windows = list(getter() if callable(getter) else [])
 
                 # Variable dependency injection
                 dependency_missing = False
@@ -499,24 +472,24 @@ class MetaVideoAgent:
                             tool_request = make_tool_request(
                                 producer_module, tool_name, casted_params, instruction,
                             )
-                            obs, _, _ = self.localization.execute(tool_name, casted_params)
+                            with runtime_evidence.observe_structure_reads(self.structuring, producer_module):
+                                obs, _, _ = self.localization.execute(tool_name, casted_params)
                         elif hasattr(self.perception, f"tool_{tool_name}"):
                             producer_module = "perception"
                             casted_params['instruction'] = instruction
                             tool_request = make_tool_request(
                                 producer_module, tool_name, casted_params, instruction,
                             )
-                            obs, _, _ = self.perception.execute(tool_name, casted_params)
+                            with runtime_evidence.observe_structure_reads(self.structuring, producer_module):
+                                obs, _, _ = self.perception.execute(tool_name, casted_params)
                         else:
                             obs = f"Execution Error: Tool '{tool_name}' not found."
                             circuit_break = True
                             execution_status = "tool_not_found"
                             error_code = "tool_not_found"
 
-                    # Every tool observation crosses the same envelope.  Keep
-                    # the raw provider/module payload in ``evidence`` and do
-                    # deterministic field exports only; a second LLM here
-                    # used to create lossy, unauditable handoffs.
+                    # Preserve raw provider/module payloads in the shared
+                    # envelope and export the requested protocol fields.
                     if producer_module:
                         module_result = normalize_tool_result(
                             obs,
@@ -529,6 +502,14 @@ class MetaVideoAgent:
                         extracted = self._extract_variables(module_result, export_vars)
                         valid_extracted = {k: v for k, v in extracted.items() if v is not None}
                         self.task_variables.update(valid_extracted)
+
+                if subtask.get("native_tool_call"):
+                    if not module_result:
+                        module_result = {"kind": "tool_error", "status": "error",
+                                         "tool_name": tool_name, "error": str(obs),
+                                         "evidence": {"raw_output": obs}}
+                    module_result["native_tool_call"] = subtask["native_tool_call"]
+                    module_result["native_assistant_message"] = subtask.get("native_assistant_message")
 
                 # Update working memory
                 # ``obs`` can contain VLM/OCR/ASR evidence verbatim.  A
@@ -547,14 +528,11 @@ class MetaVideoAgent:
                     render_result_for_context(module_result)
                     if module_result else str(obs)
                 )
-                try:
-                    evidence_event_ids = [
-                        str(item.get("evidence_event_id") or "")
-                        for item in runtime_evidence.get_evidence_events()[evidence_start:]
-                        if item.get("evidence_event_id")
-                    ]
-                except Exception:
-                    evidence_event_ids = []
+                evidence_event_ids = [
+                    str(item.get("evidence_event_id") or "")
+                    for item in runtime_evidence.get_evidence_events()[evidence_start:]
+                    if item.get("evidence_event_id")
+                ]
                 self.work_memory.update(
                     thought=instruction,
                     action=tool_name,
@@ -578,34 +556,26 @@ class MetaVideoAgent:
                 # execution trace distinguishes an implemented memory path
                 # from a merely declared bundle contract.
                 if producer_module and module_result and output_contract_valid:
-                    try:
-                        import runtime_evidence
-                        memory_fields = set(module_result.keys())
-                        evidence_payload = module_result.get("evidence")
-                        if isinstance(evidence_payload, dict):
-                            memory_fields.update(evidence_payload.keys())
-                        runtime_evidence.mark_output_consumed(
-                            consumer="memory",
-                            tool_name=tool_name,
-                            producer_module=producer_module,
-                            output_protocol=output_protocol,
-                            contract_valid=output_contract_valid,
-                            source_event_ids=evidence_event_ids,
-                            output_fields=sorted(memory_fields),
-                        )
-                    except Exception:
-                        pass
+                    memory_fields = set(module_result.keys())
+                    evidence_payload = module_result.get("evidence")
+                    if isinstance(evidence_payload, dict):
+                        memory_fields.update(evidence_payload.keys())
+                    runtime_evidence.mark_output_consumed(
+                        consumer="memory",
+                        tool_name=tool_name,
+                        producer_module=producer_module,
+                        output_protocol=output_protocol,
+                        contract_valid=output_contract_valid,
+                        source_event_ids=evidence_event_ids,
+                        output_fields=sorted(memory_fields),
+                    )
                 if module_result:
                     recent_module_results.append(module_result)
-                    try:
-                        import runtime_evidence
-                        runtime_evidence.record_runtime_trace(
-                            "module.result", status=str(module_result.get("status") or ""),
-                            payload={"producer_module": producer_module, "tool_name": tool_name,
-                                     "request": tool_request}, result=module_result,
-                        )
-                    except Exception:
-                        pass
+                    runtime_evidence.record_runtime_trace(
+                        "module.result", status=str(module_result.get("status") or ""),
+                        payload={"producer_module": producer_module, "tool_name": tool_name,
+                                 "request": tool_request}, result=module_result,
+                    )
                 if not circuit_break and output_contract_valid:
                     pending_output_tools.append({
                         "tool_name": str(tool_name),
@@ -615,8 +585,13 @@ class MetaVideoAgent:
                         "evidence_event_ids": evidence_event_ids,
                     })
 
-                # Fuse check
-                if circuit_break or ("Error:" in str(obs) and "Not Found" not in str(obs) and "Cannot find" not in str(obs)):
+                # Observed media/text may legitimately contain "Error:".
+                # Control flow follows the runtime result, not observation text.
+                if circuit_break or module_result.get("status") == "error":
+                    if subtask.get("native_tool_call"):
+                        # Native chat needs one result for every call in the
+                        # assistant batch, including rejected/failed calls.
+                        continue
                     print("   [Plan Aborted] Circuit break triggered.")
                     break
 

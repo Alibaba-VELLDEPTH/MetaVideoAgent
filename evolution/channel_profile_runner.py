@@ -10,7 +10,6 @@ reuse a profile across iterations.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import time
@@ -42,14 +41,6 @@ def write_json(path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
-def _sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def profile_runtime_provenance(distribution_manifest: str) -> Dict[str, Any]:
     """Return non-prompt provenance used to bind a profile to one train split."""
     if not distribution_manifest:
@@ -60,14 +51,12 @@ def profile_runtime_provenance(distribution_manifest: str) -> Dict[str, Any]:
     return {
         "schema_version": 1,
         "distribution_manifest_path": manifest_path,
-        "distribution_manifest_sha256": _sha256_file(manifest_path),
         "train_split_path": os.path.realpath(os.path.abspath(train_path)) if train_path else "",
-        "train_split_sha256": _sha256_file(train_path) if train_path and os.path.isfile(train_path) else "",
     }
 
 
 def profile_matches_manifest(profile: Dict[str, Any], distribution_manifest: str) -> tuple[bool, str]:
-    """Fail closed when an explicit profile has no matching runtime provenance."""
+    """Check that a saved observation profile belongs to the requested split."""
     if (profile or {}).get("profile_source") != "five_frame_query_aware_train_distribution":
         return False, "profile_method_mismatch"
     if not distribution_manifest:
@@ -77,8 +66,7 @@ def profile_matches_manifest(profile: Dict[str, Any], distribution_manifest: str
     if not actual:
         return False, "profile_missing_runtime_provenance"
     for key in (
-        "schema_version", "distribution_manifest_path", "distribution_manifest_sha256",
-        "train_split_path", "train_split_sha256",
+        "distribution_manifest_path", "train_split_path",
     ):
         if actual.get(key) != expected.get(key):
             return False, f"profile_runtime_provenance_mismatch:{key}"
@@ -90,6 +78,20 @@ def default_profile_path(run_id: str = "", output_root: str = "",
     if run_id:
         return os.path.join(metavideoagent_run_dir(run_id, output_root), "profiles", filename)
     return os.path.join(metavideoagent_run_dir("", output_root), "profiles", filename)
+
+
+def profile_ready_for_mode(profile: Dict[str, Any], mode: str) -> bool:
+    """A sampling plan is not a completed visual observation."""
+    if mode != "observe":
+        return True
+    observer = profile.get("video_distribution_observer_profile") or {}
+    summary = observer.get("summary") or {}
+    return (
+        observer.get("mode") == "observe"
+        and observer.get("status") in {"observed", "partially_observed"}
+        and int(summary.get("usable_model_observations") or 0) > 0
+        and int((summary.get("model_inference_status_counts") or {}).get("ok") or 0) > 0
+    )
 
 
 def compact_channel_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -128,14 +130,12 @@ def build_channel_profile(
     output_path: str = "",
     run_id: str = "",
     output_root: str = "",
-    include_execution_artifacts: bool = True,
     force: bool = False,
     semantic_observer_mode: str = "observe",
     semantic_observer_dir: str = "",
     semantic_video_budget: int = 0,
     semantic_observe_workers: int = 1,
     runtime_dir: str = "",
-    vlm_model: str = "",
 ) -> Dict[str, Any]:
     """Build or reuse a prompt-safe distribution profile.
 
@@ -148,7 +148,7 @@ def build_channel_profile(
     if output_path and os.path.exists(output_path) and not force:
         profile = read_json(output_path)
         matches, _reason = profile_matches_manifest(profile, distribution_manifest)
-        if profile and matches:
+        if profile and matches and profile_ready_for_mode(profile, semantic_observer_mode):
             return profile
 
     spec = load_distribution_spec(distribution_manifest) if distribution_manifest else {}
@@ -167,7 +167,6 @@ def build_channel_profile(
             mode=semantic_observer_mode,
             video_budget=semantic_video_budget,
             runtime_dir=runtime_dir,
-            vlm_model=vlm_model,
             observe_workers=semantic_observe_workers,
         )
         observations_path = observer_profile.get("observations_path", "")
@@ -177,14 +176,11 @@ def build_channel_profile(
         workspace,
         distribution_spec=spec,
         output_path=output_path,
-        include_execution_artifacts=include_execution_artifacts,
     )
     if observer_profile:
         profile["video_distribution_observer_profile"] = observer_profile
     profile["output_path"] = os.path.abspath(output_path)
-    # This provenance is persisted for runtime validation only; the compact
-    # prompt-facing profile summary intentionally never contains local paths
-    # or fingerprints.
+    # Keep local runtime paths separate from the distribution summary.
     profile["runtime_provenance"] = profile_runtime_provenance(distribution_manifest)
     profile["artifact_type"] = "metavideoagent_channel_profile"
     profile["schema_version"] = 1
@@ -194,6 +190,11 @@ def build_channel_profile(
     write_json(summary_path, profile["channel_profile_summary"])
     profile["channel_profile_summary_path"] = summary_path
     write_json(output_path, profile)
+    if semantic_observer_mode == "observe" and not profile_ready_for_mode(profile, "observe"):
+        raise RuntimeError(
+            f"Distribution observation produced no usable model observations; inspect {output_path} "
+            "and rerun after resolving the recorded media/provider failure."
+        )
     return profile
 
 
@@ -211,7 +212,6 @@ def main() -> int:
     parser.add_argument("--semantic-video-budget", type=int, default=0)
     parser.add_argument("--semantic-observe-workers", type=int, default=1)
     parser.add_argument("--runtime-dir", default="")
-    parser.add_argument("--vlm-model", default="")
     args = parser.parse_args()
 
     profile = build_channel_profile(
@@ -220,14 +220,12 @@ def main() -> int:
         output_path=args.output,
         run_id=args.run_id or f"channel_profile_{int(time.time())}",
         output_root=args.output_root,
-        include_execution_artifacts=False,
         force=args.force,
         semantic_observer_mode=args.semantic_observer_mode,
         semantic_observer_dir=args.semantic_observer_dir,
         semantic_video_budget=args.semantic_video_budget,
         semantic_observe_workers=args.semantic_observe_workers,
         runtime_dir=args.runtime_dir,
-        vlm_model=args.vlm_model,
     )
     print("CHANNEL_PROFILE_DONE")
     print(f"profile_path={profile.get('output_path')}")

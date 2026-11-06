@@ -18,7 +18,7 @@ Benlei Cui<sup>1,&#42;</sup>, Ruize Wang<sup>2,&#42;</sup>, Junjie Li<sup>1,&dag
 
 ## 🔍 Overview
 
-Long-form videos differ in how visual, spoken, and temporal evidence is distributed. **MetaVideoAgent (MVA)** adapts the agent design to a target video distribution: sampled frames and queries guide initial research and modular agent construction, followed by code evolution grounded in execution trajectories. Teacher review, cross-sample diagnosis, and targeted research when needed guide updates across five modules: video structuring, localization, perception, memory, and reasoning. Minimal validation tasks and evolution-split evaluation test candidate changes before the next iteration.
+Long-form videos differ in how visual, spoken, and temporal evidence is distributed. **MetaVideoAgent (MVA)** adapts the agent design to a target video distribution: sampled frames and queries guide initial research and modular agent construction, followed by code evolution grounded in execution trajectories. Teacher review, cross-sample diagnosis, and targeted research when needed guide updates across five modules: video structuring, localization, perception, memory, and reasoning. Runtime smoke checks, paired probes, and evolution-split evaluation test candidate changes before the next iteration.
 
 <p align="center"><img src="assets/overview.jpg" alt="MetaVideoAgent framework: distribution-aware design, Teacher review, cross-sample diagnosis, and modular code evolution" width="100%"></p>
 
@@ -29,7 +29,7 @@ Long-form videos differ in how visual, spoken, and temporal evidence is distribu
 - **Distribution-aware initialization.** Sampled frames and associated queries guide initial research and agent design for each target distribution.
 - **Evidence-grounded review.** The Teacher compares Student trajectories with a Gold Path grounded in evolution-split answers and annotated evidence.
 - **Cross-sample diagnosis.** Recurring failures are traced to responsible modules, with targeted research used when additional evidence is needed to guide improvements.
-- **Validated code evolution.** Updates focus on responsible modules and necessary dependencies; minimal validation tasks and full evolution-split evaluation assess candidate changes.
+- **Validated code evolution.** Updates focus on responsible modules and necessary dependencies; smoke checks, paired probes, and full evolution-split evaluation assess candidate changes.
 
 ## 📊 VA-EvoBench
 
@@ -39,11 +39,15 @@ With four evolution iterations per distribution, the [paper](https://arxiv.org/a
 
 The [benchmark package](VA-EvoBench/README.md) includes annotations, split manifests, a validator, and an evaluator. See the [dataset card](VA-EvoBench/DATASET_CARD.md) for distribution details and the annotation-access protocol. Obtain videos separately from the [official CG-Bench release](https://huggingface.co/datasets/CG-Bench/CG-Bench) under its access conditions.
 
+VA-EvoBench is bundled with the source repository, not the Python wheel, and is not loaded automatically by the runtime.
+
 ## 🚀 Quick Start
 
 ### 1. Install
 
 Use Python 3.10 or newer, with FFmpeg and FFprobe available for video/audio processing. Automatic authoring requires an authenticated `codex` executable on `PATH` (or a path supplied through `--codex-cli`).
+
+A replacement coding agent can use the same workflow through a `--codex-cli` wrapper implementing the Codex `exec` command contract.
 
 ```bash
 git clone https://github.com/Alibaba-VELLDEPTH/MetaVideoAgent.git
@@ -89,7 +93,7 @@ export METAVIDEOAGENT_OCR_PROFILE=custom.ocr.default
 export METAVIDEOAGENT_EMBEDDING_PROFILE=custom.embedding.default
 ```
 
-The reasoning profile serves the execution agent; the evolution, review, and post-decision profiles serve the corresponding orchestration stages. Use provider-supported models for each capability and keep credentials in the environment.
+The reasoning profile serves the execution agent; the evolution and review profiles serve Diagnosis and Teacher. The post-decision profile provides an optional explanation of the train-selection result; it does not decide acceptance. Use provider-supported models for each capability and keep credentials in the environment.
 
 </details>
 
@@ -110,7 +114,7 @@ Evolution JSONL records need `video_id`, `question`, `choices` (or `options`), a
 
 Set the split paths in [the distribution manifest](configs/distribution_manifest.example.json). Paths are relative to that manifest. For VA-EvoBench, prepare one distribution per run using its released split membership and upstream videos.
 
-The manifest's `train` split drives evolution and candidate selection; `test` is reserved for held-out reporting. Student execution uses video, question, and choices; evolution labels and evidence intervals are used in post-execution Teacher review.
+The manifest's `train` split drives evolution and candidate selection; `test` is reserved for held-out reporting. Student answers are generated from video, question, and choices. Evolution answers and evidence annotations support post-execution Teacher review; annotated intervals also scope the engineering smoke and probe runs.
 
 ### 4. Run Automatic Evolution
 
@@ -128,16 +132,39 @@ python scripts/run_automatic.py \
 
 Use `--check-only` instead of `--run` to validate the configuration and planned artifact paths without model calls. Select a coding model available in your Codex environment with `--codex-model` and set its reasoning effort with `--codex-reasoning-effort`. See `python scripts/run_automatic.py --help` for additional options. Generated agent code executes locally; use an isolated environment for evolution runs.
 
+Run artifacts are stored under `artifacts/<run-id>/`: `iter_0` contains initialization, and `iter_1`, `iter_2`, etc. contain successive update rounds. Within each iteration, `agent/` and `agent.json` hold the editable implementation, `implementation.md` records implementation reasoning, and stage-specific `attempt_N/` directories retain findings and execution evidence.
+
+<details>
+<summary>Initialize from existing agent code</summary>
+
+Source-agent mapping is an alternative initialization input to the same automatic workflow:
+
+```bash
+python scripts/run_automatic.py \
+  --distribution-manifest configs/distribution_manifest.example.json \
+  --workspace workspace \
+  --initialization map \
+  --source-agent path/to/curated_agent_source \
+  --run-id mapped_agent_run \
+  --output-root artifacts \
+  --run
+```
+
+Include the original entrypoints, helpers, prompts, and non-secret configuration in the source directory; keep datasets, credentials, model weights, and generated outputs outside it. Mapping adapts these operations to MVA's five interfaces, then uses the same smoke checks, train evaluation, and evolution loop.
+
+</details>
+
+With a less capable coding agent, manual review may help when generated code fails imports or interface checks, loses structured evidence between modules, or produces limited gains despite passing validation. Inspect the diagnosis and complete trajectories, correct the reusable implementation, and rerun smoke, probe, and train evaluation. Keep held-out data for reporting.
+
 ## 🧪 Evaluation
 
-After evolution, open the JSON report identified by the terminal's `report_path` output. In `automatic_final_current_best`, `bundle_path` supplies `--candidate-bundle` and `report_path` supplies `--train-diagnostic-report`; use the corresponding candidate-run directory for `--candidate-run`. The train report must attest a completed evolution-split evaluation of the exact frozen bundle being evaluated:
+After evolution, open the JSON report identified by the terminal's `report_path` output. In `automatic_final_current_best`, `report_path` supplies `--train-diagnostic-report`; use the corresponding candidate-run directory for `--candidate-run`. Held-out reporting loads the frozen execution bundle recorded by that completed train report:
 
 ```bash
 python scripts/run_held_out.py \
   --distribution-manifest configs/distribution_manifest.example.json \
   --workspace workspace \
   --candidate-run artifacts/frozen_candidate_run \
-  --candidate-bundle artifacts/frozen_current_best_bundle.json \
   --train-diagnostic-report artifacts/frozen_train_full_eval_report.json
 ```
 

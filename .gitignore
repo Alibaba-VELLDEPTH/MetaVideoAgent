@@ -1,14 +1,12 @@
 __pycache__/
 *.py[cod]
 *.so
-.pytest_cache/
 .ruff_cache/
-.coverage
-coverage.xml
-htmlcov/
 build/
 *.egg-info/
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 metavideoagent_outputs/

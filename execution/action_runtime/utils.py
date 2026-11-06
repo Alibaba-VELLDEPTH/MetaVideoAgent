@@ -103,14 +103,7 @@ def clamp_to_active_media_windows(start_sec: float, end_sec: float):
 
 
 def _explicit_proxy_url(env: dict | None = None) -> str:
-    """Return one validated local proxy URL for provider clients.
-
-    The runtime used to let every httpx client independently inherit the
-    process proxy environment.  That makes provider transport depend on
-    mixed-case/overlapping proxy variables and hides the actual route from
-    execution logs.  Formal runs instead select one conventional proxy URL
-    explicitly and construct a UTF-8 client with ``trust_env=False``.
-    """
+    """Select a proxy URL by conventional precedence for provider clients."""
     env = os.environ if env is None else env
     for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
         value = str(env.get(key) or "").strip()
@@ -336,11 +329,6 @@ def _parallel_limit_from_env(name: str, default: int, ceiling: int | None = None
         limit = int(os.environ.get(name, str(default)) or default)
     except ValueError:
         limit = default
-    # A caller may lower a limit for a constrained provider, but may never
-    # silently raise it above the channel's explicit run-wide ceiling.
-    # ``default`` and ``ceiling`` intentionally differ for GLM: ordinary
-    # formal runs retain the conservative default of 8, while an explicitly
-    # requested, separately audited high-throughput run may use at most 16.
     limit = max(1, min(limit, int(ceiling if ceiling is not None else default)))
     return threading.BoundedSemaphore(limit)
 
@@ -514,7 +502,7 @@ def _current_api_limiters() -> dict:
         "embedding": ("METAVIDEOAGENT_EMBEDDING_MAX_CONCURRENCY", 16, 16),
     }
     signature = tuple(
-        (channel, os.environ.get(env_name, str(default)))
+        (channel, os.environ.get(env_name, str(default)), _ceiling)
         for channel, (env_name, default, _ceiling) in names.items()
     )
     with _API_LIMITER_LOCK:
@@ -692,16 +680,16 @@ def extract_audio_segment(video_path: str, start_sec: float, end_sec: float, out
 # Large model API call center (decoupled into dedicated channels for different modes)
 # =====================================================================
 
-def call_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0.1,
-             max_tokens: int | None = 4096, profile_id: str | None = None,
-             response_format: dict | None = None) -> str:
-    """Call the text-LLM capability selected by the active runtime profile."""
+def call_chat_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0.1,
+                  max_tokens: int | None = 4096, profile_id: str | None = None,
+                  response_format: dict | None = None, request_options: dict | None = None) -> dict:
+    """Return a native assistant message through the selected chat profile."""
     try:
         profile, client = _runtime_profile_client("llm", profile_id)
     except CapabilityProfileError as exc:
-        return f"LLM Error: {exc}"
+        return {"status": "api_error", "error": str(exc), "message": {}}
     if profile.get("transport") != "openai_chat_text":
-        return f"LLM Error: profile {profile_id!r} does not support text chat transport"
+        return {"status": "api_error", "error": f"Profile {profile_id!r} does not support chat transport", "message": {}}
     model_name = str(profile.get("model_id") or _configured_model_name(model_name, LLM_MODEL))
     print(f"  [API] Call LLM ({model_name}) (Temp={temperature})...")
 
@@ -712,6 +700,7 @@ def call_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0
     for attempt in range(max_retries):
         try:
             request = {
+                **(request_options or {}),
                 "model": model_name,
                 "messages": messages,
                 "temperature": temperature,
@@ -727,10 +716,11 @@ def call_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0
             # so honor the
             # capability-profile request contract instead of silently
             # consuming the entire completion budget in ``reasoning_content``.
-            request_options = profile.get("request_options") or {}
-            if "enable_thinking" in request_options:
+            profile_options = profile.get("request_options") or {}
+            if "enable_thinking" in profile_options:
                 request["extra_body"] = {
-                    "enable_thinking": bool(request_options["enable_thinking"])
+                    **(request.get("extra_body") or {}),
+                    "enable_thinking": bool(profile_options["enable_thinking"]),
                 }
             response = _limited_api_call(
                 "llm",
@@ -739,14 +729,28 @@ def call_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0
             cost_tracker.record_api_call(
                 response, call_type="llm", profile=profile, model_name=model_name,
             )
-            content = _response_content_text(response)
-            return content if content else "LLM returned empty response"
+            message = response.choices[0].message
+            native = message.model_dump(exclude_none=True) if hasattr(message, "model_dump") else {
+                "role": "assistant", "content": _response_content_text(response),
+            }
+            return {"status": "ok" if native.get("content") or native.get("tool_calls") else "no_content",
+                    "message": native, "text": _response_content_text(response)}
         except Exception as e:
             last_error = str(e)
             print(f"⚠️ [LLM API Error] Attempt {attempt + 1}/{max_retries}: {last_error}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
-    return f"LLM Error: {last_error}"
+    return {"status": "api_error", "error": last_error, "message": {}, "text": ""}
+
+
+def call_llm(messages: list, model_name: str = LLM_MODEL, temperature: float = 0.1,
+             max_tokens: int | None = 4096, profile_id: str | None = None,
+             response_format: dict | None = None) -> str:
+    """Text-only convenience form of the registered native chat transport."""
+    result = call_chat_llm(messages, model_name, temperature, max_tokens, profile_id, response_format)
+    if result["status"] == "api_error":
+        return f"LLM Error: {result['error']}"
+    return result.get("text") or "LLM returned empty response"
 
 
 def call_vlm(prompt_or_messages, image_paths: list, model_name: str = VLM_MODEL,

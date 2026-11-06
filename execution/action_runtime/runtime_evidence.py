@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Dict, List
 
@@ -90,12 +91,12 @@ def mark_output_consumed(*, consumer: str, tool_name: str = "", producer_module:
                          output_nonempty: bool = True, output_protocol: str = "",
                          contract_valid: bool = True,
                          source_event_ids: List[str] | None = None,
-                         output_fields: List[str] | None = None) -> None:
-    """Record that the agent passed a tool result to the next reasoning turn.
+                         output_fields: List[str] | None = None,
+                         source_ref: str = "") -> None:
+    """Record a result delivered to a runtime consumer.
 
-    This is framework instrumentation, not a declaration made by generated
-    code.  It lets smoke/probe distinguish "tool returned text" from "the
-    preserved consumer actually received the target-module output".
+    The event identifies the producer, consumer and source when available.
+    Smoke and probe use it to follow evidence across module boundaries.
     """
     _emit(
         "module_output",
@@ -108,9 +109,41 @@ def mark_output_consumed(*, consumer: str, tool_name: str = "", producer_module:
         contract_valid=bool(contract_valid),
         source_event_ids=[str(value) for value in (source_event_ids or []) if str(value)],
         output_fields=[str(value) for value in (output_fields or []) if str(value)],
+        source_ref=str(source_ref or ""),
     )
 
 
+@contextmanager
+def observe_structure_reads(struct_db, consumer: str):
+    """Record the structure results delivered during one module execution."""
+    retrieve = struct_db.retrieveStructure
+    had_override = "retrieveStructure" in vars(struct_db)
+    previous_override = vars(struct_db).get("retrieveStructure")
+
+    def observed_retrieve(*args, **kwargs):
+        result = retrieve(*args, **kwargs)
+        valid = isinstance(result, str) and bool(result.strip())
+        source_ref = str(struct_db.db_path)
+        mark_output_consumed(
+            consumer=consumer, tool_name="retrieveStructure", producer_module="video_structuring",
+            output_nonempty=bool(result), contract_valid=valid,
+            output_protocol="structured_retrieval_records", source_ref=source_ref,
+        )
+        record_runtime_trace(
+            "structure.read", status="ok" if valid else "no_content",
+            payload={"consumer": consumer, "args": list(args), "params": kwargs,
+                     "source_ref": source_ref}, result=result,
+        )
+        return result
+
+    struct_db.retrieveStructure = observed_retrieve
+    try:
+        yield
+    finally:
+        if had_override:
+            struct_db.retrieveStructure = previous_override
+        else:
+            del struct_db.retrieveStructure
 
 
 def _active_windows(env, max_windows: int | None) -> List[tuple[float, float]]:
@@ -872,6 +905,31 @@ def call_text_llm(messages, *, profile_id: str | None = None, temperature: float
                          payload={"messages": list(messages or []), "temperature": temperature,
                                   "max_tokens": max_tokens, "response_format": response_format,
                                   "profile": profile_details}, result=result)
+    return result
+
+
+def call_chat_llm(messages, *, profile_id: str | None = None, temperature: float = 0.1,
+                  max_tokens: int | None = 4096, response_format: dict | None = None,
+                  request_options: dict | None = None) -> Dict[str, Any]:
+    """Keep native tool calls and assistant messages for adapted agent loops."""
+    try:
+        details = _profile_details("llm", profile_id)
+    except CapabilityProfileError as exc:
+        _emit("llm", "request_rejected", "unavailable", reason="unknown_profile", error_message=str(exc))
+        return {"status": "unavailable", "reason": "unknown_profile", "message": {}, "text": ""}
+    payload = {"messages": list(messages or []), "temperature": temperature,
+               "max_tokens": max_tokens, "response_format": response_format,
+               "request_options": dict(request_options or {}), "profile": details}
+    try:
+        result = utils.call_chat_llm(
+            payload["messages"], profile_id=details["profile_id"], temperature=temperature,
+            max_tokens=max_tokens, response_format=response_format, request_options=request_options,
+        )
+    except Exception as exc:
+        result = {"status": "api_error", "error": f"{type(exc).__name__}: {exc}", "message": {}, "text": ""}
+    result["profile"] = details
+    _emit("llm", "inference", result["status"], input_provenance="bounded_text_context", **details)
+    record_runtime_trace("llm.inference", status=result["status"], payload=payload, result=result)
     return result
 
 

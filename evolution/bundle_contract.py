@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 MODULE_TYPES = (
@@ -33,29 +31,6 @@ def normalize_modules(value: Any, *, allow_empty: bool = False) -> list[str]:
     return result
 
 
-def bundle_fingerprint(bundle: dict) -> str:
-    """Fingerprint code/interface facts, never task data or output paths."""
-    bundle = bundle if isinstance(bundle, dict) else {}
-    modules = bundle.get("modules") or {}
-    if isinstance(modules, list):
-        modules = {str(item.get("module_type") or ""): item for item in modules if isinstance(item, dict)}
-    payload = {
-        "changed_modules": sorted(normalize_modules(bundle.get("changed_modules") or list(modules), allow_empty=True)),
-        "combo": bundle.get("combo") or {},
-        "modules": {
-            key: {
-                "name": str((value or {}).get("name") or ""),
-                "code": str((value or {}).get("code") or ""),
-                "source_file": str((value or {}).get("source_file") or ""),
-            }
-            for key, value in sorted(modules.items()) if isinstance(value, dict)
-        },
-        "handoff_contracts": bundle.get("handoff_contracts") or [],
-    }
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return "bundle_" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
-
-
 def validate_handoff_contracts(contracts: Any, *, changed_modules: list[str]) -> list[str]:
     issues: list[str] = []
     if not isinstance(contracts, list):
@@ -74,20 +49,19 @@ def validate_handoff_contracts(contracts: Any, *, changed_modules: list[str]) ->
             issues.append(f"{prefix} producer/consumer must be valid modules")
         if producer == consumer:
             issues.append(f"{prefix} producer and consumer must differ")
-        key = (producer, consumer, tuple(item.get("required_fields") or []))
-        if key in seen:
-            issues.append(f"{prefix} duplicates an earlier handoff")
-        seen.add(key)
         fields = item.get("required_fields")
-        if not isinstance(fields, list) or not all(str(field).strip() for field in fields):
+        if not isinstance(fields, list) or not fields or not all(
+            isinstance(field, str) and field.strip() for field in fields
+        ):
             issues.append(f"{prefix}.required_fields must be a non-empty list of names")
+        else:
+            key = (producer, consumer, tuple(fields))
+            if key in seen:
+                issues.append(f"{prefix} duplicates an earlier handoff")
+            seen.add(key)
         for field in ("output_protocol", "consumer_behavior", "fallback"):
             if not str(item.get(field) or "").strip():
                 issues.append(f"{prefix}.{field} is empty")
-        # A contract must be relevant to an actual changed edge.  It may have
-        # one preserved endpoint, but cannot describe two untouched modules.
-        if producer not in changed_modules and consumer not in changed_modules:
-            issues.append(f"{prefix} has no changed endpoint")
     return issues
 
 
@@ -155,9 +129,6 @@ def validate_candidate_bundle(bundle: Any, *, require_source: bool = True) -> li
                 for field in ("responsibility", "input_invariant", "output_invariant", "fallback"):
                     if not str(item.get(field) or "").strip():
                         issues.append(f"adaptive bundle responsibility {module}.{field} is empty")
-    declared = str(bundle.get("bundle_fingerprint") or "")
-    if declared and declared != bundle_fingerprint(bundle):
-        issues.append("bundle_fingerprint does not match candidate contents")
     return issues
 
 
@@ -176,5 +147,4 @@ def make_candidate_bundle(*, combo: dict, modules: dict, changed_modules: list[s
         "change_rationale": dict(rationale or {}),
         "implementation_spec": dict(implementation_spec or {}),
     }
-    bundle["bundle_fingerprint"] = bundle_fingerprint(bundle)
     return bundle

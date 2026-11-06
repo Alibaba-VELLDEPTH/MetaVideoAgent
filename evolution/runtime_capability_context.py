@@ -19,17 +19,64 @@ except ImportError:  # pragma: no cover - package import
 CURRENT_DIR = Path(__file__).resolve().parent
 MANUAL_PATH = CURRENT_DIR / "agent_docs" / "runtime_capability_manual.md"
 try:
-    from capability_registry import DEFAULT_PROFILE_IDS, LLM_ROLE_PROFILE_IDS, PROFILE_MANUAL_PATH
+    from capability_registry import DEFAULT_PROFILE_IDS, PROFILE_MANUAL_PATH
 except ImportError:  # pragma: no cover - package import fallback
     from execution.action_runtime.capability_registry import (
         DEFAULT_PROFILE_IDS,
-        LLM_ROLE_PROFILE_IDS,
         PROFILE_MANUAL_PATH,
     )
 
 DEFAULT_VLM_PROFILE_ID = DEFAULT_PROFILE_IDS["vlm"]
 DEFAULT_EXECUTION_LLM_PROFILE_ID = DEFAULT_PROFILE_IDS["llm"]
-DEFAULT_EVOLUTION_LLM_PROFILE_ID = LLM_ROLE_PROFILE_IDS["evolution"]
+
+
+def candidate_runtime_capabilities(diagnosis: dict) -> list[dict]:
+    """Carry the latest research plan into execution, including an empty plan.
+
+    Diagnosis suggests a direction; Research selects concrete registered
+    adapters. Neither selection locks later code repair to one model profile.
+    """
+    brief = (diagnosis.get("codex_deep_research") or {}).get("design_brief") or {}
+    needs = brief.get("runtime_capability_mapping")
+    if needs is None:
+        needs = (diagnosis.get("implementation_task") or {}).get("runtime_capabilities") or []
+    if not isinstance(needs, list):
+        raise ValueError("runtime capability plan must be a list")
+    inventory = {item["profile_id"]: item for item in _profile_inventory()}
+    plan = []
+    for need in needs:
+        if not isinstance(need, dict):
+            raise ValueError("runtime capability plan entries must be objects")
+        item = dict(need)
+        capability = str(item.get("capability") or "")
+        profile_id = str(item.get("profile_id") or DEFAULT_PROFILE_IDS.get(capability, ""))
+        profile = inventory.get(profile_id)
+        if not profile or profile.get("capability") != capability:
+            raise ValueError(f"runtime capability plan uses an unregistered profile: {capability}/{profile_id}")
+        item["profile_id"] = profile_id
+        if profile.get("input_provenance"):
+            item["input_provenance"] = profile["input_provenance"]
+        plan.append(item)
+    return plan
+
+
+def runtime_profile_mismatches(expected: dict, observed: dict) -> dict:
+    """Check the configured inventory, not equality with an earlier suggestion.
+
+    A candidate may legitimately use several registered profiles for the same
+    capability. Runtime events still must identify profiles in that capability's
+    configured inventory; unknown or cross-capability bindings are errors.
+    """
+    allowed = {}
+    for profile in _profile_inventory():
+        allowed.setdefault(profile["capability"], set()).add(profile["profile_id"])
+    return {
+        capability: {"planned": expected.get(capability),
+                     "allowed": sorted(allowed.get(capability, set())),
+                     "observed": sorted(profiles)}
+        for capability, profiles in observed.items()
+        if set(profiles) - allowed.get(capability, set())
+    }
 
 
 def _read_manual() -> str:

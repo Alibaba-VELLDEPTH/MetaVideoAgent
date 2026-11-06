@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import json
 import os
 import re
@@ -40,12 +39,14 @@ from capability_registry import DEFAULT_PROFILE_IDS, resolve_profile
 
 DEFAULT_LLM_MODEL = str(resolve_profile("llm").get("model_id") or "")
 
+from agent_sources import module_resource_inputs
 from combo_contract import require_complete_agent_combo
 from evaluation_audit import build_full_eval_audit, write_audit_files
 from post_full_eval_decider import (
     CURRENT_BEST_SELECTION_SPLIT,
     current_best_update_allowed,
     decide_post_full_eval,
+    full_evaluation_is_valid,
 )
 from question_set_loader import (
     load_questions as load_question_set,
@@ -78,16 +79,6 @@ MODULE_TO_COMBO_KEY = {
 # The held-out split is read-only reporting evidence.
 EVOLUTION_SPLIT = "train"
 HELD_OUT_TEST_SPLIT = "test"
-
-
-def _file_digest(path: str) -> str:
-    if not path or not os.path.exists(path) or os.path.isdir(path):
-        return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _active_vlm_model_name() -> str:
@@ -193,26 +184,7 @@ def _resolve_path(path: str, *bases: str) -> str:
     return path
 
 
-def _load_or_build_distribution_profile(workspace: str, manifest: str = "",
-                                        profile_path: str = "") -> dict:
-    if profile_path:
-        return _read_json(profile_path)
-    if not manifest:
-        return {}
-    from distribution_profiler import build_observed_distribution_profile
-    from distribution_spec import load_distribution_spec
-    spec = load_distribution_spec(manifest)
-    out_dir = os.path.join(runtime_output_root(), "profiles")
-    out_path = os.path.join(out_dir, f"observed_distribution_profile_{int(time.time())}.json")
-    return build_observed_distribution_profile(
-        workspace,
-        spec,
-        output_path=out_path,
-        include_execution_artifacts=False,
-    )
-
-
-def _resolve_reference_results(workspace: str, args, diagnosis_context: dict = None) -> tuple:
+def _resolve_reference_results(workspace: str, args) -> tuple:
     report_path = getattr(args, "reference_report", "") or ""
     results_path = getattr(args, "reference_results", "") or ""
     if not (report_path or results_path):
@@ -271,51 +243,17 @@ def _combo_from_report(path: str) -> dict:
     return dict(combo) if isinstance(combo, dict) else {}
 
 
-def _combo_from_plan(path: str) -> dict:
-    if not path:
-        return {}
-    path = _resolve_path(path, os.getcwd())
-    if not os.path.exists(path):
-        return {}
-    plan = _read_json(path)
-    combo = plan.get("combo") or {}
-    return dict(combo) if isinstance(combo, dict) else {}
-
-
-def _agent_combo_from_evolution_combo(combo: dict) -> dict:
-    if not isinstance(combo, dict):
-        return {}
-    converted = {}
-    key_map = {
-        "video_structuring": "video_structuring",
-        "thinking": "thinking",
-        "memory": "memory",
-        "localization": "localization",
-        "perception": "perception",
-    }
-    for key, value in combo.items():
-        mapped = key_map.get(key)
-        if mapped and value:
-            converted[mapped] = value
-    return converted
-
-
-def _resolve_base_combo(args, diagnosis_context: dict) -> tuple:
+def _resolve_base_combo(args) -> tuple:
     def _complete(combo: dict, source: str) -> tuple:
         return require_complete_agent_combo(combo, source), source
 
-    plan_combo = _combo_from_plan(getattr(args, "combo_plan", ""))
-    if plan_combo:
-        return _complete(plan_combo, "combo_plan")
     report_combo = _combo_from_report(getattr(args, "reference_report", ""))
     if report_combo:
         return _complete(report_combo, "reference_report")
     reference_results = getattr(args, "reference_results", "") or ""
     if reference_results:
         reference_results = _resolve_path(reference_results, os.getcwd())
-        reference_combo = _agent_combo_from_evolution_combo(
-            combo_from_reference(reference_results)
-        )
+        reference_combo = combo_from_reference(reference_results)
         if reference_combo:
             return _complete(reference_combo, "reference_results")
     if str(getattr(args, "question_split", "") or "") == HELD_OUT_TEST_SPLIT:
@@ -323,15 +261,9 @@ def _resolve_base_combo(args, diagnosis_context: dict) -> tuple:
         frozen_combo = frozen_bundle.get("combo") if isinstance(frozen_bundle, dict) else {}
         if frozen_combo:
             return _complete(frozen_combo, "frozen_candidate_bundle")
-    decision = diagnosis_context.get("evolution_decision", {}) or {}
-    for key in ("base_combo", "combo_base_config", "current_best_combo"):
-        value = decision.get(key)
-        if isinstance(value, dict) and value:
-            return _complete(value, f"diagnosis.{key}")
     raise RuntimeError(
-        "Full-eval requires an explicit base combo from --reference-report, "
-        "--reference-results, --combo-plan, or diagnosis context. Refusing to "
-        "fall back to an implicit/default combo."
+        "Full evaluation requires the current-best combo from --reference-report "
+        "or --reference-results; held-out reporting uses its frozen candidate bundle."
     )
 
 
@@ -427,20 +359,9 @@ def _resolve_reference_bundle(args, ref_report: dict, ref_report_path: str,
     return {}, "", {
         "passed": False,
         "issues": [
-            "No reference bundle with full module code matched the base combo. "
-            "MetaVideoAgent full-eval refuses to alias Codex bundle names to built-in registry keys."
+            "A complete reference bundle matching the current-best combo is required."
         ],
     }
-
-
-def _module_code_digest(module: dict) -> str:
-    code = module.get("code", "") if isinstance(module, dict) else ""
-    return hashlib.sha256(str(code).encode("utf-8")).hexdigest() if code else ""
-
-
-def _structuring_implementation_digest(module: dict) -> tuple[str, str]:
-    """Return the source digest used for structure-cache compatibility."""
-    return _module_code_digest(module), "literal_source"
 
 
 def _planned_structure_reuse_decision(base_bundle: dict, candidate_bundle: dict) -> dict:
@@ -451,10 +372,8 @@ def _planned_structure_reuse_decision(base_bundle: dict, candidate_bundle: dict)
     candidate_struct = candidate_combo.get("video_structuring", "")
     reference_module = _bundle_modules_by_type(base_bundle).get("video_structuring") or {}
     candidate_module = _bundle_modules_by_type(candidate_bundle).get("video_structuring") or {}
-    reference_raw_sha = _module_code_digest(reference_module)
-    candidate_raw_sha = _module_code_digest(candidate_module)
-    reference_sha, reference_digest_source = _structuring_implementation_digest(reference_module)
-    candidate_sha, candidate_digest_source = _structuring_implementation_digest(candidate_module)
+    reference_code = reference_module.get("code", "")
+    candidate_code = candidate_module.get("code", "")
     if not reference_struct or not candidate_struct:
         raise RuntimeError(
             "Cannot determine structure reuse from incomplete reference/candidate combo: "
@@ -462,9 +381,16 @@ def _planned_structure_reuse_decision(base_bundle: dict, candidate_bundle: dict)
         )
     if candidate_struct != reference_struct:
         rebuild, reason = True, "struct_module_name_changed"
-    elif candidate_sha and reference_sha and candidate_sha != reference_sha:
+    elif (
+        module_resource_inputs(candidate_bundle, "video_structuring")
+        != module_resource_inputs(base_bundle, "video_structuring")
+    ):
+        rebuild, reason = True, "struct_resources_or_config_changed"
+    elif candidate_module.get("source_file") != reference_module.get("source_file"):
+        rebuild, reason = True, "struct_source_location_changed"
+    elif candidate_code and reference_code and candidate_code != reference_code:
         rebuild, reason = True, "struct_module_code_changed"
-    elif candidate_sha and not reference_sha:
+    elif candidate_code and not reference_code:
         rebuild, reason = True, "reference_struct_code_unavailable"
     else:
         rebuild, reason = False, "struct_implementation_matches_current_best"
@@ -473,50 +399,7 @@ def _planned_structure_reuse_decision(base_bundle: dict, candidate_bundle: dict)
         "reason": reason,
         "reference_struct": reference_struct,
         "candidate_struct": candidate_struct,
-        "reference_struct_code_sha256": reference_sha,
-        "candidate_struct_code_sha256": candidate_sha,
-        "reference_struct_raw_code_sha256": reference_raw_sha,
-        "candidate_struct_raw_code_sha256": candidate_raw_sha,
-        "reference_struct_digest_source": reference_digest_source,
-        "candidate_struct_digest_source": candidate_digest_source,
     }
-
-
-def _combo_registry_status(combo: dict) -> dict:
-    try:
-        import module_map
-    except Exception as exc:
-        return {"registered": False, "missing": [], "error": str(exc)}
-    registries = {
-        "video_structuring": getattr(module_map, "STRUCTURING_MAP", {}),
-        "thinking": getattr(module_map, "THINKING_MAP", {}),
-        "memory": getattr(module_map, "WORK_MEMORY_MAP", {}),
-        "localization": getattr(module_map, "LOCALIZATION_MAP", {}),
-        "perception": getattr(module_map, "PERCEPTION_MAP", {}),
-    }
-    missing = [
-        {"slot": slot, "module_name": name}
-        for slot, name in (combo or {}).items()
-        if slot in registries and name not in registries[slot]
-    ]
-    return {"registered": not missing, "missing": missing, "error": ""}
-
-
-def _external_history_meta(*paths: str) -> dict:
-    formal_output_root = os.path.abspath(runtime_output_root())
-    external = []
-    for path in paths:
-        if not path:
-            continue
-        resolved = _resolve_path(path, os.getcwd())
-        abs_path = os.path.abspath(resolved)
-        if not abs_path.startswith(formal_output_root + os.sep):
-            external.append(abs_path)
-    return {
-        "external_history_input": bool(external),
-        "external_history_paths": external,
-    }
-
 
 
 def _infer_structure_suffix_from_bundle(bundle: dict, struct_name: str) -> str:
@@ -674,7 +557,6 @@ def _structure_artifact(structure_dir: str, combo: dict, video_ids: List[str],
                 "name": path.name,
                 "path": str(path),
                 "size": path.stat().st_size,
-                "sha256": _file_digest(str(path)),
             })
     return {
         "artifact_type": "metavideoagent_structure_artifact",
@@ -721,7 +603,7 @@ def _safe_remove(path: str, candidate_run: str) -> None:
         os.remove(path)
 
 
-def _prepare_outputs(candidate_run: str, overwrite: bool, resume: bool = False) -> dict:
+def _prepare_outputs(candidate_run: str, overwrite: bool) -> dict:
     paths = {
         "sandbox_dir": os.path.join(candidate_run, "full_eval_sandbox"),
         "results_path": os.path.join(candidate_run, "full_eval_results.jsonl"),
@@ -734,48 +616,6 @@ def _prepare_outputs(candidate_run: str, overwrite: bool, resume: bool = False) 
         "provider_failure_path": os.path.join(candidate_run, "full_eval_provider_failures.json"),
     }
     existing = [path for path in paths.values() if os.path.exists(path)]
-    if resume:
-        # A resumed run may have only the append-only per-question sandbox
-        # artifacts.  Final rows/reports are terminal artifacts: resuming over
-        # them would silently replace an already measured full evaluation.
-        terminal = [
-            path for key, path in paths.items()
-            # ``provider_calls.jsonl`` is deliberately append-only: a
-            # resumed full eval must retain the start/finish audit events
-            # already recorded before interruption.  It is not a completed
-            # evaluation result and therefore must not block ``--resume``.
-            if key not in {"sandbox_dir", "provider_audit_path"}
-            and os.path.exists(path)
-        ]
-        if terminal:
-            raise FileExistsError(
-                "resume refused: final full-eval artifacts already exist; "
-                f"start a new candidate-run instead: {terminal}"
-            )
-        if not os.path.isdir(paths["sandbox_dir"]):
-            raise FileNotFoundError(
-                "resume refused: no sandbox_dir exists to resume: "
-                f"{paths['sandbox_dir']}"
-            )
-        return paths
-    # A newly scoped recovery may deliberately pre-place immutable per-video
-    # JSONL structures before its first evaluation.  These are inputs, not
-    # prior evaluation outputs: accept only this exact empty-sandbox shape.
-    sandbox_dir = paths["sandbox_dir"]
-    if sandbox_dir in existing:
-        allowed_preseed = os.path.join(sandbox_dir, "video_structure")
-        sandbox_entries = set(os.listdir(sandbox_dir)) if os.path.isdir(sandbox_dir) else set()
-        structure_entries = (
-            set(os.listdir(allowed_preseed))
-            if os.path.isdir(allowed_preseed) else set()
-        )
-        preseed_only = (
-            sandbox_entries == {"video_structure"}
-            and bool(structure_entries)
-            and all(name.endswith(".jsonl") for name in structure_entries)
-        )
-        if preseed_only:
-            existing.remove(sandbox_dir)
     if existing and not overwrite:
         raise FileExistsError(
             "Full-eval outputs already exist. Pass --overwrite to replace only "
@@ -788,170 +628,11 @@ def _prepare_outputs(candidate_run: str, overwrite: bool, resume: bool = False) 
     return paths
 
 
-def _seed_resume_sandbox(target_sandbox_dir: str, source_dirs: List[str],
-                         copy_structures: bool = False) -> dict:
-    """Copy immutable completed sandbox artifacts into a new resume run.
-
-    This is deliberately a file-level provenance operation, not a result-row
-    merger: the resumed evaluator later validates every copied task row against
-    the exact bundle/combo and produces the only final report itself.
-    """
-    if not source_dirs:
-        return {"artifact_type": "full_eval_resume_seed", "sources": [], "files": []}
-    if os.listdir(target_sandbox_dir):
-        raise RuntimeError("resume seed requires an empty target sandbox directory")
-    manifest = {"artifact_type": "full_eval_resume_seed", "schema_version": 1,
-                "sources": [], "files": [], "structure_sources": [],
-                "structures_copied": bool(copy_structures)}
-    for raw_source in source_dirs:
-        source = os.path.abspath(raw_source)
-        if not os.path.isdir(source):
-            raise FileNotFoundError(f"resume seed sandbox does not exist: {source}")
-        manifest["sources"].append(source)
-        candidates = sorted(glob.glob(os.path.join(source, "*_sandbox.jsonl")))
-        structure_dir = os.path.join(source, "video_structure")
-        if os.path.isdir(structure_dir):
-            for item in sorted(glob.glob(os.path.join(structure_dir, "*.jsonl"))):
-                manifest["structure_sources"].append({
-                    "source": item, "sha256": _file_digest(item),
-                    "size": os.path.getsize(item),
-                })
-            if copy_structures:
-                candidates.extend(sorted(glob.glob(os.path.join(structure_dir, "*.jsonl"))))
-        for item in candidates:
-            rel = (
-                os.path.join("video_structure", os.path.basename(item))
-                if os.path.dirname(item) == structure_dir else os.path.basename(item)
-            )
-            target = os.path.join(target_sandbox_dir, rel)
-            if os.path.exists(target):
-                raise RuntimeError(
-                    "resume seed refuses duplicate artifact basename: "
-                    f"{rel} from {source}"
-                )
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copy2(item, target)
-            manifest["files"].append({
-                "source": item, "target": target,
-                "sha256": _file_digest(item), "size": os.path.getsize(item),
-            })
-    return manifest
-
-
-def _resume_contract_path(candidate_run: str) -> str:
-    return os.path.join(candidate_run, "full_eval_resume_contract.json")
-
-
-def _resume_contract(candidate_bundle_path: str, split: str,
-                     questions: List[dict], combo_id: str) -> dict:
-    """Return the immutable identity of a resumable full-eval invocation."""
-    task_ids = [str(item.get("task_id") or "") for item in questions]
-    if not task_ids or any(not item for item in task_ids):
-        raise RuntimeError("resume contract requires non-empty task_ids")
-    return {
-        "artifact_type": "full_eval_resume_contract",
-        "schema_version": 1,
-        "candidate_bundle_path": os.path.abspath(candidate_bundle_path),
-        "candidate_bundle_sha256": _file_digest(candidate_bundle_path),
-        "question_split": str(split),
-        "task_ids": task_ids,
-        "combo_id": str(combo_id),
-    }
-
-
-def _ensure_resume_contract(candidate_run: str, expected: dict,
-                            resume: bool) -> tuple[str, str]:
-    """Create/validate a fail-closed contract before writing Agent rows."""
-    path = _resume_contract_path(candidate_run)
-    if resume:
-        if not os.path.isfile(path):
-            raise RuntimeError(
-                "resume refused: missing full_eval_resume_contract.json; "
-                "this run predates resumable full-eval and must remain an "
-                "archived interrupted attempt"
-            )
-        actual = _read_json(path)
-        actual_identity = dict(actual)
-        actual_combo_id = str(actual_identity.pop("combo_id", "") or "")
-        expected_identity = dict(expected)
-        expected_identity.pop("combo_id", None)
-        if not actual_combo_id or actual_identity != expected_identity:
-            raise RuntimeError(
-                "resume refused: candidate bundle, split, or task set differs "
-                "from the original full-eval contract"
-            )
-        return path, actual_combo_id
-    else:
-        if os.path.exists(path):
-            raise FileExistsError(
-                f"full-eval resume contract already exists: {path}; use --resume "
-                "or choose a new candidate-run"
-            )
-        _write_json(path, expected)
-        return path, str(expected["combo_id"])
-
-
-def _load_completed_sandbox_rows(sandbox_dir: str, questions: List[dict],
-                                 combo: dict,
-                                 rerun_provider_failures: bool = False) -> tuple[List[dict], set[str]]:
-    """Load exact completed task rows for an explicit full-eval resume.
-
-    Rows are append-only after each Agent question completes.  Duplicate ids,
-    malformed JSON, or an unexpected combo are fatal rather than silently
-    selecting a row from a different evaluation pass.
-    """
-    expected = {str(item.get("task_id") or "") for item in questions}
-    if not expected or "" in expected:
-        raise RuntimeError("resume requires a complete task-id-bearing question set")
-    rows_by_task = {}
-    duplicates = set()
-    for path in sorted(glob.glob(os.path.join(sandbox_dir, "*_sandbox.jsonl"))):
-        with open(path, "r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        f"invalid persisted sandbox JSONL: {path}:{line_number}"
-                    ) from exc
-                attach_task_identity(row, fallback_video_id=str(row.get("video_id") or ""))
-                task_id = str(row.get("task_id") or "")
-                if task_id not in expected:
-                    continue
-                if row.get("combo") != combo:
-                    raise RuntimeError(
-                        "resume refused: persisted row combo differs from the "
-                        f"requested combo ({path}:{line_number})"
-                    )
-                # A terminal provider failure is an execution incident, not a
-                # reusable completed result when an operator explicitly asks
-                # for a provider-failure-only retry.  Keep the original row on
-                # disk for provenance, but schedule this task again in the
-                # new isolated resume run.
-                if rerun_provider_failures and task_id in _terminal_provider_failure_task_ids([row]):
-                    continue
-                if task_id in rows_by_task:
-                    duplicates.add(task_id)
-                else:
-                    rows_by_task[task_id] = row
-    if duplicates:
-        raise RuntimeError(
-            "resume refused: duplicate task_ids in persisted sandbox rows: "
-            f"{sorted(duplicates)[:5]}"
-        )
-    ordered = [rows_by_task[str(item.get("task_id") or "")]
-               for item in questions if str(item.get("task_id") or "") in rows_by_task]
-    return ordered, set(rows_by_task)
-
-
 def _terminal_provider_failure_task_ids(results: List[dict]) -> List[str]:
     """Return tasks whose final execution contains a terminal API error.
 
     ``retrying`` records preserve an earlier failed attempt but are not terminal
-    failures.  The returned IDs are persisted for an explicit later task rerun;
-    full evaluation itself never silently reruns or replaces question results.
+    failures. The returned IDs identify execution failures in the stage report.
     """
     task_ids = []
     for row in results or []:
@@ -968,7 +649,7 @@ def _terminal_provider_failure_task_ids(results: List[dict]) -> List[str]:
 
 
 def _provider_failure_summary(row: dict) -> List[dict]:
-    """Keep explicit-rerun provenance compact while raw attempts remain in JSONL."""
+    """Summarize provider failures alongside the complete execution records."""
     summary = []
     for event in (row or {}).get("capability_events") or []:
         if not isinstance(event, dict) or str(event.get("status") or "") != "api_error":
@@ -1008,39 +689,10 @@ def _module_artifact(module_type: str, module_name: str,
         "module_type": module_type,
         "module_name": module_name,
         "path": os.path.abspath(path) if path else "",
-        "sha256": _file_digest(path) if path else "",
         "source": source,
     }
 
 
-
-
-def _materialize_effective_bundle(candidate_run: str, combo: dict,
-                                  candidate_bundle: dict) -> str:
-    """Write the exact five-module combo evaluated by this full-eval run."""
-    modules_by_type = _bundle_modules_by_type(candidate_bundle)
-    modules = []
-    for module_type in BUNDLE_MODULE_ORDER:
-        selected = dict(modules_by_type.get(module_type) or {})
-        wanted_name = (combo or {}).get(MODULE_TO_COMBO_KEY[module_type], "")
-        if not selected or selected.get("name") != wanted_name:
-            raise RuntimeError(
-                "Cannot materialize effective full-eval bundle for "
-                f"{module_type}={wanted_name!r}"
-            )
-        selected.pop("_artifact_path", None)
-        selected.pop("_artifact_container", None)
-        modules.append(selected)
-    path = os.path.join(candidate_run, "candidate_full_eval_bundle.json")
-    payload = dict(candidate_bundle)
-    payload.update({
-        "combo": combo,
-        "modules": modules,
-        "evaluated_at": int(time.time()),
-        "source_bundle_fingerprint": candidate_bundle.get("bundle_fingerprint", ""),
-    })
-    _write_json(path, payload)
-    return path
 
 
 def _dedupe_results(results: List[dict], questions: List[dict],
@@ -1104,21 +756,6 @@ def _write_summary(path: str, report: dict) -> None:
         f.write("\n".join(lines) + "\n")
 
 
-def _metavideoagent_ledger_path(args) -> str:
-    run_id = getattr(args, "metavideoagent_run_id", "") or ""
-    if not run_id:
-        return ""
-    output_root = getattr(args, "metavideoagent_output_root", "") or ""
-    metavideoagent_dir = os.path.join(PROJECT_ROOT, "execution")
-    if metavideoagent_dir not in sys.path:
-        sys.path.insert(0, metavideoagent_dir)
-    try:
-        from ledger import ledger_path
-        return ledger_path(run_id, output_root)
-    except Exception:
-        return ""
-
-
 def _record_metavideoagent_ledger(args, report: dict, decision: dict = None,
                              decision_path: str = "") -> str:
     run_id = getattr(args, "metavideoagent_run_id", "") or ""
@@ -1137,7 +774,7 @@ def _record_metavideoagent_ledger(args, report: dict, decision: dict = None,
     # Every completed full evaluation is an auditable next-round input. A
     # rejected candidate is recorded as candidate_full_eval without changing
     # the ledger current best, rather than being silently omitted.
-    if report.get("evaluation_complete", True) is not True:
+    if not full_evaluation_is_valid(report):
         return ""
     decision = decision or {}
     # The decision's preference is necessary but not sufficient; the policy
@@ -1197,10 +834,25 @@ def run(args: argparse.Namespace) -> dict:
     candidate_bundle_path = getattr(args, "candidate_bundle", "") or os.path.join(
         candidate_run, "candidate_bundle.json"
     )
+    split = str(getattr(args, "question_split", EVOLUTION_SPLIT) or EVOLUTION_SPLIT)
+    evaluation_dir = getattr(args, "evaluation_dir", "") or (
+        os.path.join(candidate_run, "held_out_evaluation") if split == HELD_OUT_TEST_SPLIT else candidate_run
+    )
+    frozen_path = os.path.join(evaluation_dir, "execution_bundle.json")
+    if split == HELD_OUT_TEST_SPLIT:
+        train_diagnostic = getattr(args, "train_diagnostic_report", "")
+        train_diagnostic_payload = _read_json_optional(train_diagnostic)
+        if (train_diagnostic_payload.get("question_split") != EVOLUTION_SPLIT
+                or train_diagnostic_payload.get("evaluation_complete") is not True):
+            raise ValueError("Held-out reporting requires a completed train-diagnostic report.")
+        candidate_bundle_path = str(
+            train_diagnostic_payload.get("candidate_full_eval_bundle_path")
+            or train_diagnostic_payload.get("effective_initial_baseline_bundle") or ""
+        )
     if not os.path.isfile(candidate_bundle_path):
         raise ValueError("MetaVideoAgent full eval requires a self-contained candidate_bundle.json")
+    args.candidate_bundle = candidate_bundle_path
     candidate_bundle = _read_json(candidate_bundle_path)
-    split = str(getattr(args, "question_split", EVOLUTION_SPLIT) or EVOLUTION_SPLIT)
     if split not in {EVOLUTION_SPLIT, HELD_OUT_TEST_SPLIT}:
         raise ValueError(f"Unsupported full-eval question split: {split!r}")
     from bundle_contract import validate_candidate_bundle
@@ -1215,48 +867,7 @@ def run(args: argparse.Namespace) -> dict:
     changed_modules = list(candidate_bundle.get("changed_modules") or [])
     diagnosis_context = _load_diagnosis_context(candidate_run, args)
 
-    if split == HELD_OUT_TEST_SPLIT:
-        train_diagnostic = getattr(args, "train_diagnostic_report", "")
-        if not train_diagnostic or not os.path.isfile(train_diagnostic):
-            raise ValueError(
-                "held-out reporting requires --train-diagnostic-report from "
-                "this frozen candidate's completed evolution-split evaluation"
-            )
-        train_diagnostic_payload = _read_json_optional(train_diagnostic)
-        if (
-            train_diagnostic_payload.get("question_split") != EVOLUTION_SPLIT
-            or train_diagnostic_payload.get("evaluation_complete") is not True
-        ):
-            raise ValueError(
-                "--train-diagnostic-report must be a completed train full eval"
-            )
-        paired_bundles = [
-            str(train_diagnostic_payload.get(key) or "")
-            for key in (
-                "candidate_bundle", "candidate_full_eval_bundle_path",
-                "effective_initial_baseline_bundle", "initial_baseline_bundle",
-            )
-        ]
-        paired_digests = {
-            _file_digest(path) for path in paired_bundles if path and os.path.isfile(path)
-        }
-        paired_digests.update({
-            str(train_diagnostic_payload.get(key) or "").strip()
-            for key in (
-                "candidate_bundle_sha256", "candidate_full_eval_bundle_sha256",
-            )
-            if str(train_diagnostic_payload.get(key) or "").strip()
-        })
-        if not paired_digests:
-            raise ValueError(
-                "--train-diagnostic-report does not attest a frozen bundle digest"
-            )
-        if _file_digest(candidate_bundle_path) not in paired_digests:
-            raise ValueError(
-                "--train-diagnostic-report belongs to a different frozen bundle"
-            )
     questions, video_ids, split_spec = load_question_set(
-        workspace,
         video_id=args.video_id,
         distribution_manifest=getattr(args, "distribution_manifest", ""),
         preferred_splits=(split,),
@@ -1275,35 +886,10 @@ def run(args: argparse.Namespace) -> dict:
         )
     if len({q.get("task_id") for q in questions}) != len(questions):
         raise RuntimeError("Duplicate task_id detected in full-eval question set")
-    requested_task_ids = [
-        str(value or "").strip()
-        for value in (getattr(args, "task_id", []) or [])
-        if str(value or "").strip()
-    ]
-    if requested_task_ids:
-        if len(set(requested_task_ids)) != len(requested_task_ids):
-            raise ValueError("--task-id values must be unique")
-        available_by_id = {
-            str(item.get("task_id") or ""): item
-            for item in questions
-        }
-        missing_task_ids = [
-            task_id for task_id in requested_task_ids
-            if task_id not in available_by_id
-        ]
-        if missing_task_ids:
-            raise ValueError(
-                "--task-id is outside the selected split/video scope: "
-                f"{missing_task_ids}"
-            )
-        # Explicit task recovery is intentionally an isolated evaluation
-        # artifact.  It never expands a user-selected repair set to other
-        # rows that merely contain historical transient provider events.
-        questions = [available_by_id[task_id] for task_id in requested_task_ids]
     scheduled_questions = list(questions)
 
     validation = validate_bundle_assembly(candidate_bundle)
-    base_combo, base_combo_source = _resolve_base_combo(args, diagnosis_context)
+    base_combo, base_combo_source = _resolve_base_combo(args)
     ref_report_path = _resolve_path(getattr(args, "reference_report", "") or "", os.getcwd())
     ref_report = _read_json_optional(ref_report_path)
     if split == HELD_OUT_TEST_SPLIT and not getattr(args, "reference_bundle", ""):
@@ -1318,7 +904,6 @@ def run(args: argparse.Namespace) -> dict:
         reference_rows, reference_source, reference_label = _resolve_reference_results(
             workspace,
             args,
-            diagnosis_context,
         )
     if not reference_rows and split != HELD_OUT_TEST_SPLIT:
         raise RuntimeError(
@@ -1331,7 +916,6 @@ def run(args: argparse.Namespace) -> dict:
         if q.get("task_id", "") not in reference_lookup
         and q.get("question", "") not in reference_lookup
     ]
-    base_combo_registry_status = _combo_registry_status(base_combo)
     base_bundle, base_bundle_path, base_bundle_validation = _resolve_reference_bundle(
         args, ref_report, ref_report_path, base_combo
     )
@@ -1352,10 +936,7 @@ def run(args: argparse.Namespace) -> dict:
             "matches the current-best struct implementation; use "
             "--force-fresh-structure for an explicit reproducibility rebuild."
         )
-    base_combo_injectable = bool(
-        base_combo_registry_status.get("registered")
-        or (base_bundle_path and base_bundle_validation.get("passed"))
-    )
+    base_combo_injectable = bool(base_bundle_path and base_bundle_validation.get("passed"))
     explicit_structure_dirs = [
         os.path.abspath(str(path))
         for path in (getattr(args, "reference_structure_dir", []) or [])
@@ -1386,7 +967,6 @@ def run(args: argparse.Namespace) -> dict:
         "output_root": runtime_output_root(),
         "candidate": {
             "name": "MetaVideoAgent bundle",
-            "bundle_fingerprint": candidate_bundle.get("bundle_fingerprint", ""),
             "changed_modules": changed_modules,
         },
         "diagnosis_context_path": (
@@ -1402,7 +982,6 @@ def run(args: argparse.Namespace) -> dict:
         "reference_source": reference_source,
         "base_combo": base_combo,
         "base_combo_source": base_combo_source,
-        "base_combo_registry_status": base_combo_registry_status,
         "base_bundle_path": base_bundle_path,
         "base_bundle_validation": base_bundle_validation,
         "base_combo_injectable": base_combo_injectable,
@@ -1412,7 +991,7 @@ def run(args: argparse.Namespace) -> dict:
             "manifest_path": split_spec.get("manifest_path", "") if isinstance(split_spec, dict) else "",
             "split_names": sorted((split_spec.get("splits", {}) or {}).keys()) if isinstance(split_spec, dict) else [],
         },
-        "llm_model": args.llm_model,
+        "llm_model": DEFAULT_LLM_MODEL,
         "vlm_model": _active_vlm_model_name(),
         "rebuild_structure": effective_rebuild_structure,
         "structure_reuse_decision": structure_reuse_decision,
@@ -1446,59 +1025,36 @@ def run(args: argparse.Namespace) -> dict:
     if not readiness["ready"]:
         raise RuntimeError(f"Full-eval readiness failed: {readiness}")
 
-    evaluation_dir = (
-        os.path.join(candidate_run, "held_out_evaluation")
-        if split == HELD_OUT_TEST_SPLIT else candidate_run
-    )
-    resume_requested = bool(getattr(args, "resume", False))
-    resume_seed_dirs = list(getattr(args, "resume_seed_sandbox", []) or [])
-    if resume_seed_dirs and not resume_requested:
-        raise ValueError("--resume-seed-sandbox requires --resume")
-    # Seeding bootstraps a brand-new, isolated run from immutable per-video
-    # artifacts. It then follows the same strict resume path as an interrupted
-    # run. Existing candidate-run artifacts are never overwritten.
-    seed_manifest = {}
-    if resume_seed_dirs:
-        paths = _prepare_outputs(evaluation_dir, overwrite=args.overwrite, resume=False)
-        seed_manifest = _seed_resume_sandbox(
-            paths["sandbox_dir"], resume_seed_dirs,
-            copy_structures=bool(getattr(args, "resume_seed_structures", False)),
-        )
-        _write_json(os.path.join(evaluation_dir, "full_eval_resume_seed.json"), seed_manifest)
-    else:
-        paths = _prepare_outputs(
-            evaluation_dir, overwrite=args.overwrite, resume=resume_requested
-        )
+    paths = _prepare_outputs(evaluation_dir, overwrite=args.overwrite)
+    _write_json(frozen_path, candidate_bundle)
+    candidate_bundle_path = frozen_path
     # Persist one start/end record for every execution-provider request,
     # including the pre-answer candidate structure build.  Full-eval reports
     # already retain per-question capability events; this append-only audit
     # makes the build phase equally reproducible and is isolated per split.
     os.environ["RUNTIME_PROVIDER_AUDIT_PATH"] = paths["provider_audit_path"]
-    requested_combo_id = (
+    combo_id = (
         args.combo_id
         or f"Evolved_bundle_{int(time.time())}"
     )
-    resume_contract_path, combo_id = _ensure_resume_contract(
-        evaluation_dir,
-        _resume_contract(
-            candidate_bundle_path, split, scheduled_questions, requested_combo_id
-        ),
-        resume=resume_requested and not bool(resume_seed_dirs),
-    )
+    evaluation_plan_path = os.path.join(evaluation_dir, "evaluation_plan.json")
+    _write_json(evaluation_plan_path, {
+        "candidate_bundle_path": candidate_bundle_path,
+        "question_split": split,
+        "task_ids": [item["task_id"] for item in scheduled_questions],
+        "combo_id": combo_id,
+    })
     if reference_structure_dirs and not effective_rebuild_structure:
         _prepopulate_structure_dir(reference_structure_dirs, paths["sandbox_dir"])
-    os.environ["METAVIDEOAGENT_LLM_MODEL"] = args.llm_model
     os.environ.setdefault("VIDEO_STRUCT_REBUILD_WORKERS", str(args.structure_workers))
     if effective_rebuild_structure:
         os.environ["SANDBOX_DISABLE_FULL_STRUCTURE_BUILD"] = "0"
         os.environ["SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD"] = "1"
         os.environ["SANDBOX_STRUCTURE_CHROMA_PER_VIDEO"] = "1"
-        os.environ["VIDEO_STRUCT_RESUME_BUILD"] = "0"
     else:
         os.environ.setdefault("SANDBOX_DISABLE_FULL_STRUCTURE_BUILD", "1")
         os.environ.setdefault("SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD", "0")
         os.environ.setdefault("SANDBOX_STRUCTURE_CHROMA_PER_VIDEO", "0")
-        os.environ.setdefault("VIDEO_STRUCT_RESUME_BUILD", "0")
 
     import module_map
 
@@ -1535,70 +1091,32 @@ def run(args: argparse.Namespace) -> dict:
                 f"injected={agent_combo.get('video_structuring', '')!r}, "
                 f"planned={structure_reuse_decision['candidate_struct']!r}"
             )
-        if "video_structuring" in injected_candidate_names:
-            custom_configs.setdefault(injected_candidate_names["video_structuring"], {})
-        for struct_name in {
-            agent_combo.get("video_structuring", ""),
-            injected_candidate_names.get("video_structuring", ""),
-        }:
-            if struct_name and effective_rebuild_structure:
-                custom_configs.setdefault(struct_name, {})
-                custom_configs[struct_name].setdefault("physics", {})
-                physics = custom_configs[struct_name]["physics"]
-                physics["parallel_workers"] = args.structure_workers
-                physics.setdefault("parallel_workers_full_coverage", args.structure_workers)
-                physics.setdefault("parallel_workers_interval_entity_ocr", args.structure_workers)
-                physics.setdefault("parallel_workers_actionable_handoff", args.structure_workers)
-                physics.setdefault("parallel_batch_delay", 0.2)
-        resumed_rows, resumed_task_ids = ([], set())
-        if resume_requested:
-            resumed_rows, resumed_task_ids = _load_completed_sandbox_rows(
-                paths["sandbox_dir"], scheduled_questions, agent_combo,
-                rerun_provider_failures=bool(
-                    getattr(args, "resume_rerun_provider_failures", False)
-                ),
-            )
-        pending_questions = [
-            item for item in scheduled_questions
-            if str(item.get("task_id") or "") not in resumed_task_ids
-        ]
-        # A resume preserves an existing candidate structure artifact for its
-        # video. Only a video with no artifact is rebuilt. This prevents a
-        # partial interruption from consuming VLM/ASR calls again.
+        if effective_rebuild_structure:
+            struct_config = custom_configs.setdefault(agent_combo["video_structuring"], {})
+            physics = struct_config.setdefault("physics", {})
+            physics["parallel_workers"] = args.structure_workers
+            physics.setdefault("parallel_batch_delay", 0.2)
+        # Build this evaluation's video libraries before scheduling answers.
         structure_prebuild = []
         force_rebuild_by_video = {}
         if effective_rebuild_structure:
-            structure_dir = os.path.join(paths["sandbox_dir"], "video_structure")
-            struct_name = str(agent_combo.get("video_structuring") or "")
-            pending_video_ids = {
-                str(item.get("video_id") or "") for item in pending_questions
-            }
-            missing_structure_video_ids = []
-            for video_id in pending_video_ids:
-                artifact = os.path.join(structure_dir, f"{video_id}_{struct_name}.jsonl")
-                needs_build = not (
-                    os.path.isfile(artifact) and os.path.getsize(artifact) > 0
-                )
-                force_rebuild_by_video[video_id] = needs_build
-                if needs_build:
-                    missing_structure_video_ids.append(video_id)
-            # Formal train/test full eval has an explicit two-phase schedule:
-            # materialize every required video library first, then release the
-            # complete question pool to the global answer scheduler.
-            if missing_structure_video_ids:
+            evaluation_video_ids = sorted({
+                str(item.get("video_id") or "") for item in scheduled_questions
+            })
+            if evaluation_video_ids:
                 structure_prebuild = prebuild_isolated_video_structures(
                     workspace,
-                    missing_structure_video_ids,
+                    evaluation_video_ids,
                     agent_combo,
                     paths["sandbox_dir"],
                     custom_configs=custom_configs,
                 )
                 force_rebuild_by_video = {
-                    video_id: False for video_id in pending_video_ids
+                    video_id: False for video_id in evaluation_video_ids
                 }
-        fresh_rows = evaluate_combo_multi_video(
+        results = evaluate_combo_multi_video(
             workspace,
-            pending_questions,
+            scheduled_questions,
             agent_combo,
             combo_id,
             paths["sandbox_dir"],
@@ -1613,18 +1131,16 @@ def run(args: argparse.Namespace) -> dict:
             # video group.  The evaluator automatically falls back to the
             # safe grouped path if a future candidate requires rebuilding.
             global_question_scheduler=True,
-        ) if pending_questions else []
-        results = resumed_rows + fresh_rows
+        ) if scheduled_questions else []
         # Provider/API failures are per-question execution incidents, not a
         # reason to discard a completed multi-video evaluation.  Adapters have
-        # already retried the identical API request once.  Persist any terminal
-        # failures for an explicitly requested task rerun; do not make the
-        # full-eval runner silently rerun or replace individual results.
+        # already retried the identical API request once. Record terminal
+        # failures so the complete stage can be rerun after the cause is fixed.
         provider_failure_task_ids = _terminal_provider_failure_task_ids(results)
         provider_failure_record = {
             "artifact_type": "full_eval_provider_failures",
             "schema_version": 1,
-            "task_rerun_managed_by": "explicit_or_external_runner",
+            "retry_policy": "rerun_full_evaluation_after_execution_fix",
             "task_ids": provider_failure_task_ids,
             "failures": {
                 task_id: _provider_failure_summary(next(
@@ -1642,8 +1158,7 @@ def run(args: argparse.Namespace) -> dict:
     ordered_results, missing_result_task_ids = _dedupe_results(
         results, scheduled_questions, strict=False
     )
-    # Always persist the explicit rerun list, including the empty case, so later
-    # operators can distinguish "no provider failure" from missing provenance.
+    # Keep provider failures alongside the measured results.
     _write_json(paths["provider_failure_path"], provider_failure_record)
     _write_jsonl(paths["results_path"], ordered_results)
     structure_artifact = _structure_artifact(
@@ -1655,11 +1170,7 @@ def run(args: argparse.Namespace) -> dict:
         source_artifact=ref_report.get("structure_artifact") or {},
         source_structure_dirs=reference_structure_dirs,
     )
-    effective_bundle_path = _materialize_effective_bundle(
-        evaluation_dir,
-        agent_combo,
-        candidate_bundle,
-    )
+    effective_bundle_path = frozen_path
 
     report = compare_with_reference(
         ordered_results,
@@ -1683,7 +1194,6 @@ def run(args: argparse.Namespace) -> dict:
             "structure_prebuild": structure_prebuild,
             "candidate": {
                 "name": "MetaVideoAgent bundle",
-                "bundle_fingerprint": candidate_bundle.get("bundle_fingerprint", ""),
                 "changed_modules": changed_modules,
             },
             "module_artifacts": module_artifacts,
@@ -1691,7 +1201,6 @@ def run(args: argparse.Namespace) -> dict:
             "evaluation_dir": evaluation_dir,
             "reference_report_path": ref_report_path,
             "candidate_bundle": candidate_bundle_path,
-            "candidate_bundle_sha256": _file_digest(candidate_bundle_path),
             "runtime_dir": RUNTIME_DIR,
             "runtime_id": runtime_id(),
             "workspace_dir": os.path.abspath(workspace),
@@ -1704,30 +1213,15 @@ def run(args: argparse.Namespace) -> dict:
             "question_split": split,
             "reference_label": reference_label,
             "reference_source": reference_source,
-            "history_input_policy": _external_history_meta(
-                reference_source,
-                getattr(args, "reference_report", "") or "",
-                getattr(args, "reference_results", "") or "",
-            ),
             "expected_total_questions": len(scheduled_questions),
-            "resume": {
-                "enabled": resume_requested,
-                "contract_path": resume_contract_path,
-                "seed_manifest_path": (
-                    os.path.join(candidate_run, "full_eval_resume_seed.json")
-                    if resume_seed_dirs else ""
-                ),
-                "seed_source_count": len(resume_seed_dirs),
-                "resumed_question_count": len(resumed_rows),
-                "executed_question_count": len(pending_questions),
-            },
+            "evaluation_plan_path": evaluation_plan_path,
             "missing_result_task_ids": missing_result_task_ids,
             "concurrency": args.concurrency,
-            "llm_model": args.llm_model,
+            "llm_model": DEFAULT_LLM_MODEL,
             "runtime_models": {
                 "vlm_profile_id": DEFAULT_PROFILE_IDS["vlm"],
                 "llm_profile_id": DEFAULT_PROFILE_IDS["llm"],
-                "llm_model": args.llm_model,
+                "llm_model": DEFAULT_LLM_MODEL,
                 "asr_profile_id": DEFAULT_PROFILE_IDS["asr"],
                 "embedding_profile_id": DEFAULT_PROFILE_IDS["embedding"],
             },
@@ -1747,7 +1241,6 @@ def run(args: argparse.Namespace) -> dict:
             "structure_dir": os.path.join(paths["sandbox_dir"], "video_structure"),
             "structure_artifact": structure_artifact,
             "candidate_full_eval_bundle_path": effective_bundle_path,
-            "candidate_full_eval_bundle_sha256": _file_digest(effective_bundle_path),
             "results_path": paths["results_path"],
             "report_path": paths["report_path"],
             "summary_path": paths["summary_path"],
@@ -1759,11 +1252,7 @@ def run(args: argparse.Namespace) -> dict:
             "provider_failures": provider_failure_record,
             "assembly_validation": validation,
             "readiness": readiness,
-            "observed_distribution_profile": _load_or_build_distribution_profile(
-                workspace,
-                getattr(args, "distribution_manifest", ""),
-                getattr(args, "distribution_profile", ""),
-            ),
+            "observed_distribution_profile": _read_json_optional(getattr(args, "distribution_profile", "")),
         }
     )
     apply_effectiveness_policy(
@@ -1825,17 +1314,16 @@ def run(args: argparse.Namespace) -> dict:
         if train_results and os.path.isfile(train_results):
             report["current_best_selection"]["train_diagnostic_results_path"] = os.path.abspath(train_results)
 
-    # Provider failures remain in the persisted audit for trajectory review.
-    if report.get("evaluation_complete", True) is not True:
+    if not full_evaluation_is_valid(report):
         report["full_eval_runtime_failure"] = {
             "requires_rerun": True,
-            "reason": "incomplete_full_eval",
+            "reason": report.get("engineering_invalid_reason") or "incomplete or invalid full evaluation",
             "evaluation_audit_path": paths["audit_path"],
         }
         _write_json(paths["report_path"], report)
         _write_summary(paths["summary_path"], report)
         raise RuntimeError(
-            "full eval is incomplete; rerun this same candidate before post-decision"
+            "Full evaluation is incomplete or invalid; resolve its recorded failures before rerunning."
         )
 
     if split == HELD_OUT_TEST_SPLIT:
@@ -1853,43 +1341,15 @@ def run(args: argparse.Namespace) -> dict:
         _write_json(paths["post_eval_decision_path"], decision)
         report["post_full_eval_decision"] = decision
     else:
-        ledger_snapshot = _read_json_optional(_metavideoagent_ledger_path(args))
-        # Some staged MetaVideoAgent invocations intentionally omit
-        # --metavideoagent-run-id so that an explicit full evaluation cannot mutate
-        # the ledger.  They still provide an explicit current-best reference.
-        # That reference is sufficient for the acceptance comparison: do not
-        # mistake an unavailable ledger for absence of a current best and
-        # accept a lower-scoring candidate as the first executed reference.
-        if not (ledger_snapshot.get("current_best") if isinstance(ledger_snapshot, dict) else None):
-            reference_correct = report.get("reference_correct")
-            reference_total = report.get("total_questions")
-            if isinstance(reference_correct, (int, float)) and isinstance(reference_total, (int, float)):
-                ledger_snapshot = {
-                    "current_best": {
-                        "label": "explicit_reference_for_post_full_eval",
-                        "report_path": report.get("reference_report_path", ""),
-                        "results_path": report.get("reference_results_path", ""),
-                        "metrics": {
-                            "correct": int(reference_correct),
-                            "total_questions": int(reference_total),
-                            "accuracy_delta": 0,
-                            "regressions": 0,
-                        },
-                        "synthetic": True,
-                    },
-                    "synthetic_from_explicit_reference": True,
-                }
         decision = decide_post_full_eval(
             report,
             audit,
-            ledger_snapshot,
             call_llm=not getattr(args, "skip_post_eval_decision", False),
         )
         _write_json(paths["post_eval_decision_path"], decision)
         report["post_full_eval_decision"] = decision
         if current_best_update_allowed(report, decision):
-            current_best_bundle_path = os.path.join(candidate_run, "current_best_bundle.json")
-            shutil.copy2(effective_bundle_path, current_best_bundle_path)
+            current_best_bundle_path = effective_bundle_path
             report["current_best_bundle_path"] = current_best_bundle_path
             report["combo_policy"]["current_best_bundle_path"] = current_best_bundle_path
         ledger_path = _record_metavideoagent_ledger(
@@ -1901,6 +1361,8 @@ def run(args: argparse.Namespace) -> dict:
             report["current_best_ledger"] = ledger_path
 
     _write_json(paths["report_path"], report)
+    if split == EVOLUTION_SPLIT:
+        _write_json(os.path.join(candidate_run, "full_eval_result.json"), {"report_path": paths["report_path"]})
     _write_summary(paths["summary_path"], report)
     return report
 
@@ -1916,15 +1378,11 @@ def main() -> int:
     parser.add_argument("--diagnosis-report", default="",
                         help="Optional diagnosis JSON; defaults to candidate-run/diagnosis.json")
     parser.add_argument("--video-id", default="ALL")
-    parser.add_argument("--task-id", action="append", default=[],
-                        help=("Optional exact task ID to evaluate; may be repeated. "
-                              "Creates an isolated, explicitly scoped recovery run."))
     parser.add_argument("--question-split", choices=(EVOLUTION_SPLIT, HELD_OUT_TEST_SPLIT),
                         default=EVOLUTION_SPLIT,
                         help=("Dataset split to evaluate. train drives evolution; test is "
                               "a read-only held-out report for a frozen agent."))
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
     parser.add_argument("--rebuild-structure", action="store_true")
     parser.add_argument("--force-fresh-structure", action="store_true",
                         help=("Explicitly rebuild fresh isolated per-video structure libraries before "
@@ -1932,21 +1390,6 @@ def main() -> int:
     parser.add_argument("--structure-workers", type=int, default=4)
     parser.add_argument("--combo-id", default="")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--resume", action="store_true",
-                        help=("Resume an interrupted run with the exact saved "
-                              "resume contract; completed sandbox rows and "
-                              "matching candidate structures are reused."))
-    parser.add_argument("--resume-seed-sandbox", action="append", default=[],
-                        help=("Sandbox directory from a completed compatible "
-                              "per-video run to seed into a new --resume run; "
-                              "may be supplied multiple times."))
-    parser.add_argument("--resume-seed-structures", action="store_true",
-                        help=("Also copy seeded structure JSONLs. Required only "
-                              "when the seeded run still has pending questions."))
-    parser.add_argument("--resume-rerun-provider-failures", action="store_true",
-                        help=("With --resume, treat persisted rows with terminal provider "
-                              "API failures as pending so only those tasks are re-executed; "
-                              "all other exact rows remain seeded."))
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--distribution-profile", default="",
                         help="Optional label-blind observed_distribution_profile.json to carry into the report")
@@ -1964,17 +1407,16 @@ def main() -> int:
                         help="Optional JSON bundle with full module code for the reference/base combo")
     parser.add_argument("--reference-label", default="",
                         help="Reference label for reports, e.g. initial_combo/current_best")
-    parser.add_argument("--combo-plan", default="",
-                        help="Optional initial_combo_plan.json used as the base combo before injecting candidate modules")
     parser.add_argument("--metavideoagent-run-id", default="",
                         help="Optional run id used to update the evolution-split current-best ledger")
     parser.add_argument("--metavideoagent-output-root", default="",
                         help="Optional execution output root for the current-best ledger")
+    parser.add_argument("--evaluation-dir", default="", help="Explicit output directory for this evaluation attempt.")
     parser.add_argument("--train-diagnostic-report", default="",
                         help=("Completed evolution-split report paired with a read-only held-out "
                               "evaluation of the same frozen candidate."))
     parser.add_argument("--skip-post-eval-decision", action="store_true",
-                        help="Skip LLM post-full-eval decision and use heuristic fallback only")
+                        help="Skip the optional model explanation of the train-selection result")
     args = parser.parse_args()
 
     report = run(args)
@@ -1999,7 +1441,7 @@ def main() -> int:
     decision = report.get("post_full_eval_decision") or {}
     print(f"post_eval_next_action={decision.get('next_action')}")
     print(f"post_eval_update_current_best={decision.get('update_current_best')}")
-    return 0
+    return 0 if full_evaluation_is_valid(report) else 1
 
 
 if __name__ == "__main__":

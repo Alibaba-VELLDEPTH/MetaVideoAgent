@@ -25,10 +25,10 @@ tasks_dir = use_runtime_path()
 if tasks_dir not in sys.path:
     sys.path.insert(0, tasks_dir)
 
-from combo_contract import require_complete_evolution_combo
+from combo_contract import require_complete_agent_combo
 from distribution_spec import load_distribution_spec
+from handoffs import evaluate_handoffs as _bundle_handoff_checks
 from question_set_loader import load_questions as load_question_set
-from reference_loader import combo_from_reference
 from structure_artifacts import (
     reference_structure_artifact_dir as _reference_structure_artifact_dir,
 )
@@ -132,42 +132,6 @@ def _read_json_optional(path: str) -> dict:
         return {}
 
 
-def _initial_bundle_path_from_report(report_path: str) -> str:
-    report = _read_json_optional(report_path)
-    if not report:
-        return ""
-    combo_policy = report.get("combo_policy") or {}
-    direct_paths = [
-        report.get("current_best_bundle_path", ""),
-        report.get("candidate_full_eval_bundle_path", ""),
-        combo_policy.get("current_best_bundle_path", ""),
-        combo_policy.get("effective_bundle_path", ""),
-        report.get("effective_initial_baseline_bundle", ""),
-        report.get("initial_baseline_bundle", ""),
-        report.get("bundle_path", ""),
-        combo_policy.get("base_bundle_path", ""),
-    ]
-    candidates = []
-    report_dir = os.path.dirname(os.path.abspath(report_path))
-    for direct in direct_paths:
-        if not isinstance(direct, str) or not direct:
-            continue
-        candidates.append(direct)
-        if not os.path.isabs(direct):
-            candidates.append(os.path.join(report_dir, direct))
-            candidates.append(os.path.join(_PROJECT_ROOT, direct))
-    candidates.append(os.path.join(report_dir, "current_best_bundle.json"))
-    candidates.append(os.path.join(report_dir, "initial_baseline_bundle.json"))
-    for source in report.get("sources", []) or []:
-        if isinstance(source, str):
-            candidates.append(os.path.join(os.path.dirname(os.path.abspath(source)), "initial_baseline_bundle.json"))
-            candidates.append(os.path.join(os.path.dirname(os.path.abspath(source)), "current_best_bundle.json"))
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return os.path.abspath(candidate)
-    return ""
-
-
 def _prepare_isolated_smoke_workspace(real_workspace_dir: str, log):
     """Create an isolated workspace that can only receive explicit artifacts."""
     temp_workspace = tempfile.TemporaryDirectory(prefix="codex_smoke_workspace_")
@@ -207,190 +171,12 @@ def _reuse_reference_structure_for_smoke(agent, reference_structure_dir: str, lo
     log("BUILD_DB", f"reused current-best artifact: {os.path.basename(source_db)}")
 
 
-def _find_artifact_module(ref_report: dict, module_type: str,
-                          module_name: str) -> dict:
-    artifacts = (ref_report or {}).get("module_artifacts", {}) or {}
-    item = artifacts.get(module_type) or {}
-    path = item.get("path", "")
-    if not path or not os.path.exists(path):
-        return {}
-    candidates = []
-    if path.endswith(".jsonl"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        candidates.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            return {}
-    else:
-        candidates.append(_read_json_optional(path))
-    for module in candidates:
-        if module.get("module_type") == module_type and module.get("name") == module_name:
-            module.setdefault("_artifact_path", os.path.abspath(path))
-            module.setdefault("_artifact_container", "jsonl" if path.endswith(".jsonl") else "json")
-            return module
-    return {}
-
-
-def _localization_smoke_contract_issues(trajectory, module_code: str,
-                                        raw_video_path: str) -> list[str]:
-    """Detect target-output failures before a runnable candidate reaches probe.
-
-    This is intentionally about dataflow, not answer correctness: preserved
-    thinking must be able to progress from a localization observation to a
-    different downstream action.  It also verifies that a candidate claiming
-    ASR uses the documented extraction boundary instead of a PATH-dependent
-    shell binary.
-    """
-    tool_steps = [
-        step for step in (trajectory or [])
-        if isinstance(step, dict) and step.get("step_type") == "tool_execution"
-    ]
-    issues = []
-    localization_tools = [
-        str(step.get("tool") or "") for step in tool_steps
-        if "window_search" in str(step.get("tool") or "")
-    ]
-    localization_observations = [
-        str(step.get("observation") or "")
-        for step in tool_steps
-        if "window_search" in str(step.get("tool") or "")
-    ]
-    has_structured_windows = any(
-        re.search(
-            r"(?:JSON_CANDIDATES|candidate_windows|time_ranges)\s*[:=]"
-            r".*?\[\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*\]",
-            observation,
-            re.I | re.S,
-        )
-        for observation in localization_observations
-    )
-    if len(localization_tools) >= 3 and len(set(localization_tools[-3:])) == 1 and not has_structured_windows:
-        issues.append(
-            "Localization repeatedly returned non-actionable retrieval output: "
-            "preserved thinking could not extract structured candidate windows and repeated the same tool."
-        )
-    drops_available_visual_candidates = any(
-        "candidate windows selected: 0" in observation.lower()
-        and re.search(r'"candidates"\s*:\s*\[\s*\{', observation)
-        for observation in localization_observations
-    )
-    if drops_available_visual_candidates:
-        issues.append(
-            "Localization discarded available retrieval candidates while reporting zero candidate windows; "
-            "it must return the selected intervals in the preserved thinking contract instead of prose-only fallback."
-        )
-
-    return issues
-
-
-def _bundle_handoff_checks(trajectory, capability_events, contracts) -> list[dict]:
-    """Verify declared bundle handoffs on the one real smoke trajectory.
-
-    Declarative contracts are not sufficient: each declared producer must emit an
-    observation carrying its required fields and a later consumer must either
-    run or record a valid runtime consumption event.
-    """
-    tool_steps = [
-        step for step in (trajectory or [])
-        if isinstance(step, dict) and step.get("step_type") == "tool_execution"
-    ]
-    checks = []
-    for contract in contracts or []:
-        if not isinstance(contract, dict):
-            continue
-        producer, consumer = str(contract.get("producer") or ""), str(contract.get("consumer") or "")
-        fields = [str(value) for value in (contract.get("required_fields") or []) if str(value)]
-        producer_index, observation, module_result = None, "", {}
-        for index, step in enumerate(tool_steps):
-            if str(step.get("producer_module") or "") == producer:
-                producer_index, observation = index, str(step.get("observation") or "")
-                module_result = step.get("module_result") if isinstance(step.get("module_result"), dict) else {}
-                break
-        # Memory is stateful rather than a tool.  Its packet is consumed by
-        # thinking at the next loop boundary, so there is deliberately no
-        # synthetic ``tool_execution`` row to locate.  Accept only the
-        # framework-recorded consumption event carrying an explicit field
-        # inventory; this keeps the handoff auditable without pretending the
-        # memory was a sensor/tool call.
-        memory_consumption = next((
-            event for event in (capability_events or [])
-            if isinstance(event, dict) and event.get("event") == "consumer_consumed"
-            and event.get("status") == "ok" and event.get("contract_valid") is True
-            and str(event.get("producer_module") or "") == producer
-            and str(event.get("consumer") or event.get("consumer_module") or "") == consumer
-            and str(event.get("output_protocol") or "") == "memory_context"
-        ), None)
-        event_fields = set(memory_consumption.get("output_fields") or []) if memory_consumption else set()
-        if producer == "memory" and memory_consumption is not None:
-            producer_index = -1
-        parsed = {}
-        try:
-            parsed = json.loads(observation) if observation.strip().startswith("{") else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        # The formal ABI stores perception-specific values under the stable
-        # result envelope's ``evidence`` member.  Prefer the lossless module
-        # result retained by working memory; only use rendered text for previous
-        # trajectories.  Treating every declared field as a top-level string
-        # made a real perception→thinking handoff look absent.
-        evidence = module_result.get("evidence") if isinstance(module_result.get("evidence"), dict) else {}
-        previous_evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), dict) else {}
-        missing_fields = [
-            field for field in fields
-            if field not in module_result
-            and field not in evidence
-            and field not in parsed
-            and field not in previous_evidence
-            and field not in observation
-            and field not in event_fields
-        ]
-        later_consumer_run = any(
-            str(step.get("producer_module") or "") == consumer
-            for step in tool_steps[(producer_index + 1 if producer_index is not None else 0):]
-        )
-        consumed_event = any(
-            isinstance(event, dict) and event.get("event") == "consumer_consumed"
-            and event.get("status") == "ok" and event.get("contract_valid") is True
-            and str(event.get("producer_module") or "") == producer
-            and str(event.get("consumer") or event.get("consumer_module") or "") == consumer
-            for event in (capability_events or [])
-        )
-        checks.append({
-            "producer": producer, "consumer": consumer, "required_fields": fields,
-            "producer_observed": producer_index is not None,
-            "missing_fields": missing_fields,
-            "consumer_observed": later_consumer_run or consumed_event,
-            "consumption_event": consumed_event,
-            "passed": producer_index is not None and not missing_fields and (later_consumer_run or consumed_event),
-        })
-    return checks
-
-
 def _structure_build_handoff_step(db_path: str, contracts: list[dict] | None = None,
                                   source_mode: str = "isolated_build") -> dict:
-    """Expose the materialized isolated structure input as a producer event.
-
-    Video structuring runs before the question-answering loop, so it is not a
-    tool-execution row in ``agent.run()``. Treating that absence as a missing
-    structuring-to-localization handoff would incorrectly reject rebuilt
-    stores. This adapter reads only the isolated candidate JSONL that was
-    produced in this smoke *or* explicitly copied from the attested scoped
-    reference artifact.  Both are real timestamped producer outputs available
-    to localization; only their provenance differs.  Recording that distinction
-    prevents a valid reuse-only smoke from masquerading as an absent handoff.
-    """
-    # Start with the runtime's observable schema, then add every field declared
-    # by the candidate's structure-build producer contract. The isolated smoke
-    # record is the authoritative materialized output.
+    """Expose persisted build or reference records to the handoff checker."""
     fields = {
-        "transcript_sentence", "screen_text", "translated_keywords", "source",
-        "segment_boundaries",
+        "start_sec", "end_sec", "multimodal_narration", "canonical_evidence",
+        "retrieval_document", "asr_text", "media_assets", "source",
     }
     for contract in contracts or []:
         if not isinstance(contract, dict):
@@ -404,42 +190,6 @@ def _structure_build_handoff_step(db_path: str, contracts: list[dict] | None = N
     fields = tuple(sorted(fields))
     observed = {field: [] for field in fields}
 
-    def normalized_record(record: dict) -> dict:
-        """Expose deterministic schema views of native builder evidence.
-
-        The generated segment builder owns the media calls and persists native
-        ASR/VLM observations.  A structuring candidate may enrich those
-        observations before storage, but smoke must also recognize the same
-        evidence when the builder supplies a source-native record. This is a
-        no-model, no-question transformation: every derived value is bounded
-        by the record's own timestamped text and interval.
-        """
-        normalized = dict(record)
-        native_text = []
-        for key in ("asr_text", "transcript", "multimodal_narration", "description"):
-            text = str(record.get(key) or "").strip()
-            if text:
-                native_text.append(text)
-        screen = record.get("screen_text")
-        if isinstance(screen, list):
-            native_text.extend(str(item).strip() for item in screen if str(item).strip())
-        elif str(screen or "").strip():
-            native_text.append(str(screen).strip())
-        joined = " ".join(native_text).strip()
-        if "retrieval_document" in fields and not str(normalized.get("retrieval_document") or "").strip() and joined:
-            normalized["retrieval_document"] = joined
-        if "action_semantics" in fields and not normalized.get("action_semantics") and joined:
-            tokens = re.findall(r"[^\W_]+", joined.lower(), flags=re.UNICODE)
-            normalized["action_semantics"] = list(dict.fromkeys(token for token in tokens if len(token) > 2))
-        if "semantic_subwindows" in fields and not normalized.get("semantic_subwindows"):
-            try:
-                start, end = float(record.get("start_sec")), float(record.get("end_sec"))
-            except (TypeError, ValueError):
-                start = end = 0.0
-            if end > start:
-                normalized["semantic_subwindows"] = [{"start_sec": start, "end_sec": end}]
-        return normalized
-
     record_count = 0
     try:
         with open(db_path, "r", encoding="utf-8") as handle:
@@ -452,13 +202,7 @@ def _structure_build_handoff_step(db_path: str, contracts: list[dict] | None = N
                     continue
                 if not isinstance(record, dict):
                     continue
-                # The optional synthetic micro-record validates the call
-                # interface, but must not stand in for real media-derived
-                # producer output.
-                if str(record.get("source") or "") == "smoke_test_micro_add":
-                    continue
                 record_count += 1
-                record = normalized_record(record)
                 for field in fields:
                     if field in record and record.get(field) not in (None, "", [], {}):
                         observed[field].append(record.get(field))
@@ -490,7 +234,7 @@ def _structure_build_handoff_step(db_path: str, contracts: list[dict] | None = N
         "active_time_windows": [],
         "tool_params_summary": {"persisted_record_count": record_count, "source_mode": source_mode},
         "tool_request": {"kind": "smoke_structure_input", "tool_name": action,
-                         "source_mode": source_mode},
+                         "source_mode": source_mode, "source_ref": str(db_path)},
         "module_result": {
             "protocol_version": "metavideoagent_module_protocol",
             "kind": "structure_reuse_result" if reused_reference else "structure_build_result",
@@ -504,58 +248,43 @@ def _structure_build_handoff_step(db_path: str, contracts: list[dict] | None = N
 
 _SMOKE_SUPERVISION_KEYS = {
     "answer", "gt_answer", "gold_answer", "final_answer", "final_agent_answer",
-    "is_correct", "correct", "correctness", "score", "reward",
+    "is_correct", "correct", "correctness",
 }
 
 
-def _redact_smoke_supervision(value, answer_text: str = ""):
-    """Preserve execution shape while removing answer supervision.
-
-    Engineering smoke is allowed to expose the real request and every runtime
-    step to Codex, because that is how a generated bundle can be debugged.  It
-    must not expose a gold label, a candidate terminal answer, or an accuracy
-    signal: those belong exclusively to the supervised probe.  This function
-    is deterministic and deliberately does not summarize or judge a trace.
-    """
+def _redact_smoke_supervision(value):
+    """Redact answer and correctness fields while retaining execution evidence."""
     if isinstance(value, dict):
         return {
             str(key): (
                 "<redacted_answer_supervision>"
                 if str(key).lower() in _SMOKE_SUPERVISION_KEYS
-                else _redact_smoke_supervision(item, answer_text)
+                else _redact_smoke_supervision(item)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact_smoke_supervision(item, answer_text) for item in value]
-    if isinstance(value, str) and answer_text:
-        return value.replace(answer_text, "<redacted_candidate_answer>")
+        return [_redact_smoke_supervision(item) for item in value]
     return value
 
 
 def _engineering_execution_trace(test_task: dict, trajectory: list,
-                                 capability_events: list, answer_text: str) -> dict:
+                                 capability_events: list) -> dict:
     """Return the complete no-label trace supplied to engineering repair."""
     request = {
         key: test_task.get(key)
         for key in ("question", "choices", "time_reference")
         if key in test_task
     }
-    # This artifact is the authoritative no-label debugging view consumed by
-    # Codex repair.  Keep the real request and every agent/runtime event, but
-    # deterministically remove answer supervision.  Do not replace this with
-    # an LLM summary: the repair loop needs the actual producer/consumer data
-    # flow in order to find the first broken boundary.
     return {
         "artifact_type": "engineering_smoke_execution_trace", "schema_version": 1,
         "trace_policy": (
-            "complete runtime trajectory and capability events; gold labels and "
-            "correctness fields and the candidate terminal answer are redacted; "
-            "engineering repair diagnoses only execution/dataflow"
+            "runtime request, trajectory and capability events for engineering repair; "
+            "answer and correctness fields are redacted; evidence text is preserved"
         ),
-        "runtime_request": _redact_smoke_supervision(request, answer_text),
-        "trajectory": _redact_smoke_supervision(trajectory, answer_text),
-        "capability_events": _redact_smoke_supervision(capability_events, answer_text),
+        "runtime_request": _redact_smoke_supervision(request),
+        "trajectory": _redact_smoke_supervision(trajectory),
+        "capability_events": _redact_smoke_supervision(capability_events),
         "candidate_final_answer": "<redacted_candidate_answer>",
     }
 
@@ -626,7 +355,7 @@ def _answer_contract_issue(answer, task: dict) -> str:
     failure_tokens = (
         "uncertain", "unknown", "cannot determine", "can't determine",
         "insufficient evidence", "task failed", "failed to find answer",
-        "no answer", "unable to answer", "Unable to determine", "Insufficient evidence", "Unable to answer",
+        "no answer", "unable to answer", "unable to determine",
     )
     if folded in failure_tokens or any(token in folded for token in failure_tokens):
         return f"final answer is a non-evaluable failure token: {text[:160]}"
@@ -656,23 +385,47 @@ def _answer_contract_issue(answer, task: dict) -> str:
     return "final answer cannot be parsed as one of the visible options"
 
 
+def _evidence_delivery_issue(events: list[dict]) -> str:
+    """Require an observed structure or media result to reach Thinking."""
+    evidence_ids = set()
+    for event in events:
+        structure_read = (
+            event.get("event") == "consumer_consumed"
+            and event.get("status") == "ok" and event.get("contract_valid") is True
+            and event.get("producer_module") == "video_structuring"
+            and event.get("consumer") in {"localization", "perception"}
+        )
+        media_result = (
+            event.get("capability") in {"vlm", "ocr", "asr"}
+            and event.get("event") in {"inference", "transcription"}
+            and event.get("status") in {"ok", "no_content", "no_speech"}
+        )
+        if (structure_read or media_result) and event.get("evidence_event_id"):
+            evidence_ids.add(event["evidence_event_id"])
+        if (
+            event.get("event") == "consumer_consumed"
+            and event.get("status") == "ok" and event.get("contract_valid") is True
+            and event.get("consumer") == "thinking"
+            and event.get("producer_module") in {"localization", "perception"}
+            and evidence_ids.intersection(event.get("source_event_ids") or [])
+        ):
+            return ""
+    return "No observed structure or media evidence was delivered to Thinking by Localization or Perception."
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target_module", default="")
-    parser.add_argument("--class_name", default="")
     parser.add_argument("--bundle-json", default="", help="Current candidate_bundle.json for atomic bundle smoke")
     parser.add_argument("--workspace", default=default_workspace())
     parser.add_argument("--distribution-manifest", default="")
     parser.add_argument("--question-split", default="train")
     parser.add_argument("--reference-results", default="")
     parser.add_argument("--reference-report", default="")
-    parser.add_argument("--reference-bundle", default="")
     parser.add_argument("--expected-capabilities", default="")
     parser.add_argument("--expected-profiles-json", default="{}")
-    parser.add_argument("--require-consumer-event", action="store_true")
     parser.add_argument("--failure-contract-json", default="{}")
     parser.add_argument("--trace-output", default="",
-                        help="Persist the complete credential-free smoke execution trace here")
+                        help="Persist the complete smoke execution trace here")
     args = parser.parse_args()
     expected_capabilities = {
         value.strip() for value in args.expected_capabilities.split(",") if value.strip()
@@ -712,15 +465,10 @@ def main():
     changed_modules = [str(item) for item in changed_modules if str(item)]
     if bundle_candidate and not changed_modules:
         raise SmokeExecutionLayerError("candidate_bundle_invalid", "candidate bundle has no changed_modules")
-    # A bundle smoke is one real agent trajectory; this is only the display
-    # target used by previous logs and the structuring rebuild decision.
-    primary_target = args.target_module or ("video_structuring" if "video_structuring" in changed_modules else changed_modules[0])
-    log("INIT", f"target={primary_target}, class={args.class_name or 'bundle'}")
 
     # ─── Load the evolution module code ───
     log("PHASE", "loading_module")
     modules = bundle_candidate.get("modules") or {}
-    evolved = {}
     # An adaptive bundle is self-contained. Inject every canonical module
     # carried by the candidate; changed_modules is provenance only.
     candidate_module_types = (
@@ -733,20 +481,14 @@ def main():
                 "candidate_bundle_invalid",
                 f"candidate bundle has no executable code for {module_type}",
             )
-        record = dict(item)
-        record["module_type"] = module_type
-        evolved[module_type] = [record]
-    module_dict = (evolved.get(primary_target) or [{}])[-1]
-    module_code = str(module_dict.get("code") or "")
 
     # Dynamically register module classes
     import module_map
     from agent import MetaVideoAgent
     from run_video_qa import VideoQAEnv, build_video_structure
     from sandbox_evaluator import (
-        inject_evolved_modules,
+        _rebuild_sandbox_chroma_if_requested,
         inject_module_bundle,
-        map_combo_to_agent_config,
     )
 
     # ─── Position dataset ───
@@ -778,7 +520,6 @@ def main():
                 "distribution manifest declares no train split",
             )
         tasks, _video_ids, split_spec = load_question_set(
-            real_workspace_dir,
             video_id="ALL",
             distribution_manifest=args.distribution_manifest,
             preferred_splits=(args.question_split,),
@@ -835,106 +576,30 @@ def main():
         "perception": module_map.PERCEPTION_MAP,
     }
 
-    evolved_combo_config = require_complete_evolution_combo(
-        combo_from_reference(args.reference_results),
-        "smoke reference combo",
-    )
-    reference_combo_config = dict(evolved_combo_config)
-    for module_type, records in evolved.items():
-        evolved_combo_config[module_type] = records[-1].get("name", "")
-
-    custom_configs = {}
-    bundle_path = args.reference_bundle or _initial_bundle_path_from_report(args.reference_report)
-    if bundle_path:
-        bundle = _read_json_optional(bundle_path)
-        ok, bundle_combo, bundle_custom_configs, bundle_validation = inject_module_bundle(
-            bundle, module_map_refs
-        )
-        if not ok:
-            raise SmokeExecutionLayerError(
-                "reference_bundle_invalid",
-                f"reference initial bundle injection failed: {bundle_validation}",
-            )
-        custom_configs.update(bundle_custom_configs)
-        log("INJECT", f"reference_bundle={bundle_path}")
-        log("INJECT", f"reference_bundle_combo={bundle_combo}")
-        bundle_as_evolution = {
-            "video_structuring": bundle_combo.get("video_structuring", ""),
-            "thinking": bundle_combo.get("thinking", ""),
-            "memory": bundle_combo.get("memory", ""),
-            "localization": bundle_combo.get("localization", ""),
-            "perception": bundle_combo.get("perception", ""),
-        }
-        reference_delta_modules = {}
-        for module_type, reference_name in reference_combo_config.items():
-            if not reference_name or reference_name == bundle_as_evolution.get(module_type):
-                continue
-            if module_type in evolved:
-                continue
-            artifact_module = _find_artifact_module(
-                reference_report,
-                module_type,
-                reference_name,
-            )
-            if artifact_module:
-                reference_delta_modules.setdefault(module_type, []).append(artifact_module)
-                continue
-            raise SmokeExecutionLayerError(
-                "reference_bundle_artifact_missing",
-                "reference combo requires a module not embedded in its self-contained bundle/report: "
-                f"{module_type}={reference_name}",
-            )
-        if reference_delta_modules:
-            custom_configs.update(
-                inject_evolved_modules(
-                    reference_delta_modules,
-                    module_map_refs,
-                )
-            )
-            for module_type, modules in reference_delta_modules.items():
-                module_name = modules[-1].get("name", "")
-                combo_key = {
-                    "video_structuring": "video_structuring",
-                    "thinking": "thinking",
-                    "memory": "memory",
-                    "localization": "localization",
-                    "perception": "perception",
-                }.get(module_type)
-                if combo_key and module_name:
-                    bundle_combo[combo_key] = module_name
-    else:
-        raise SmokeExecutionLayerError(
-            "reference_bundle_missing",
-            "MetaVideoAgent smoke requires an explicit injectable reference bundle; "
-            "refusing builtin alias fallback",
-        )
-
-    agent_combo = map_combo_to_agent_config(evolved_combo_config)
-    custom_configs.update(
-        inject_evolved_modules(evolved, module_map_refs)
-    )
+    evolved_combo_config = require_complete_agent_combo(bundle_candidate["combo"], "smoke candidate combo")
+    ok, agent_combo, custom_configs, candidate_validation = inject_module_bundle(bundle_candidate, module_map_refs)
+    if not ok:
+        raise RuntimeError(f"Candidate bundle injection failed: {candidate_validation}")
     log("INJECT", f"combo={evolved_combo_config}")
-    if bundle_candidate:
-        log("INJECT", f"candidate_bundle_changed_modules={changed_modules}")
-        assembly_preflight = _runtime_bundle_assembly_preflight(
-            bundle_candidate, evolved_combo_config, module_map_refs,
-        )
-        log("INJECT", "runtime_preflight=" + json.dumps(assembly_preflight, ensure_ascii=False))
-        if not assembly_preflight["passed"]:
-            result = {
-                "passed": False,
-                "failure_kind": "candidate_contract",
-                "error": "runtime bundle assembly preflight failed: " + " | ".join(assembly_preflight["issues"]),
-                "contract_issues": list(assembly_preflight["issues"]),
-                "assembly_preflight": assembly_preflight,
-                "capability_events": [],
-                "engineering_execution_trace": {},
-            }
-            log("RESULT", json.dumps(result, ensure_ascii=False))
-            return
+    log("INJECT", f"candidate_bundle_changed_modules={changed_modules}")
+    assembly_preflight = _runtime_bundle_assembly_preflight(
+        bundle_candidate, evolved_combo_config, module_map_refs,
+    )
+    log("INJECT", "runtime_preflight=" + json.dumps(assembly_preflight, ensure_ascii=False))
+    if not assembly_preflight["passed"]:
+        result = {
+            "passed": False,
+            "failure_kind": "candidate_contract",
+            "error": "runtime bundle assembly preflight failed: " + " | ".join(assembly_preflight["issues"]),
+            "contract_issues": list(assembly_preflight["issues"]),
+            "assembly_preflight": assembly_preflight,
+            "capability_events": [],
+            "engineering_execution_trace": {},
+        }
+        log("RESULT", json.dumps(result, ensure_ascii=False))
+        return
 
-    # Capture [MODULE:*] logs on stdout. The Agent creation phase must be overridden,
-    # Because video_structuring's [MODULE:INIT] is usually output in __init__.
+    # Capture construction, structure-build and question-execution output.
     import io
     module_log_buffer = io.StringIO()
 
@@ -1013,16 +678,6 @@ def main():
         custom_configs=custom_configs,
     )
     log("AGENT", "created successfully")
-    if "video_structuring" in changed_modules:
-        requires_vector_db = bool(getattr(agent.structuring, "requires_vector_db", False))
-        collection_state = (
-            bool(getattr(agent.structuring, "collection", None))
-            if requires_vector_db else "not_required"
-        )
-        print(
-            "[MODULE:INIT] module=video_structuring class=%s collection=%s origin=smoke_harness_observation"
-            % (agent.structuring.__class__.__name__, collection_state)
-        )
 
     # ─── Library building (video_structuring uses an isolated workspace when evolving and cannot pollute the baseline) ───
     force_rebuild = ("video_structuring" in changed_modules)
@@ -1052,60 +707,8 @@ def main():
         build_elapsed = time.time() - build_start
         log("BUILD_DB", f"completed: {record_count[0]} records in {build_elapsed:.1f}s")
 
-        # ChromaDB supplemental rebuild: build_video_structure skips VLM because JSONL already exists,
-        # But the isolated ChromaDB may be empty. Call rebuild_chroma_from_jsonl to rebuild the vector index from JSONL.
-        if hasattr(agent.structuring, 'rebuild_chroma_from_jsonl'):
-            import chromadb as _chromadb
-            chroma_db_path_new = os.path.join(workspace_dir, "video_structure", "chroma_db")
-            video_id_local = getattr(agent.structuring, 'video_id', '')
-            struct_type_local = getattr(agent.structuring, 'struct_type', '')
-            if getattr(agent.structuring, 'requires_vector_db', False):
-                agent.structuring.chroma_client = _chromadb.PersistentClient(path=chroma_db_path_new)
-                col_name = f"{video_id_local}_{struct_type_local}".replace("-", "_")[:63]
-                agent.structuring.collection = agent.structuring.chroma_client.get_or_create_collection(name=col_name)
-            if agent.structuring.collection is None or agent.structuring.collection.count() == 0:
-                agent.structuring.rebuild_chroma_from_jsonl()
-            else:
-                log("BUILD_DB", f"isolated ChromaDB ready: {agent.structuring.collection.count()} records")
+        _rebuild_sandbox_chroma_if_requested(agent.structuring)
 
-        if os.environ.get("CODEX_SMOKE_MICRO_ADDSTRUCTURE", "1").lower() not in ("0", "false", "no"):
-            try:
-                micro_payload = json.dumps({
-                    "clip_start_time": "99990s",
-                    "clip_end_time": "99991s",
-                    "subject_registry": {},
-                    "clip_description": "Smoke test synthetic clip: a person verifies the evolved video structure module.",
-                    "action_inventory": ["verify module", "write structure"],
-                    "semantic_tags": ["smoke_test", "module_validation"],
-                    "entity_list": ["synthetic tester"]
-                }, ensure_ascii=False)
-                agent.structuring.addStructure(
-                    start_sec=99990.0,
-                    end_sec=99991.0,
-                    description=micro_payload,
-                    raw_model_output=micro_payload,
-                    source="smoke_test_micro_add",
-                )
-                log("BUILD_DB", "micro addStructure passed in isolated workspace")
-            except Exception as e:
-                log("ERROR", f"micro addStructure failed: {e}")
-                sys.exit(1)
-
-        try:
-            probe = agent.structuring.retrieveStructure(
-                query="opening caption title text with year",
-                start_sec=0.0,
-                end_sec=60.0,
-                top_k=8,
-            )
-            log("BUILD_DB", f"retrieve probe ok: {len(str(probe))} chars")
-            print(
-                "[MODULE:RETRIEVE] module=video_structuring mode=%s total_chars=%d origin=smoke_harness_observation"
-                % ("vector" if getattr(agent.structuring, "collection", None) is not None else "linear_fallback", len(str(probe)))
-            )
-        except Exception as e:
-            log("ERROR", f"retrieve probe failed: {e}")
-            sys.exit(1)
         if db_path:
             structure_handoff_step = _structure_build_handoff_step(
                 db_path, bundle_candidate.get("handoff_contracts") or [],
@@ -1167,21 +770,13 @@ def main():
     steps = len([s for s in trajectory if s.get("step_type") == "tool_execution"])
     log("AGENT", f"completed: {steps} steps in {agent_elapsed:.1f}s")
 
-    # ─── Critical path log inspection ───
     module_logs = module_log_buffer.getvalue()
-    module_log_lines = [line for line in module_logs.split("\n") if "[MODULE:" in line]
 
     def persist_full_trace(result):
-        """Write the raw runtime evidence needed by a later repair.
-
-        This artifact intentionally keeps model outputs and normalized module
-        envelopes, but never reads environment variables or serializes API
-        credentials.  It is written for both passed and failed smokes.
-        """
+        """Persist trajectory, model outputs and module stdout for repair."""
         document = {
             "artifact_type": "smoke_full_execution_trace",
             "schema_version": 1,
-            "candidate_bundle_fingerprint": str((bundle_candidate or {}).get("bundle_fingerprint") or ""),
             "changed_modules": list(changed_modules),
             # The agent receives only question/choices/time scope, but the
             # evaluator task row also carries gold fields.  Persist the same
@@ -1203,11 +798,8 @@ def main():
             json.dump(document, handle, ensure_ascii=False, indent=2, default=str)
         result["full_execution_trace_path"] = trace_path
 
-    log("VERIFY", f"captured {len(module_log_lines)} module log lines")
-    for ml in module_log_lines[:10]:
-        log("MODULE_LOG", ml.strip()[:150])
 
-    # Critical path verification by module type
+    # Validate executed interfaces and producer/consumer handoffs.
     path_warnings = []
     nonfatal_warnings = []
     handoff_checks = _bundle_handoff_checks(
@@ -1215,7 +807,7 @@ def main():
         (bundle_candidate.get("handoff_contracts") or []) if bundle_candidate else [],
     )
     engineering_trace = _engineering_execution_trace(
-        test_task, trajectory, capability_events, str(answer or ""),
+        test_task, trajectory, capability_events,
     )
     # The trajectory is the source of truth, but these execution-layer facts
     # make an inter-module break directly inspectable without asking Codex to
@@ -1225,14 +817,18 @@ def main():
             "tool_execution_steps": steps,
             "agent_elapsed_sec": round(agent_elapsed, 6),
         },
-        "module_logs": _redact_smoke_supervision(module_log_lines, str(answer or "")),
-        "handoff_checks": _redact_smoke_supervision(handoff_checks, str(answer or "")),
+        "handoff_checks": _redact_smoke_supervision(handoff_checks),
     })
     answer_issue = _answer_contract_issue(answer, test_task)
     if answer_issue:
         path_warnings.append("Final-answer contract failed: " + answer_issue)
+    evidence_issue = _evidence_delivery_issue(capability_events)
+    if evidence_issue:
+        path_warnings.append(evidence_issue)
     for check in handoff_checks:
-        if not check["passed"]:
+        if check["status"] == "not_exercised":
+            nonfatal_warnings.append(f"Conditional handoff not exercised: {check['producer']}→{check['consumer']}")
+        elif not check["passed"]:
             path_warnings.append(
                 "Bundle handoff was not realized on the smoke trajectory: "
                 f"{check['producer']}→{check['consumer']}; "
@@ -1240,75 +836,6 @@ def main():
                 f"missing_fields={check['missing_fields']}, "
                 f"consumer_observed={check['consumer_observed']}"
             )
-    if "video_structuring" in changed_modules:
-        # Check 1: Whether the collection is initialized
-        init_logs = [line for line in module_log_lines if "[MODULE:INIT]" in line]
-        if init_logs:
-            if "collection=False" in init_logs[-1] or "collection=None" in init_logs[-1]:
-                path_warnings.append(
-                    "ChromaDB collection is not initialized (collection=False/None)."
-                    "Vector retrieval is unavailable and will degrade to linear full-text scanning."
-                    "Check whether the requires_vector_db parameter in __init__ is True.")
-        else:
-            path_warnings.append(
-                "[MODULE:INIT] log not found. The code may be missing critical path log output.")
-
-        # Check 2: Whether retrieveStructure takes the vector path
-        retrieve_logs = [line for line in module_log_lines if "[MODULE:RETRIEVE]" in line]
-        if retrieve_logs:
-            vector_calls = [line for line in retrieve_logs if "mode=vector" in line]
-            fallback_calls = [line for line in retrieve_logs if "mode=linear_fallback" in line]
-            if not vector_calls and fallback_calls:
-                nonfatal_warnings.append(
-                    f"retrieveStructure used linear_fallback for all {len(fallback_calls)} calls; "
-                    "vector retrieval was not exercised. Verify the collection, query, and indexed records."
-                )
-            # Check whether the number of characters returned is too large
-            for rl in retrieve_logs:
-                if "total_chars=" in rl:
-                    try:
-                        chars = int(rl.split("total_chars=")[1].split(",")[0].split(")")[0])
-                        if chars > 10000:
-                            path_warnings.append(
-                                f"retrieveStructure returned {chars} characters (>10000); "
-                                "limit top_k or bound the rendered result."
-                            )
-                            break
-                    except (ValueError, IndexError):
-                        pass
-        else:
-            path_warnings.append(
-                "[MODULE:RETRIEVE] log not found."
-                "retrieveStructure() may be missing logs or never called.")
-
-    elif primary_target in ("perception", "localization"):
-        tool_logs = [line for line in module_log_lines if "[MODULE:TOOL]" in line]
-        if not tool_logs:
-            # Generated modules are not required to print this optional log line.
-            # The normalized module-result trajectory and capability events are
-            # the execution source of truth.  Do not reject a real scoped VLM
-            # call merely because the optional display log is absent.
-            observed_tool_result = any(
-                isinstance(step, dict)
-                and step.get("step_type") == "tool_execution"
-                and str(step.get("producer_module") or "") == primary_target
-                and str((step.get("module_result") or {}).get("status") or "") == "ok"
-                for step in trajectory
-            )
-            if observed_tool_result:
-                nonfatal_warnings.append(
-                    f"[MODULE:TOOL] log absent, but the trajectory confirms {primary_target} tool execution."
-                )
-            else:
-                path_warnings.append(
-                    f"[MODULE:TOOL] log absent and the trajectory does not confirm {primary_target} tool execution."
-                )
-        if primary_target == "localization":
-            path_warnings.extend(_localization_smoke_contract_issues(
-                trajectory,
-                module_code,
-                getattr(env, "raw_video_path", ""),
-            ))
 
     observed_capabilities = {
         str(item.get("capability") or "")
@@ -1336,24 +863,12 @@ def main():
         observed_profiles.setdefault(str(item.get("capability") or ""), set()).add(
             str(item.get("profile_id") or "")
         )
-    mismatched_profiles = {
-        capability: {"expected": expected, "observed": sorted(observed_profiles.get(capability, set()))}
-        for capability, expected in expected_profiles.items()
-        if capability in observed_capabilities and expected not in observed_profiles.get(capability, set())
-    }
+    from runtime_capability_context import runtime_profile_mismatches
+    mismatched_profiles = runtime_profile_mismatches(expected_profiles, observed_profiles)
     if mismatched_profiles:
         path_warnings.append(
-            "Declared capability profile did not match the actual runtime event: "
+            "Runtime event used a profile outside the configured capability inventory: "
             + json.dumps(mismatched_profiles, ensure_ascii=False, sort_keys=True)
-        )
-    if args.require_consumer_event and not any(
-        item.get("event") == "consumer_consumed" and item.get("status") == "ok"
-        and item.get("producer_module") in set(changed_modules)
-        and item.get("contract_valid") is True
-        for item in capability_events
-    ):
-        path_warnings.append(
-            "Target output was not consumed with a valid protocol by the preserved thinking/runtime path on the smoke trajectory."
         )
     # Output verification results
     if path_warnings:

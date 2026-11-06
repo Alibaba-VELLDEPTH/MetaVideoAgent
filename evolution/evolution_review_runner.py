@@ -1,11 +1,9 @@
 """
 Post-evolution Teacher review runner.
 
-This stage runs after an evolved combo has produced full/sandbox trajectories.
-It compares the pre-evolution current-best trajectories with the
-post-evolution result trajectories. Once post-decision accepts that result,
-the latter is the new current best; MetaVideoAgent runs never inherit stale review
-cache from another run.
+Compare the executed candidate with its explicit training reference and pass
+causal findings to the next diagnosis. Accepted candidates become current best;
+rejected candidates remain available as evolution evidence.
 """
 
 import argparse
@@ -13,44 +11,36 @@ import concurrent.futures
 import glob
 import json
 import os
+import sys
 import time
 import traceback
 from typing import Dict, List, Optional
 
-try:
-    from answer_normalizer import extract_gold_answer, judge_answer
-    from config import META_VLM_MAX_CONCURRENT, TEACHER_REVIEW_MAX_CONCURRENT
-    from question_set_loader import questions_by_ref
-    from reference_loader import load_reference_by_ref_and_question
-    from review_contract import (
-        causal_effect_coverage,
-        concrete_repair_action_issues,
-        derive_failure_chain,
-        failure_chain_issues,
-        minimal_failure_point_coverage,
-        minimal_failure_point_issues,
-    )
-    from runtime_paths import require_metavideoagent_runtime, runtime_output_root
-    from sandbox_evaluator import write_engineering_invalid_artifacts
-    from task_identity import identity_from_entry, judge_exact_answer
-    from teacher_agent import TeacherAgent, _sanitize_teacher_output_terms
-except ImportError:  # pragma: no cover - package import
-    from .answer_normalizer import extract_gold_answer, judge_answer
-    from .config import META_VLM_MAX_CONCURRENT, TEACHER_REVIEW_MAX_CONCURRENT
-    from .question_set_loader import questions_by_ref
-    from .reference_loader import load_reference_by_ref_and_question
-    from .review_contract import (
-        causal_effect_coverage,
-        concrete_repair_action_issues,
-        derive_failure_chain,
-        failure_chain_issues,
-        minimal_failure_point_coverage,
-        minimal_failure_point_issues,
-    )
-    from .runtime_paths import require_metavideoagent_runtime, runtime_output_root
-    from .sandbox_evaluator import write_engineering_invalid_artifacts
-    from .task_identity import identity_from_entry, judge_exact_answer
-    from .teacher_agent import TeacherAgent, _sanitize_teacher_output_terms
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+for path in (PROJECT_ROOT, CURRENT_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from runtime_paths import require_metavideoagent_runtime, runtime_output_root, use_runtime_path
+
+use_runtime_path()
+
+from answer_normalizer import extract_gold_answer, judge_answer
+from config import META_VLM_MAX_CONCURRENT, TEACHER_REVIEW_MAX_CONCURRENT
+from question_set_loader import questions_by_ref
+from reference_loader import load_reference_by_ref_and_question
+from review_contract import (
+    causal_effect_coverage,
+    concrete_repair_action_issues,
+    derive_failure_chain,
+    failure_chain_issues,
+    minimal_failure_point_coverage,
+    minimal_failure_point_issues,
+)
+from sandbox_evaluator import write_engineering_invalid_artifacts
+from task_identity import identity_from_entry, judge_exact_answer
+from teacher_agent import TeacherAgent
 
 
 def _read_json(path: str) -> dict:
@@ -200,21 +190,6 @@ def _iter_jsonl(path: str):
                     continue
 
 
-def _external_history_meta(*paths: str) -> dict:
-    formal_output_root = os.path.abspath(runtime_output_root())
-    external = []
-    for path in paths:
-        if not path:
-            continue
-        abs_path = os.path.abspath(path)
-        if not abs_path.startswith(formal_output_root + os.sep):
-            external.append(abs_path)
-    return {
-        "external_history_input": bool(external),
-        "external_history_paths": external,
-    }
-
-
 def _load_or_build_distribution_profile(workspace: str, manifest: str = "",
                                         profile_path: str = "") -> dict:
     if profile_path:
@@ -230,7 +205,6 @@ def _load_or_build_distribution_profile(workspace: str, manifest: str = "",
         workspace,
         spec,
         output_path=out_path,
-        include_execution_artifacts=False,
     )
 
 
@@ -241,11 +215,10 @@ def _manifest_path_from_profile(profile: dict) -> str:
     return spec.get("manifest_path", "") or profile.get("manifest_path", "")
 
 
-def _discover_video_ids(workspace_dir: str, distribution_manifest: str = "") -> List[str]:
+def _discover_video_ids(distribution_manifest: str) -> List[str]:
     if not distribution_manifest:
         raise ValueError("evolution review requires a distribution manifest")
     _by_ref, _q_to_ref, ids, _spec = questions_by_ref(
-        workspace_dir,
         video_id="ALL",
         distribution_manifest=distribution_manifest,
         preferred_splits=("train",),
@@ -253,26 +226,21 @@ def _discover_video_ids(workspace_dir: str, distribution_manifest: str = "") -> 
     return ids
 
 
-def _normalize_video_ids(workspace_dir: str, video_id: str,
-                         distribution_manifest: str = "") -> List[str]:
+def _normalize_video_ids(video_id: str, distribution_manifest: str) -> List[str]:
     if not video_id or video_id in ("ALL", "all", "multi_video"):
-        return _discover_video_ids(workspace_dir, distribution_manifest)
+        return _discover_video_ids(distribution_manifest)
     return [v.strip() for v in str(video_id).split(",") if v.strip()]
 
 
-def _load_dataset(workspace_dir: str, video_id: str,
-                  distribution_manifest: str = "") -> Dict[str, dict]:
+def _load_dataset(video_id: str, distribution_manifest: str) -> Dict[str, dict]:
     if not distribution_manifest:
         raise ValueError("evolution review requires a distribution manifest")
     by_ref, _question_to_ref, _ids, _spec = questions_by_ref(
-        workspace_dir,
         video_id=video_id,
         distribution_manifest=distribution_manifest,
         preferred_splits=("train",),
     )
     return by_ref
-
-
 
 
 def _row_matches_combo(entry: dict, combo_id: str = "") -> bool:
@@ -424,7 +392,7 @@ def _review_ref(review: dict) -> str:
 
 
 def build_retention_review(metrics: dict, micro_reviews: list,
-                           delta_reviews: list, evolution_info: dict) -> dict:
+                           evolution_info: dict) -> dict:
     """Deterministic candidate-retention evidence for the next diagnosis.
 
     It summarizes whether the previous candidate should be retained or improved
@@ -729,11 +697,7 @@ def summarize_unchanged_failures(micro_reviews: list) -> dict:
         if item.get("change_type") != "keep_wrong":
             continue
         cls = item.get("unchanged_failure_classification") or {}
-        # Previous artifacts often persisted the old blanket
-        # ``unattributed_or_incomplete`` fallback.  Recompute that fallback
-        # from the now-available validated MFPs instead of preserving stale
-        # loss of attribution; a genuinely explicit non-default category is
-        # still retained verbatim.
+        # Use the validated failure point when a category is not yet attributed.
         category = cls.get("category")
         if not category or category == "unattributed_or_incomplete":
             category = classify_unchanged_failure(item)["category"]
@@ -1242,15 +1206,14 @@ class EvolutionReviewRunner:
                  distribution_manifest: str = "",
                  reference_results_path: str = "",
                  reference_label: str = "reference",
-                 initial_reference_review: bool = False,
-                 resume_review_path: str = ""):
+                 initial_reference_review: bool = False):
         self.workspace_dir = workspace_dir
         self.observed_distribution_profile = observed_distribution_profile or {}
         self.distribution_manifest = distribution_manifest or _manifest_path_from_profile(
             self.observed_distribution_profile
         )
         self.video_ids = _normalize_video_ids(
-            workspace_dir, video_id, self.distribution_manifest
+            video_id, self.distribution_manifest
         )
         self.video_id = video_id or ("multi_video" if len(self.video_ids) > 1 else (self.video_ids[0] if self.video_ids else ""))
         self.evolved_results_path = evolved_results_path
@@ -1260,16 +1223,13 @@ class EvolutionReviewRunner:
         self.out_dir = out_dir or self._default_out_dir()
         self.dry_run = dry_run
         self.combo_id = combo_id
-        # A micro review is independently scheduled and uses the bounded selected VLM,
-        # ASR and GLM calls.  Formal review permits the requested 16 workers;
-        # this is deliberately separate from execution-layer LLM concurrency.
+        # Review workers have a separate limit from execution-layer API calls.
         self.concurrency = max(
             1, min(int(concurrency or 1), META_VLM_MAX_CONCURRENT, TEACHER_REVIEW_MAX_CONCURRENT)
         )
         self.reference_results_path = reference_results_path
         self.reference_label = reference_label or "reference"
         self.initial_reference_review = bool(initial_reference_review)
-        self.resume_review_path = os.path.abspath(resume_review_path) if resume_review_path else ""
         self.structure_dir = ""
 
     def _default_out_dir(self) -> str:
@@ -1279,7 +1239,7 @@ class EvolutionReviewRunner:
     def run(self) -> dict:
         os.makedirs(self.out_dir, exist_ok=True)
         dataset_by_ref = _load_dataset(
-            self.workspace_dir, self.video_id, self.distribution_manifest
+            self.video_id, self.distribution_manifest
         )
         if not self.reference_results_path and not self.initial_reference_review:
             raise RuntimeError(
@@ -1362,63 +1322,6 @@ class EvolutionReviewRunner:
                 normalized.append(item)
         normalized.sort(key=lambda x: (x.get("video_id", ""), x.get("time_reference", ""), x.get("task_id", "")))
 
-        # Preserve only completed Teacher evidence from an exact prior review.
-        # This turns a transient quota failure into a bounded replay instead of
-        # discarding successful micro reviews or silently mixing trajectories.
-        resumed_micro_by_task = {}
-        resumed_delta_by_task = {}
-        resume_meta = {}
-        if self.resume_review_path:
-            existing = _read_json(self.resume_review_path)
-            if not existing:
-                raise RuntimeError(
-                    f"--resume-review is not a readable review artifact: {self.resume_review_path}"
-                )
-            prior_context = existing.get("candidate_context") or {}
-            prior_results = str(prior_context.get("candidate_results_path") or "")
-            prior_report = str(prior_context.get("verification_report_path") or "")
-            if not prior_results or os.path.abspath(prior_results) != os.path.abspath(self.evolved_results_path):
-                raise RuntimeError(
-                    "--resume-review candidate_results_path does not match --evolved-results"
-                )
-            if not prior_report or os.path.abspath(prior_report) != os.path.abspath(self.verification_report_path):
-                raise RuntimeError(
-                    "--resume-review verification_report_path does not match --verification-report"
-                )
-            for micro in existing.get("evolved_micro_reviews") or []:
-                if not isinstance(micro, dict):
-                    continue
-                task_id = str(micro.get("task_id") or "")
-                # Dry-run rows are preflight placeholders, not completed
-                # Teacher evidence.  They must be replayed rather than
-                # suppressing a real retry after a provider failure.
-                if (
-                    task_id
-                    and micro.get("success") is True
-                    and micro.get("dry_run") is not True
-                ):
-                    if task_id in resumed_micro_by_task:
-                        raise RuntimeError(f"--resume-review has duplicate successful task_id: {task_id}")
-                    resumed_micro_by_task[task_id] = micro
-            for delta in existing.get("delta_reviews") or []:
-                if isinstance(delta, dict) and delta.get("success") is True:
-                    task_id = str(delta.get("task_id") or "")
-                    if task_id:
-                        resumed_delta_by_task[task_id] = delta
-            current_task_ids = {str(item.get("task_id") or "") for item in normalized}
-            unknown_task_ids = sorted(set(resumed_micro_by_task) - current_task_ids)
-            if unknown_task_ids:
-                raise RuntimeError(
-                    "--resume-review has successful task_ids absent from current evolved results: "
-                    + ", ".join(unknown_task_ids[:3])
-                )
-            resume_meta = {
-                "source_review": self.resume_review_path,
-                "source_timestamp": existing.get("timestamp"),
-                "preserved_successful_micro_reviews": len(resumed_micro_by_task),
-                "preserved_successful_delta_reviews": len(resumed_delta_by_task),
-            }
-
         current_best_override = verification_report.get("current_best_override") or {}
         accepted_current_best = bool(
             (verification_report.get("post_full_eval_decision") or {}).get("update_current_best") is True
@@ -1463,7 +1366,6 @@ class EvolutionReviewRunner:
         }
 
         review_inputs = []
-        preserved_results = []
         for idx, item in enumerate(normalized):
             task_id = item.get("task_id", "")
             baseline_entry = baseline_by_ref.get(task_id, {})
@@ -1472,16 +1374,7 @@ class EvolutionReviewRunner:
                   ("keep_correct" if _answer_is_correct(item.get("answer", ""), item.get("raw") or item) else "keep_wrong"))
             if ct in change_counts:
                 change_counts[ct] += 1
-            prior_micro = resumed_micro_by_task.get(str(task_id))
-            # Reuse only evidence whose authoritative comparison outcome is
-            # still identical; otherwise rerun the task instead of combining
-            # incompatible review states.
-            if prior_micro is not None and prior_micro.get("change_type") == ct:
-                preserved_results.append(
-                    (idx, prior_micro, resumed_delta_by_task.get(str(task_id)))
-                )
-            else:
-                review_inputs.append((idx, item, baseline_entry, baseline_review, ct))
+            review_inputs.append((idx, item, baseline_entry, baseline_review, ct))
 
         def review_one(payload):
             idx, item, baseline_entry, baseline_review, ct = payload
@@ -1509,7 +1402,7 @@ class EvolutionReviewRunner:
                     "root_cause": f"Teacher micro-review failed: {type(exc).__name__}: {exc}",
                     "change_type": ct,
                 }
-                return idx, _sanitize_teacher_output_terms(micro, preserve_trace=False), None
+                return idx, micro, None
 
         def _review_one_inner(payload):
             idx, item, baseline_entry, baseline_review, ct = payload
@@ -1716,11 +1609,9 @@ class EvolutionReviewRunner:
                 delta["video_id"] = item.get("video_id", "")
                 delta["time_reference"] = tr
                 delta["change_type"] = ct
-            micro = _sanitize_teacher_output_terms(micro, preserve_trace=False)
-            delta = _sanitize_teacher_output_terms(delta, preserve_trace=False) if delta is not None else None
             return idx, micro, delta
 
-        review_results = list(preserved_results)
+        review_results = []
         if self.concurrency == 1 or len(review_inputs) <= 1:
             for payload in review_inputs:
                 review_results.append(review_one(payload))
@@ -1787,7 +1678,7 @@ class EvolutionReviewRunner:
             evolved_micro_reviews
         )
         retention_review = build_retention_review(
-            metrics, evolved_micro_reviews, delta_reviews, evolution_info
+            metrics, evolved_micro_reviews, evolution_info
         )
         macro_evidence_ledger = build_macro_evidence_ledger(
             evolved_micro_reviews, delta_reviews,
@@ -1826,13 +1717,6 @@ class EvolutionReviewRunner:
                     else self.reference_results_path or "explicit_reference_required"
                 ),
             },
-            "history_input_policy": _external_history_meta(
-                self.reference_results_path,
-                self.evolved_results_path,
-                self.verification_report_path,
-                self.candidate_bundle_path,
-                self.source_diff_path,
-            ),
             "candidate_context": {
                 "initial_reference_only": self.initial_reference_review,
                 "semantic_role": (
@@ -1868,12 +1752,6 @@ class EvolutionReviewRunner:
             "delta_reviews": delta_reviews,
             "retention_review": retention_review,
         }
-        if resume_meta:
-            summary_payload["micro_review_resume"] = {
-                **resume_meta,
-                "rerun_micro_reviews": len(review_inputs),
-                "merged_micro_reviews": len(evolved_micro_reviews),
-            }
         if self.dry_run:
             macro_review = {
                 "success": True,
@@ -1915,7 +1793,6 @@ class EvolutionReviewRunner:
             macro_review, causal_coverage,
         )
         output = refresh_review_deterministic_aggregates(output)
-        output = _sanitize_teacher_output_terms(output, preserve_trace=False)
 
         review_path = os.path.join(self.out_dir, "teacher_evolution_review.json")
         with open(review_path, "w", encoding="utf-8") as f:
@@ -1949,87 +1826,6 @@ class EvolutionReviewRunner:
                 "source_diff_head": diff_text,
             }
         return {"candidate_name": "", "module_type": "bundle", "source_diff_head": diff_text}
-
-    def run_macro_only(self, existing_review_path: str) -> dict:
-        """Re-run only the Teacher macro review from a completed review artifact."""
-        existing = _read_json(existing_review_path)
-        required = (
-            "metrics", "evolved_micro_reviews", "causal_effect_coverage",
-            "delta_reviews", "candidate_context",
-        )
-        missing = [key for key in required if key not in existing]
-        if missing:
-            raise RuntimeError(
-                "macro-only review requires a completed review artifact with "
-                f"{missing}; refusing to regenerate or infer micro reviews"
-            )
-        source_micro = existing.get("evolved_micro_reviews") or []
-        if not source_micro:
-            raise RuntimeError("macro-only review source has no evolved_micro_reviews")
-        # Weak Teacher micro reviews are audit omissions, not a reason to block
-        # the macro synthesis or later diagnosis. The downstream ledger keeps
-        # only complete causal records.
-        summary_payload = {
-            key: existing.get(key)
-            for key in (
-                "metrics", "observed_distribution_profile",
-                "distribution_leakage_policy", "reference_context",
-                "history_input_policy", "candidate_context", "current_best_context", "reviewed_execution_context", "per_video_metrics",
-                "evaluation_audit", "code_context", "evolved_micro_reviews", "causal_effect_coverage",
-                "minimal_failure_point_coverage", "macro_evidence_ledger",
-                "unchanged_failure_summary", "delta_reviews", "retention_review",
-            )
-        }
-        summary_payload["unchanged_failure_summary"] = summarize_unchanged_failures(source_micro)
-        if self.dry_run:
-            macro_review = {
-                "success": True,
-                "dry_run": True,
-                "overall_verdict": "not_reviewed",
-                "verdict_reason": "dry-run: macro model review skipped",
-            }
-        else:
-            teacher = TeacherAgent(
-                self.workspace_dir,
-                self.video_ids[0] if self.video_ids else self.video_id,
-                structure_dir=self.structure_dir,
-            )
-            macro_review = teacher.summarize_post_evolution(summary_payload)
-        macro_review = ensure_programmable_macro_fields(macro_review, summary_payload)
-        macro_validation_issues = macro_review_issues(macro_review, summary_payload)
-        macro_review["validation"] = {
-            "valid": not macro_validation_issues,
-            "issues": macro_validation_issues,
-            "policy": "invalid macro fields are audit omissions; deterministic ledger remains available to diagnosis",
-        }
-        output = {
-            "timestamp": int(time.time()),
-            "video_id": existing.get("video_id", self.video_id),
-            "video_ids": existing.get("video_ids", self.video_ids),
-            "out_dir": self.out_dir,
-            **summary_payload,
-            "macro_review": macro_review,
-            "mechanism_summary": build_mechanism_summary(summary_payload, macro_review),
-            "macro_only_source_review": {
-                "path": os.path.abspath(existing_review_path),
-                "source_timestamp": existing.get("timestamp"),
-                "micro_review_count": len(source_micro),
-                "delta_review_count": len(existing.get("delta_reviews") or []),
-            },
-        }
-        output["review_status"] = (
-            "complete" if macro_review.get("success") is True else "macro_review_invalid"
-        )
-        output["micro_review_status"] = existing.get("micro_review_status", "")
-        output = refresh_review_deterministic_aggregates(output)
-        output = _sanitize_teacher_output_terms(output, preserve_trace=False)
-        review_path = os.path.join(self.out_dir, "teacher_evolution_review.json")
-        os.makedirs(self.out_dir, exist_ok=True)
-        with open(review_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
-        self._write_markdown(output)
-        output["review_path"] = review_path
-        return output
 
     def _write_markdown(self, output: dict) -> None:
         macro = output.get("macro_review", {})
@@ -2107,17 +1903,12 @@ def main():
                         help="Reference label used for delta review, e.g. initial_combo/current_best.")
     parser.add_argument("--initial-reference-review", action="store_true",
                         help="Review one executed initial reference without inventing a pre/post self comparison.")
-    parser.add_argument("--macro-only-from", default="",
-                        help="Completed teacher_evolution_review.json whose micro/delta reviews are reused; only reruns macro review.")
-    parser.add_argument("--resume-review", default="",
-                        help=("Matching completed review artifact. Preserve its success=true micro reviews, "
-                              "rerun only failed/incomplete tasks, then regenerate macro review."))
     args = parser.parse_args()
     require_metavideoagent_runtime("evolution_review_runner")
     if not args.initial_reference_review and not args.candidate_bundle:
         parser.error("MetaVideoAgent review requires --candidate-bundle")
-    if not args.macro_only_from and not args.evolved_results:
-        parser.error("--evolved-results is required unless --macro-only-from is supplied")
+    if not args.evolved_results:
+        parser.error("--evolved-results is required")
     observed_distribution_profile = _load_or_build_distribution_profile(
         args.workspace, args.distribution_manifest, args.distribution_profile)
 
@@ -2137,9 +1928,8 @@ def main():
         reference_results_path=args.reference_results,
         reference_label=args.reference_label,
         initial_reference_review=args.initial_reference_review,
-        resume_review_path=args.resume_review,
     )
-    result = runner.run_macro_only(args.macro_only_from) if args.macro_only_from else runner.run()
+    result = runner.run()
     print(json.dumps({
         "review_path": result.get("review_path"),
         "metrics": result.get("metrics"),

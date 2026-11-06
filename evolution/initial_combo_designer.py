@@ -14,7 +14,6 @@ Codex after distribution profiling and deep research.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import time
@@ -33,10 +32,7 @@ def _write_json(path: str, payload: Dict[str, Any]) -> None:
 
 
 def _channel_hypothesis(profile: Dict[str, Any]) -> Dict[str, Any]:
-    hypothesis = (
-        profile.get("information_channel_hypothesis")
-        or profile.get("channel_hypothesis")
-    )
+    hypothesis = profile.get("information_channel_hypothesis")
     if isinstance(hypothesis, dict):
         return hypothesis
     return {}
@@ -44,36 +40,11 @@ def _channel_hypothesis(profile: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ranked_channels(profile: Dict[str, Any]) -> list:
     hypothesis = _channel_hypothesis(profile)
-    ranked = hypothesis.get("ranked_channels")
-    if isinstance(ranked, list):
-        return ranked
-    scores = (
-        hypothesis.get("channel_scores")
-        if isinstance(hypothesis.get("channel_scores"), dict) else
-        hypothesis.get("scores")
-        if isinstance(hypothesis.get("scores"), dict) else
-        {}
-    )
+    scores = hypothesis.get("channel_scores") or {}
     return [
         {"channel": channel, "score": score}
         for channel, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
     ]
-
-
-def _genericize_runtime_names(value: Any) -> Any:
-    replacements = {
-        "registered module": "generated module",
-    }
-    if isinstance(value, dict):
-        return {key: _genericize_runtime_names(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_genericize_runtime_names(item) for item in value]
-    if isinstance(value, str):
-        text = value
-        for old, new in replacements.items():
-            text = text.replace(old, new)
-        return text
-    return value
 
 
 def _research_module_guidance(design_brief: Dict[str, Any]) -> Dict[str, str]:
@@ -107,27 +78,12 @@ def design_initial_combo(profile: Dict[str, Any],
     human category/type labels and only references observed channel statistics.
     """
     hypothesis = _channel_hypothesis(profile)
-    primary = (
-        hypothesis.get("primary_observed_channel")
-        or hypothesis.get("primary_channel")
-        or hypothesis.get("primary")
-        or "mixed_or_unknown"
-    )
+    primary = hypothesis.get("primary_observed_channel") or "mixed_or_unknown"
     ranked = _ranked_channels(profile)
     raw_video_summary = (
         (profile.get("raw_video_signal_profile") or {}).get("summary")
         if isinstance(profile.get("raw_video_signal_profile"), dict) else {}
     ) or {}
-    question_stats = (
-        profile.get("observed_information_channels")
-        or profile.get("question_stats")
-        or {}
-    )
-    long_context_ratio = 0.0
-    if isinstance(question_stats.get("channel_hit_ratio"), dict):
-        long_context_ratio = float(
-            question_stats["channel_hit_ratio"].get("long_context_reasoning", 0.0) or 0.0
-        )
 
     if primary in ("speech_or_audio", "screen_text_or_subtitle"):
         struct_strategy = (
@@ -157,42 +113,31 @@ def design_initial_combo(profile: Dict[str, Any],
             "plausible observed channel and records uncertainty for later review."
         )
 
-    if long_context_ratio >= 0.25:
-        thinking_strategy = (
-            "Generate thinking that tracks cross-window entities, relations, and "
-            "state changes while keeping final answers normalized."
-        )
-    else:
-        thinking_strategy = (
-            "Generate bounded ReAct thinking that chooses an evidence channel, "
-            "verifies it, and finalizes in the expected answer form."
-        )
+    thinking_strategy = (
+        "Generate bounded ReAct thinking that chooses an evidence channel, "
+        "uses the resulting evidence to replan or answer, and preserves the requested answer form."
+    )
 
     design_answers = {
         "video_structuring": {
-            "selected": "codex_generated_video_structuring_module",
             "answer": struct_strategy,
         },
         "localization": {
-            "selected": "codex_generated_localization_module",
             "answer": localization_strategy,
         },
         "perception": {
-            "selected": "codex_generated_perception_module",
             "answer": (
                 "Generate perception tools that inspect only candidate windows and "
                 "choose visual/text/audio verification according to the question."
             ),
         },
         "memory": {
-            "selected": "codex_generated_memory_module",
             "answer": (
                 "Generate memory that preserves searched windows, evidence channel, "
                 "entities/states, contradictions, and answer-normalization decisions."
             ),
         },
         "thinking": {
-            "selected": "codex_generated_thinking_module",
             "answer": thinking_strategy,
         },
     }
@@ -279,29 +224,26 @@ def design_initial_combo(profile: Dict[str, Any],
         "observed_profile_summary": {
             "primary_channel": primary,
             "ranked_channels": ranked[:5],
-            "question_stats": question_stats,
             "raw_video_signal_summary": raw_video_summary,
         },
-        "combo": {},
-        "custom_configs": {},
-        "design_answers": _genericize_runtime_names(design_answers),
-        "initial_capability_blueprints": _genericize_runtime_names(capability_blueprints),
+        "design_answers": design_answers,
+        "initial_capability_blueprints": capability_blueprints,
         "initial_execution_policy": {
             "asr_profile_id": os.environ.get("METAVIDEOAGENT_ASR_PROFILE", "paper.asr.default"),
             "vlm_profile_id": os.environ.get("METAVIDEOAGENT_VLM_PROFILE", "paper.vlm.default"),
             "structure_build_lifecycle": (
                 "The execution-layer builder performs bounded media sampling and model calls. "
                 "The generated video_structuring module persists, indexes, and retrieves supplied records; "
-                "addStructure must not issue model calls."
+                "addStructure must not issue model calls. A custom buildStructure(env) "
+                "may own a bounded build and must persist canonical records."
             ),
         },
         "deep_research_input": {
             "consumed": bool(deep_research_brief),
-            "design_brief_sha256": (
-                hashlib.sha256(json.dumps(deep_research_brief, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-                if deep_research_brief else ""
-            ),
-            "module_guidance": _genericize_runtime_names(research_guidance),
+            "analysis": (deep_research_brief or {}).get("analysis", ""),
+            "open_questions": (deep_research_brief or {}).get("open_questions", []),
+            "next_task": (deep_research_brief or {}).get("next_task", {}),
+            "module_guidance": research_guidance,
         },
         "initial_codegen_policy": (
             "This deterministic plan is design context only. It must not be "
@@ -340,7 +282,6 @@ def main() -> int:
     print("INITIAL_COMBO_PLAN")
     print(f"output={args.output}")
     print(f"primary_channel={plan['observed_profile_summary'].get('primary_channel')}")
-    print(f"combo={json.dumps(plan['combo'], ensure_ascii=False)}")
     return 0
 
 

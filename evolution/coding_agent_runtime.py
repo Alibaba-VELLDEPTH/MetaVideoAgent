@@ -1,15 +1,11 @@
-"""Executable resolution for the single automatic coding-agent workflow.
-
-MetaVideoAgent publicly documents and defaults to Codex.  A compatible wrapper
-may be supplied in place of the ``codex`` executable when it implements the
-same command contract used by this workflow.  This is an execution adapter,
-not a separate authoring or evolution route.
-"""
+"""Executable resolution and environments for automatic coding tasks."""
 
 from __future__ import annotations
 
 import os
 import shutil
+
+from execution.action_runtime.capability_registry import iter_profiles
 
 CODING_AGENT_PROTOCOL = "codex_exec_compatible"
 _RUNTIME_PROVIDER_ENV = {
@@ -18,12 +14,29 @@ _RUNTIME_PROVIDER_ENV = {
 }
 
 
-def coding_agent_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a subprocess environment without MetaVideoAgent provider secrets."""
+def coding_agent_environment(
+    extra: dict[str, str] | None = None, *, workspace: str = ""
+) -> dict[str, str]:
+    """Exclude the credentials and endpoints declared by runtime profiles."""
     env = dict(os.environ)
-    for name in _RUNTIME_PROVIDER_ENV:
-        env.pop(name, None)
     env.update(extra or {})
+    provider_names = _RUNTIME_PROVIDER_ENV | {
+        name
+        for profile in iter_profiles()
+        for field in ("api_key_env", "base_url_env")
+        for name in profile.get(field) or []
+    }
+    for name in provider_names:
+        env.pop(name, None)
+    if workspace:
+        env["PYTHONPATH"] = os.pathsep.join(
+            os.path.join(workspace, relative)
+            for relative in ("", "evolution", "execution/action_runtime")
+        )
+        env["METAVIDEOAGENT_CAPABILITY_PROFILES"] = os.path.join(
+            workspace,
+            "evolution/agent_docs/capabilities/runtime_capability_profiles.json",
+        )
     return env
 
 

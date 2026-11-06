@@ -1,10 +1,4 @@
-"""Codex-backed deep research for MetaVideoAgent evolution.
-
-The first MetaVideoAgent stage and later evolution rounds need source-grounded
-design context before code generation.  This runner asks Codex to do online
-research and produce a five-module design brief, then validates that the output
-contains verifiable sources and concrete designs for all five execution modules.
-"""
+"""Research source-backed designs and implementation tasks for MetaVideoAgent."""
 
 from __future__ import annotations
 
@@ -13,34 +7,25 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
 
-try:
-    from channel_profile_runner import compact_channel_summary
-    from bundle_contract import normalize_modules
-    from codex_runtime_settings import codex_exec_model_args, resolve_codex_runtime_settings
-    from coding_agent_runtime import coding_agent_environment, resolve_coding_agent_executable
-    from diagnosis_execution_brief import (
-        model_handoff_issues,
-        validate_bundle_execution_brief,
-    )
-    from runtime_capability_context import DEFAULT_PROFILE_IDS, build_runtime_capability_context
-    from runtime_paths import metavideoagent_run_dir
-except ImportError:  # pragma: no cover
-    from .channel_profile_runner import compact_channel_summary
-    from .bundle_contract import normalize_modules
-    from .codex_runtime_settings import codex_exec_model_args, resolve_codex_runtime_settings
-    from .coding_agent_runtime import coding_agent_environment, resolve_coding_agent_executable
-    from .diagnosis_execution_brief import (
-        model_handoff_issues,
-        validate_bundle_execution_brief,
-    )
-    from .runtime_capability_context import DEFAULT_PROFILE_IDS, build_runtime_capability_context
-    from .runtime_paths import metavideoagent_run_dir
+if not __package__:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from evolution.bundle_contract import normalize_modules
+from evolution.channel_profile_runner import compact_channel_summary
+from evolution.codex_runtime_settings import codex_exec_model_args, resolve_codex_runtime_settings
+from evolution.coding_agent_runtime import coding_agent_environment, resolve_coding_agent_executable
+from evolution.diagnosis_execution_brief import validate_bundle_execution_brief
+from evolution.runtime_capability_context import (
+    DEFAULT_PROFILE_IDS,
+    build_runtime_capability_context,
+)
+from evolution.runtime_paths import metavideoagent_run_dir
 
 MODULES = ["video_structuring", "localization", "perception", "memory", "thinking"]
 DEFAULT_YEAR_MIN = 2024
@@ -59,67 +44,6 @@ IMPLEMENTATION_OR_MODEL_DOMAINS = (
     "github.com",
     "huggingface.co",
 )
-
-NON_RUNTIME_TOOL_TERMS = {
-    "DIAG_VIDEO_AUDIT": "Video review capability",
-    "DIAG_DETAIL_VIDEO_AUDIT": "Detailed video review capability",
-    "AUDIT_VIDEO": "Video review capability",
-    "AUDIT_DETAIL_VIDEO": "Detailed video review capability",
-    "AUDIT_ENHANCED_VIDEO": "Enhance video review capabilities",
-    "AUDIT_STRUCTURE": "Structure library review capability",
-    "AUDIT_TRANSCRIPT": "Subtitle/audio text review capabilities",
-    "watch_video": "Video review capability",
-    "video_review": "Video review capability",
-    "teacher_video_verification": "Video review capability",
-    "detailed_watch": "Detailed video review capability",
-    "detail_video_review": "Detailed video review capability",
-    "fine_video_review": "Detailed video review capability",
-    "teacher_detailed_video_verification": "Detailed video review capability",
-    "enhanced_watch": "Enhance video review capabilities",
-    "enhanced_video_review": "Enhance video review capabilities",
-    "teacher_enhanced_video_verification": "Enhance video review capabilities",
-    "browse_struct_db": "Structure library review capability",
-    "structure_review": "Structure library review capability",
-    "teacher_structure_db_audit": "Structure library review capability",
-    "read_transcript": "Subtitle/audio text review capabilities",
-    "transcript_review": "Subtitle/audio text review capabilities",
-    "teacher_transcript_audit": "Subtitle/audio text review capabilities",
-    "listen_audio": "Subtitle/audio text review capabilities",
-    "frame_inspect": "visual observation ability",
-    "single_frame_inspect": "visual observation ability",
-    "inspect_frames": "visual observation ability",
-    "runtime_visual_observation_tool": "visual observation ability",
-    "runtime_visual_observation_capability": "visual observation ability",
-    "clip_search": "Positioning/structure search capabilities",
-    "frame_clip_search": "Positioning/structure search capabilities",
-    "search_evidence": "Positioning/structure search capabilities",
-    "runtime_localization_or_structure_retrieval_tool": "Positioning/structure search capabilities",
-    "runtime_localization_or_structure_retrieval_capability": "Positioning/structure search capabilities",
-    "runtime_evidence_retrieval_capability": "Positioning/structure search capabilities",
-    "global_browse": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_tool": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_capability": "Global structure browsing capabilities",
-    "audio_analysis": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_evidence_tool": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_capability": "Audio/subtitle understanding ability",
-}
-
-
-def sanitize_tool_terms(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            k: sanitize_tool_terms(v)
-            for k, v in value.items()
-            if k != "react_trace"
-        }
-    if isinstance(value, list):
-        return [sanitize_tool_terms(v) for v in value]
-    if not isinstance(value, str):
-        return value
-    text = value
-    for old, new in sorted(NON_RUNTIME_TOOL_TERMS.items(), key=lambda item: -len(item[0])):
-        text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
-    return text
 
 
 def read_json(path: str) -> Dict[str, Any]:
@@ -173,25 +97,25 @@ def _target_modules(diagnosis: Dict[str, Any]) -> list[str]:
 
 
 def _failure_summary(diagnosis: Dict[str, Any], review: Dict[str, Any]) -> Dict[str, Any]:
-    del review
+    """Pass the actual investigation forward, including evidence and open work."""
     if not diagnosis:
         return {}
-    task = diagnosis.get("implementation_task", {}) or {}
-    plan = diagnosis.get("evolution_plan", {}) or {}
-    issues = model_handoff_issues(task, path="implementation_task")
-    issues.extend(model_handoff_issues(plan, path="evolution_plan"))
-    if issues:
-        raise RuntimeError(
-            "refusing execution brief with machine-only evidence in research handoff: "
-            + "; ".join(issues)
-        )
+    task = diagnosis.get("implementation_task") or {}
     return {
         "diagnosis_target_modules": _target_modules(diagnosis),
+        "summary": diagnosis.get("summary", ""),
+        "analysis": diagnosis.get("analysis", ""),
+        "open_questions": diagnosis.get("open_questions", []),
+        "next_task": diagnosis.get("next_task", {}),
+        "evolution_design": diagnosis.get("evolution_design", {}),
         "failure_chain": task.get("failure_chain", ""),
         "evolution_mechanism": task.get("evolution_mechanism", ""),
         "handoff_contracts": task.get("handoff_contracts", []),
         "diagnosis_evolution_hint": task.get("goal", ""),
-        "allowed_runtime_capabilities": task.get("runtime_capabilities", []),
+        "working_materials": diagnosis.get("working_materials", {}),
+        "review": review,
+        "history": diagnosis.get("iter_context", {}),
+        "allowed_runtime_capabilities": build_runtime_capability_context().get("profiles", []),
     }
 
 
@@ -204,15 +128,15 @@ def build_research_brief(profile: Dict[str, Any],
     diagnosis = diagnosis or {}
     review = review or {}
     target_modules = _target_modules(diagnosis)
-    failure = sanitize_tool_terms(_failure_summary(diagnosis, review))
+    failure = _failure_summary(diagnosis, review)
     later_round = bool(target_modules)
     if later_round:
         objective = (
             "Research implementation methods for the diagnosis-selected bundle "
             "mechanism, responsibility boundaries, and producer/consumer handoffs. "
-            "Do not prescribe task-specific behavior or an edit whitelist."
+            "Ground the implementation in reusable runtime behavior."
         )
-        research_questions = [
+        research_questions = list((diagnosis.get("research_plan") or {}).get("questions") or []) + list(diagnosis.get("open_questions") or []) + [
             "Which concrete methods implement the diagnosed evolution mechanism without task-specific rules?",
             "What state, stopping, verification, and fallback logic should the connected modules add?",
             "Which producer/consumer contracts must remain stable across the bundle?",
@@ -221,7 +145,7 @@ def build_research_brief(profile: Dict[str, Any],
     else:
         objective = (
             "Design an initial five-module MetaVideoAgent baseline for this five-frame, "
-            "query-aware distribution before any fixed baseline bundle exists."
+            "query-aware distribution."
         )
         research_questions = [
             "Which information channel should be indexed first for this distribution?",
@@ -244,13 +168,13 @@ def build_research_brief(profile: Dict[str, Any],
             "must_fit_existing_execution_layer_interfaces": True,
             "avoid_answer_leakage": True,
             "initial_stage_forbidden_inputs": [
-                "questions", "answers", "evidence intervals",
+                "gold answers", "annotated evidence intervals",
                 "human type/category labels", "task trajectories",
             ],
             "later_round_rule": (
-                "Research supplies the diagnosed evolution mechanism and boundary constraints, "
-                "not a per-file edit whitelist. Codex may adapt related modules inside the "
-                "five-module bundle while preserving unaffected behavior."
+                "Research develops the diagnosed mechanism and boundary contracts. "
+                "Codex may adapt related modules when implementation or execution "
+                "evidence supports the change, while preserving unaffected behavior."
             ),
             "initial_execution_lifecycle": (
                 "For initial-baseline research, the execution-layer structure builder owns "
@@ -258,7 +182,9 @@ def build_research_brief(profile: Dict[str, Any],
                 "persist or index supplied records. Use registered runtime adapters rather "
                 "than provider clients or local model toolboxes. The configured ASR profile is "
                 f"{DEFAULT_PROFILE_IDS['asr']}; the configured VLM profile is "
-                f"{DEFAULT_PROFILE_IDS['vlm']}."
+                f"{DEFAULT_PROFILE_IDS['vlm']}. An optional buildStructure(env) hook may "
+                "own a custom bounded build and must persist canonical records; addStructure "
+                "itself remains a persistence/indexing operation."
             ),
         },
         "research_questions": research_questions,
@@ -330,10 +256,6 @@ def build_research_queries(profile: Dict[str, Any],
         "visual_object_detail": [
             "fine-grained object attribute verification for video question answering",
             "object-centric video memory retrieval",
-        ],
-        "long_context_reasoning": [
-            "long video narrative reasoning graph memory",
-            "multi-hop long video question answering planning",
         ],
         "mixed_or_unknown": [
             "long video QA hierarchical retrieval multimodal agent",
@@ -420,276 +342,94 @@ def validate_design_brief(brief: Dict[str, Any],
                           min_sources: int = 2,
                           verify_source_urls: bool = False,
                           source_timeout: int = 8,
-                          expected_target_modules: List[str] | None = None,
-                          allowed_runtime_capabilities: List[Dict[str, Any]] | None = None,
-                          required_bundle_contract: Dict[str, Any] | None = None) -> Dict[str, Any]:
+                          expected_target_modules: List[str] | None = None) -> Dict[str, Any]:
+    """Check source-backed findings and the next implementation task."""
     issues: List[str] = []
     if not isinstance(brief, dict) or not brief:
         return {"passed": False, "issues": ["missing design_brief"], "valid_source_count": 0}
     if brief.get("research_complete") is not True:
-        issues.append("research_complete must be explicitly true for a formal research brief")
-
+        issues.append("research is incomplete; resolve or report the remaining questions")
     sources = brief.get("sources_used") or []
-    if not isinstance(sources, list):
-        issues.append("sources_used must be a list")
-        sources = []
     valid_sources = []
     unreachable_sources = []
-    source_domain_counts = {
-        "academic_or_official": 0,
-        "implementation_or_model": 0,
-        "other": 0,
-    }
-    for source in sources:
+    domains = {"academic_or_official": 0, "implementation_or_model": 0, "other": 0}
+    for source in sources if isinstance(sources, list) else []:
         if not isinstance(source, dict):
             continue
-        title = str(source.get("title") or source.get("name") or "").strip()
-        url = str(source.get("url") or source.get("link") or "").strip()
-        used_for = str(source.get("used_for") or "").strip()
-        if title and used_for and _valid_source_url(url):
-            if verify_source_urls and not _source_reachable(url, timeout=source_timeout):
-                unreachable_sources.append({
-                    "title": title,
-                    "url": url,
-                    "used_for": used_for,
-                })
-            else:
-                valid_sources.append(source)
-                source_domain_counts[_source_domain_class(url)] += 1
+        url = str(source.get("url") or source.get("link") or "")
+        if not (source.get("title") or source.get("name")) or not source.get("used_for") or not _valid_source_url(url):
+            continue
+        valid_sources.append(source)
+        domains[_source_domain_class(url)] += 1
+        # A transient HTTP failure is not evidence that a source is fabricated.
+        # Retain it as a warning; Codex must inspect the sources during research.
+        if verify_source_urls and not _source_reachable(url, timeout=source_timeout):
+            unreachable_sources.append(source)
     if len(valid_sources) < min_sources:
-        issues.append(f"need at least {min_sources} verifiable sources with title/url/used_for")
-    if valid_sources and not (
-        source_domain_counts["academic_or_official"]
-        or source_domain_counts["implementation_or_model"]
-    ):
-        issues.append(
-            "need at least one academic/official/implementation source "
-            "(arXiv/CVF/ACL/NeurIPS/OpenReview/GitHub/HuggingFace/etc.)"
-        )
-    valid_source_titles = {
-        str(source.get("title") or source.get("name") or "").strip().lower()
+        issues.append(f"need at least {min_sources} sources with title, public URL and implementation relevance")
+    source_titles = {
+        str(source.get("title") or source.get("name")).strip().casefold()
         for source in valid_sources
     }
 
-    research_plan = brief.get("research_plan") or {}
-    if not isinstance(research_plan, dict):
-        issues.append("research_plan must be an object")
-        research_plan = {}
-    if not str(research_plan.get("problem_understanding") or "").strip():
-        issues.append("research_plan.problem_understanding is empty")
-    source_strategy = research_plan.get("source_strategy") or []
-    if not isinstance(source_strategy, list) or not [s for s in source_strategy if str(s).strip()]:
-        issues.append("research_plan.source_strategy is empty")
+    def linked_source(title):
+        return isinstance(title, str) and title.strip().casefold() in source_titles
 
-    target_modules = list(expected_target_modules or brief.get("target_modules") or [])
-    if target_modules:
-        if list(brief.get("target_modules") or []) != target_modules:
-            issues.append("target_modules must match the diagnosis execution brief")
-
-        # Later-round research supports one adaptive module-set mechanism
-        # rather than an initial-baseline redesign.
+    if expected_target_modules:
         design = brief.get("module_set_design") or {}
-        if not isinstance(design, dict):
-            issues.append("module_set_design must be an object")
-            design = {}
         for field in ("goal", "mechanism"):
-            if not str(design.get(field) or "").strip():
-                issues.append(f"module_set_design.{field} is empty")
-        modules = design.get("candidate_module_roles") or {}
-        if not isinstance(modules, dict) or not [key for key in modules if key in MODULES]:
-            issues.append("module_set_design.candidate_module_roles needs at least one module")
-        handoffs = design.get("handoff_contracts") or []
-        if not isinstance(handoffs, list) or not handoffs:
-            issues.append("module_set_design.handoff_contracts is empty")
-        implementation_plan = brief.get("implementation_plan") or []
-        if not isinstance(implementation_plan, list) or not [p for p in implementation_plan if str(p).strip()]:
-            issues.append("implementation_plan is empty")
-        required_bundle_contract = required_bundle_contract or {}
-        policy = required_bundle_contract.get("execution_policy") or {}
-        task_contract = required_bundle_contract.get("implementation_task") or {}
-        expected_modules = {
-            str(module) for module in (policy.get("target_modules") or [])
-            if str(module) in MODULES
-        }
-        actual_modules = {
-            str(module) for module in modules
-            if str(module) in MODULES and str(modules.get(module) or "").strip()
-        }
-        if expected_modules and not expected_modules.issubset(actual_modules):
-            issues.append(
-                "module_set_design.candidate_module_roles must include every "
-                "diagnosis target modules: " + ", ".join(sorted(expected_modules - actual_modules))
-            )
-        expected_handoffs = {
-            (str(item.get("producer") or ""), str(item.get("consumer") or ""))
-            for item in (task_contract.get("handoff_contracts") or [])
-            if isinstance(item, dict) and str(item.get("producer") or "") and str(item.get("consumer") or "")
-        }
-        actual_handoffs = {
-            (str(item.get("producer") or ""), str(item.get("consumer") or ""))
-            for item in handoffs if isinstance(item, dict)
-            and str(item.get("producer") or "") and str(item.get("consumer") or "")
-            and str(item.get("contract") or item.get("output_protocol") or "").strip()
-        }
-        if expected_handoffs and not expected_handoffs.issubset(actual_handoffs):
-            missing = [f"{producer}->{consumer}" for producer, consumer in sorted(expected_handoffs - actual_handoffs)]
-            issues.append(
-                "module_set_design.handoff_contracts must cover diagnosis handoffs: "
-                + ", ".join(missing)
-            )
-
-        mappings = brief.get("runtime_capability_mapping")
-        if allowed_runtime_capabilities is not None and not isinstance(mappings, list):
-            issues.append("runtime_capability_mapping must be a list")
-            mappings = []
-        if allowed_runtime_capabilities is not None:
-            # One allowed entry may name several equivalent public helpers.
-            def helper_identities(runtime_call: Any) -> set[str]:
-                return set(re.findall(
-                    r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(",
-                    str(runtime_call or ""),
-                ))
-            allowed_helpers = {}
-            for allowed in allowed_runtime_capabilities:
-                if not isinstance(allowed, dict):
+            if not isinstance(design, dict) or not str(design.get(field) or "").strip():
+                issues.append(f"module_set_design.{field} must explain the implementation approach")
+        try:
+            normalize_modules(brief.get("target_modules") or expected_target_modules)
+        except ValueError as exc:
+            issues.append(str(exc))
+        findings = brief.get("functional_change_research") or []
+        if not isinstance(findings, list) or not findings:
+            issues.append("functional_change_research needs source-backed implementation findings")
+        else:
+            for index, finding in enumerate(findings):
+                if not isinstance(finding, dict) or not all(
+                    isinstance(finding.get(field), str) and finding[field].strip()
+                    for field in ("component", "method", "implementation_guidance")
+                ):
+                    issues.append(f"functional_change_research[{index}] needs a component, method and implementation_guidance")
                     continue
-                key = (str(allowed.get("capability") or ""), str(allowed.get("profile_id") or ""))
-                identities = helper_identities(allowed.get("runtime_call"))
-                if key[0] and identities:
-                    allowed_helpers.setdefault(key, set()).update(identities)
-            for item in mappings or []:
-                if not isinstance(item, dict):
-                    issues.append("runtime_capability_mapping entries must be objects")
-                    continue
-                key = (str(item.get("capability") or ""), str(item.get("profile_id") or ""))
-                identities = helper_identities(item.get("runtime_call"))
-                if not identities or not identities.issubset(allowed_helpers.get(key, set())):
-                    issues.append("runtime_capability_mapping uses a capability not allowed by execution brief")
-
-        # Source-backed research must justify every diagnosed role and handoff,
-        # rather than merely provide unrelated bibliography entries.
-        source_mappings = brief.get("functional_change_research") or []
-        if not isinstance(source_mappings, list):
-            issues.append("functional_change_research must be a list")
-            source_mappings = []
-        expected_components = {f"module:{module}" for module in expected_modules}
-        expected_components.update(
-            f"handoff:{producer}->{consumer}" for producer, consumer in expected_handoffs
-        )
-        mapped_components = set()
-        for item in source_mappings:
-            if not isinstance(item, dict):
-                issues.append("functional_change_research entries must be objects")
-                continue
-            component = str(item.get("component") or item.get("functional_change") or "").strip()
-            mapped_components.add(component)
-            for field in ("method", "implementation_guidance", "source_support"):
-                if not str(item.get(field) or "").strip():
-                    issues.append(f"functional_change_research.{component or '<missing>'}.{field} is empty")
-            if valid_source_titles:
-                # One component can legitimately draw on several sources.  Do
-                # not force Codex to discard that provenance merely because it
-                # uses a semicolon/newline-separated citation list; every
-                # cited title must still exactly match a verified source.
-                source_support = str(item.get("source_support") or "").strip()
-                cited_titles = [
-                    title.strip().lower()
-                    for title in re.split(r"[;\n]+", source_support)
-                    if title.strip()
-                ]
-                if not cited_titles or any(title not in valid_source_titles for title in cited_titles):
-                    issues.append(
-                        f"functional_change_research.{component or '<missing>'}.source_support "
-                        "must reference one or more validated source titles"
-                    )
-        if expected_components - mapped_components:
-            issues.append(
-                "functional_change_research must cover diagnosis bundle components: "
-                + ", ".join(sorted(expected_components - mapped_components))
-            )
+                support = finding.get("source_support") or []
+                if not isinstance(support, list) or not support or not all(linked_source(title) for title in support):
+                    issues.append(f"functional_change_research[{index}].source_support must cite sources_used titles")
     else:
+        spec = brief.get("baseline_combo_design_spec") or {}
+        if not isinstance(spec, dict) or not spec.get("overall_strategy"):
+            issues.append("baseline_combo_design_spec.overall_strategy is missing")
         for module in MODULES:
-            key = f"{module}_design"
-            item = brief.get(key)
-            if not isinstance(item, dict):
-                issues.append(f"missing {key}")
-                continue
-            goal = str(item.get("goal") or "").strip()
-            mechanisms = item.get("mechanisms") or []
-            if not goal:
-                issues.append(f"{key}.goal is empty")
-            if not isinstance(mechanisms, list) or not [m for m in mechanisms if str(m).strip()]:
-                issues.append(f"{key}.mechanisms is empty")
-
-        module_source_map = brief.get("module_source_map") or {}
-        if not isinstance(module_source_map, dict):
-            issues.append("module_source_map must be an object")
-            module_source_map = {}
-        for module in MODULES:
-            mappings = module_source_map.get(module) or []
-            if not isinstance(mappings, list) or not mappings:
-                issues.append(f"module_source_map.{module} is empty")
-                continue
-            mapped_to_valid_source = False
-            for mapping in mappings:
-                if not isinstance(mapping, dict):
-                    continue
-                source = str(mapping.get("source") or "").strip()
-                method = str(mapping.get("method_idea") or "").strip()
-                hint = str(mapping.get("implementation_hint") or "").strip()
-                if not method:
-                    issues.append(f"module_source_map.{module}.method_idea is empty")
-                if not hint:
-                    issues.append(f"module_source_map.{module}.implementation_hint is empty")
-                source_l = source.lower()
-                if source_l and any(source_l == title or source_l in title or title in source_l for title in valid_source_titles):
-                    mapped_to_valid_source = True
-            if valid_source_titles and not mapped_to_valid_source:
-                issues.append(f"module_source_map.{module} does not reference a validated source title")
-
-        design_spec = brief.get("baseline_combo_design_spec") or {}
-        if not isinstance(design_spec, dict):
-            issues.append("baseline_combo_design_spec must be an object")
-            design_spec = {}
-        if not str(design_spec.get("overall_strategy") or "").strip():
-            issues.append("baseline_combo_design_spec.overall_strategy is empty")
-        for module in MODULES:
-            spec = design_spec.get(module)
-            if not isinstance(spec, dict):
-                issues.append(f"baseline_combo_design_spec.{module} is missing")
-                continue
-            if not str(spec.get("class_goal") or spec.get("goal") or "").strip():
-                issues.append(f"baseline_combo_design_spec.{module}.class_goal is empty")
-            mechanisms = spec.get("core_mechanisms") or spec.get("mechanisms") or []
-            if not isinstance(mechanisms, list) or not [m for m in mechanisms if str(m).strip()]:
-                issues.append(f"baseline_combo_design_spec.{module}.core_mechanisms is empty")
-
-    for bucket in RESEARCH_BUCKETS:
-        value = brief.get(bucket)
-        if not isinstance(value, list):
-            issues.append(f"{bucket} must be a list")
-    if isinstance(brief.get("high_confidence_designs"), list) and not brief.get("high_confidence_designs"):
-        issues.append("high_confidence_designs is empty")
-
-    if not str(brief.get("codex_instructions") or "").strip():
-        issues.append("codex_instructions is empty")
-    if target_modules:
-        if not str(brief.get("diagnosis_support_summary") or "").strip():
-            issues.append("diagnosis_support_summary is empty")
-    elif not str(brief.get("recommended_architecture") or "").strip():
-        issues.append("recommended_architecture is empty")
+            design = spec.get(module) if isinstance(spec, dict) else None
+            if not isinstance(design, dict) or not (design.get("class_goal") or design.get("goal")):
+                issues.append(f"baseline_combo_design_spec.{module} needs a concrete responsibility")
+            elif not (design.get("core_mechanisms") or design.get("mechanisms")):
+                issues.append(f"baseline_combo_design_spec.{module} needs an implementation mechanism")
+            if isinstance(design, dict):
+                support = design.get("source_support") or []
+                if not isinstance(support, list) or not support or not all(
+                    isinstance(item, dict) and linked_source(item.get("source"))
+                    and all(isinstance(item.get(field), str) and item[field].strip()
+                            for field in ("method_idea", "implementation_hint"))
+                    for item in support
+                ):
+                    issues.append(f"baseline_combo_design_spec.{module}.source_support needs a cited method and implementation_hint")
+    next_task = brief.get("next_task") or {}
+    if (not isinstance(next_task, dict) or not str(next_task.get("objective") or "").strip()
+            or not isinstance(next_task.get("implementation_steps"), list)
+            or not next_task["implementation_steps"]
+            or not all(isinstance(step, str) and step.strip() for step in next_task["implementation_steps"])):
+        issues.append("next_task must describe an objective and implementation_steps")
     return {
-        "passed": not issues,
-        "issues": issues,
-        "valid_source_count": len(valid_sources),
-        "min_sources": min_sources,
+        "passed": not issues, "issues": issues,
+        "valid_source_count": len(valid_sources), "min_sources": min_sources,
         "source_url_verification": bool(verify_source_urls),
-        "source_domain_counts": source_domain_counts,
-        "unreachable_sources": unreachable_sources,
-        "warnings": [
-            f"source URL not reachable: {item['url']}"
-            for item in unreachable_sources
-        ],
+        "source_domain_counts": domains, "unreachable_sources": unreachable_sources,
+        "warnings": [f"source URL was not reachable during this check: {item.get('url') or item.get('link')}"
+                     for item in unreachable_sources],
     }
 
 
@@ -701,83 +441,58 @@ def _build_codex_prompt(profile: Dict[str, Any],
                         year_min: int,
                         min_sources: int) -> str:
     target_modules = _target_modules(diagnosis)
+    schema = {
+        "research_complete": True,
+        "research_plan": {"problem_understanding": "...", "key_uncertainties": ["..."], "source_strategy": ["..."]},
+        "executed_searches": [{"query": "...", "source_target": "academic|implementation|benchmark|model",
+                               "why": "...", "top_sources_considered": ["..."]}],
+        "rejected_sources": [{"title": "...", "url": "https://...", "reason": "..."}],
+        "analysis": "Evidence, findings, alternatives, implementation reasoning and tradeoffs",
+        "open_questions": ["Unresolved implementation or evidence questions"],
+        "next_task": {"stage": "codegen", "objective": "...",
+                      "implementation_steps": ["Concrete behavioral changes"], "checks": ["Observable smoke/probe checks"]},
+        "high_confidence_designs": [{"claim": "...", "why": "...", "module": "...", "source": "..."}],
+        "hypotheses_to_test": [{"claim": "...", "probe": "...", "risk": "..."}],
+        "avoid_or_low_priority": [{"idea": "...", "reason": "..."}],
+        "sources_used": [{"title": "...", "url": "https://...", "used_for": "..."}],
+        "risks": ["..."],
+        "source_quality": "strong|medium|weak",
+    }
     if target_modules:
-
-        schema_text = (
-            "{\n"
-            '  "research_complete": true,\n'
-            '  "research_plan": {"problem_understanding": "...", "key_uncertainties": ["..."], "source_strategy": ["..."]},\n'
-            f'  "target_modules": {json.dumps(target_modules)},\n'
-            '  "diagnosis_support_summary": "how sources support the diagnosis without changing its outer direction",\n'
-            '  "executed_searches": [{"query": "...", "source_target": "academic|implementation|benchmark|model", "why": "...", "top_sources_considered": ["..."]}],\n'
-            '  "rejected_sources": [{"title": "...", "url": "https://...", "reason": "..."}],\n'
-            '  "module_set_design": {"goal": "...", "mechanism": "...", "candidate_module_roles": {"localization": "..."}, "handoff_contracts": [{"producer": "...", "consumer": "...", "contract": "..."}]},\n'
-            '  "implementation_plan": ["concrete coding steps; inner Codex feedback may adapt related modules"],\n'
-            '  "runtime_capability_mapping": [{"capability": "only an allowed capability", "profile_id": "exact allowed profile_id", "runtime_call": "registered runtime helper identity", "use": "..."}],\n'
-            '  "functional_change_research": [{"component": "module:localization|handoff:localization->perception", "method": "source-backed method", "implementation_guidance": "general implementation guidance", "source_support": "exact source title"}],\n'
-            '  "high_confidence_designs": [{"claim": "...", "why": "...", "module": "...", "source": "..."}],\n'
-            '  "hypotheses_to_test": [{"claim": "...", "probe": "...", "risk": "..."}],\n'
-            '  "avoid_or_low_priority": [{"idea": "...", "reason": "..."}],\n'
-            '  "codex_instructions": "implementation guidance for the first bundle candidate; later probe feedback may revise related modules",\n'
-            '  "sources_used": [{"title": "...", "url": "https://...", "used_for": "..."}],\n'
-            '  "risks": ["..."], "source_quality": "strong|medium|weak"\n'
-            "}\n"
-        )
-        task_line = (
-            "Task: research the diagnosis-selected five-module bundle mechanism. "
-            "This is an OUTER-ROUND direction, not an edit whitelist: explain responsibility boundaries and "
-            "producer→consumer handoffs, while allowing the later inner Codex loop to adapt related modules."
-        )
-        schema_rule = (
-            "- Output the bundle schema with at least one target module role; include additional roles only when the mechanism requires them.\n"
-            "- candidate_module_roles must include every diagnosis target module, and handoff_contracts must include every diagnosis handoff.\n"
-            "- functional_change_research must contain one source-backed entry for each target module and diagnosis handoff, using component values `module:<name>` or `handoff:<producer>-><consumer>`.\n"
-            "- runtime_capability_mapping may use only the capability/profile/helper triples in allowed_runtime_capabilities.\n"
-            "- Do not include a per-file edit whitelist.\n"
+        schema.update({
+            "target_modules": target_modules,
+            "diagnosis_support_summary": "Findings that support or qualify the causal diagnosis",
+            "module_set_design": {
+                "goal": "...", "mechanism": "...", "candidate_module_roles": {module: "..." for module in target_modules},
+                "handoff_contracts": [{"producer": "...", "consumer": "...", "contract": "..."}],
+            },
+            "runtime_capability_mapping": [{"capability": "...", "profile_id": "registered profile ID",
+                                            "runtime_call": "bounded adapter", "use": "..."}],
+            "functional_change_research": [{"component": "module or handoff", "method": "source-backed method",
+                                            "implementation_guidance": "...", "source_support": ["source title"]}],
+        })
+        task = (
+            "Investigate the diagnosed evolution mechanism. Explain the affected responsibilities, "
+            "producer/consumer handoffs and implementation tradeoffs. Codex may adapt related "
+            "modules when implementation or execution evidence supports the change."
         )
     else:
-        schema_text = (
-            "{\n"
-            '  "research_complete": true,\n'
-            '  "research_plan": {"problem_understanding": "...", "key_uncertainties": ["..."], "source_strategy": ["..."]},\n'
-            '  "executed_searches": [{"query": "...", "source_target": "academic|implementation|benchmark|model", "why": "...", "top_sources_considered": ["..."]}],\n'
-            '  "rejected_sources": [{"title": "...", "url": "https://...", "reason": "..."}],\n'
-            '  "distribution_interpretation": "...",\n'
-            '  "recommended_architecture": "...",\n'
-            '  "module_source_map": {\n'
-            '    "video_structuring": [{"source": "exact source title", "method_idea": "...", "why_relevant": "...", "implementation_hint": "..."}],\n'
-            '    "localization": [{"source": "exact source title", "method_idea": "...", "why_relevant": "...", "implementation_hint": "..."}],\n'
-            '    "perception": [{"source": "exact source title", "method_idea": "...", "why_relevant": "...", "implementation_hint": "..."}],\n'
-            '    "memory": [{"source": "exact source title", "method_idea": "...", "why_relevant": "...", "implementation_hint": "..."}],\n'
-            '    "thinking": [{"source": "exact source title", "method_idea": "...", "why_relevant": "...", "implementation_hint": "..."}]\n'
-            '  },\n'
-            '  "baseline_combo_design_spec": {\n'
-            '    "overall_strategy": "...",\n'
-            '    "video_structuring": {"class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."]},\n'
-            '    "localization": {"class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."]},\n'
-            '    "perception": {"class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."]},\n'
-            '    "memory": {"class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."]},\n'
-            '    "thinking": {"class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."]}\n'
-            '  },\n'
-            '  "high_confidence_designs": [{"claim": "...", "why": "...", "module": "...", "source": "..."}],\n'
-            '  "hypotheses_to_test": [{"claim": "...", "probe": "...", "risk": "..."}],\n'
-            '  "avoid_or_low_priority": [{"idea": "...", "reason": "..."}],\n'
-            '  "video_structuring_design": {"goal": "...", "mechanisms": ["..."], "source_support": ["..."]},\n'
-            '  "localization_design": {"goal": "...", "mechanisms": ["..."], "source_support": ["..."]},\n'
-            '  "perception_design": {"goal": "...", "mechanisms": ["..."], "source_support": ["..."]},\n'
-            '  "memory_design": {"goal": "...", "mechanisms": ["..."], "source_support": ["..."]},\n'
-            '  "thinking_design": {"goal": "...", "mechanisms": ["..."], "source_support": ["..."]},\n'
-            '  "codex_instructions": "specific instructions for the later Codex code-writing agent",\n'
-            '  "sources_used": [{"title": "...", "url": "https://...", "used_for": "..."}],\n'
-            '  "risks": ["..."],\n'
-            '  "source_quality": "strong|medium|weak"\n'
-            "}\n"
+        schema.update({
+            "distribution_interpretation": "...",
+            "baseline_combo_design_spec": {
+                "overall_strategy": "...",
+                **{module: {
+                    "class_goal": "...", "core_mechanisms": ["..."], "implementation_notes": ["..."],
+                    "source_support": [{"source": "exact source title", "method_idea": "...",
+                                        "why_relevant": "...", "implementation_hint": "..."}],
+                } for module in MODULES},
+            },
+        })
+        task = (
+            "Research the initial five-module design for the observed video distribution. "
+            "For each module, connect its responsibility, mechanism and implementation guidance "
+            "to the relevant public sources."
         )
-        task_line = (
-            "Task: solve an initial-baseline engineering research problem, not a generic literature-survey task. "
-            "Given the research_brief, use online research to decide how a five-module MetaVideoAgent should be designed for this observed video distribution."
-        )
-        schema_rule = "- Answer concrete designs for all five modules: video_structuring, localization, perception, memory, thinking.\n"
     payload = {
         "research_brief": build_research_brief(profile, diagnosis, review, queries),
         "runtime_capability_manual": build_runtime_capability_context(),
@@ -787,37 +502,35 @@ def _build_codex_prompt(profile: Dict[str, Any],
         "min_verifiable_sources": min_sources,
     }
     return (
-        "You are the Deep Research agent for MetaVideoAgent target-distribution evolution.\n\n"
-        f"{task_line} "
-        "You must use verifiable public sources such as papers, project pages, GitHub repositories, HuggingFace model/dataset pages, or benchmark documentation. "
-        "Do not rely only on model memory. If you cannot access the internet or cannot provide verifiable URLs, set research_complete=false.\n\n"
-        "Hard constraints:\n"
-        "- Do not use human type/category/question_type/sub_category/domain labels.\n"
-        "- Initial-baseline research may use only five-frame query-aware profile evidence and public sources.\n"
-        "- For an initial baseline, treat the execution-layer builder as the owner of build-time media sampling/model calls; "
-        "do not prescribe model calls inside video_structuring.addStructure. "
-        "Only the registered runtime capability profiles supplied in the input are available.\n"
-        "- Later-round research may also use diagnosis/review/full-eval/probe context provided in the input.\n"
-        f"{schema_rule}"
-        "- You may choose and refine your own searches. The provided seed queries are starting points, not a complete search plan.\n"
-        "- Prefer academic and implementation-grade sources: arXiv, CVF, ACL Anthology, NeurIPS proceedings, OpenReview, official benchmark pages, GitHub repos, and HuggingFace pages.\n"
-        "- Explicitly map methods from sources to implementation hints.\n"
-        "- Separate high-confidence designs from hypotheses that still require probe/full-eval validation.\n"
-        "- The runtime_capability_manual in the input is the implementation boundary for later Codex codegen. "
-        "Prefer designs that can be expressed through those existing runtime helpers. If research suggests ASR, OCR, "
-        "VLM or embedding tools, map the method to the documented profile_id, runtime call path, and fallback policy.\n"
-        "- For later-round briefs, allowed_runtime_capabilities (including profile_id) is a binding subset selected by "
-        "the validated diagnosis handoff. Do not introduce a provider/model outside that subset or a new runtime helper. "
-        "For a later-round bundle, describe only module changes required by its diagnosed mechanism; do not turn "
-        "the outer direction into a fixed edit whitelist.\n"
-        "- For later-round briefs, functional_change_research must map every diagnosis_evolution_design.functional_changes item to a source-backed implementation method; do not replace the diagnosis design with a new one.\n"
-        "- Every source in sources_used must have title, url, and used_for.\n"
-        "- Use at least the requested number of verifiable sources.\n"
-        "- Write JSON to the output_path and also print the same JSON to stdout.\n\n"
-        "Required JSON schema:\n"
-        f"{schema_text}\n"
-        "Input JSON:\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        "You are the Deep Research stage of MetaVideoAgent.\n\n"
+        f"{task}\n\n"
+        "Research requirements:\n"
+        "- Investigate public papers, official documentation and implementation repositories. "
+        "Use at least min_verifiable_sources relevant sources with verifiable URLs, "
+        "and explain each source's relevance. If access or evidence is insufficient, "
+        "set research_complete=false and describe the remaining work.\n"
+        "- Initial research uses the five-frame query-aware distribution profile and public sources. "
+        "Keep answer labels, annotated evidence intervals and human category labels outside this stage. "
+        "Later research may also use the supplied training review, diagnosis, evaluation and probe evidence.\n"
+        "- Read upstream analysis, current source, cited training evidence and open questions in "
+        "working_materials when they affect the design. Preserve trace and source references.\n"
+        "- Resolve the implementation questions and compare alternatives. When evidence contradicts "
+        "the diagnosis, explain the consequence in analysis and open_questions.\n"
+        "- Distinguish source-supported designs from hypotheses that require execution. Explain the "
+        "behavioral change, downstream consumption, fallback behavior, cost and observable checks.\n"
+        "- Use the configured runtime capability inventory. Map model/media operations to registered "
+        "profiles and bounded adapters; Teacher audit tools belong to review. Select capabilities that "
+        "close the diagnosed information gap, including an empty capability plan when none is needed.\n"
+        "- The generic execution builder performs build-time media sampling and model calls. "
+        "A custom buildStructure(env) may implement a bounded build with registered adapters. "
+        "addStructure persists and indexes canonical evidence or media references.\n"
+        "- Seed queries are starting points; refine searches as findings develop. Prefer research "
+        "papers, official projects, benchmark documentation and implementation-grade sources.\n"
+        "- Record each module design once, with its supporting sources. Keep substantive reasoning "
+        "in analysis and the actionable implementation handoff in next_task.\n"
+        "- Write the complete JSON to output_path. Return a short completion summary and remaining work.\n\n"
+        "Output schema:\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+        + "\n\nInput JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 
@@ -948,13 +661,6 @@ def _run_codex_research(profile: Dict[str, Any],
         min_sources=min_sources,
         verify_source_urls=True,
         expected_target_modules=_target_modules(diagnosis),
-        allowed_runtime_capabilities=(
-            ((diagnosis.get("implementation_task", {}) or {}).get("runtime_capabilities", []))
-            if diagnosis.get("artifact_type") == "diagnosis_execution_brief" else None
-        ),
-        required_bundle_contract=(
-            diagnosis if diagnosis.get("artifact_type") == "diagnosis_execution_brief" else None
-        ),
     )
     research_complete = brief.get("research_complete") is True and validation.get("passed")
     return {
@@ -1044,128 +750,49 @@ def render_markdown_summary(channel: str,
                             codex_stdout: str,
                             validation: Dict[str, Any],
                             note: str = "") -> str:
-    lines = ["# Deep Research Summary", ""]
+    lines = ["# Deep Research", ""]
     if note:
-        lines.append(note)
-        lines.append("")
-    lines.append(f"- observed_primary_channel: `{channel}`")
-    lines.append(f"- validation_passed: `{validation.get('passed')}`")
-    if validation.get("issues"):
-        lines.append("- validation_issues:")
-        for issue in validation.get("issues", [])[:10]:
-            lines.append(f"  - {issue}")
-    lines.append("- research_queries:")
-    for q in queries:
-        targets = ", ".join(q.get("target_modules") or []) or "initial design"
-        lines.append(f"  - `{targets}`: {q.get('query')} ({q.get('reason')})")
-    lines.append("")
-    lines.append("## Verifiable Sources")
-    sources = design_brief.get("sources_used") or []
-    if not sources:
-        lines.append("- No validated sources.")
-    for source in sources:
-        lines.append(f"- {source.get('title')}: {source.get('url')} ({source.get('used_for')})")
-    lines.append("")
-    plan = design_brief.get("research_plan") or {}
-    if plan:
-        lines.append("## Research Plan")
-        lines.append(f"- problem_understanding: {plan.get('problem_understanding', '')}")
-        uncertainties = plan.get("key_uncertainties") or []
-        if uncertainties:
-            lines.append("- key_uncertainties:")
-            for item in uncertainties[:8]:
-                lines.append(f"  - {item}")
-        strategy = plan.get("source_strategy") or []
-        if strategy:
-            lines.append("- source_strategy:")
-            for item in strategy[:8]:
-                lines.append(f"  - {item}")
-        lines.append("")
-    lines.append("## Five-Module Design Brief")
-    target_modules = list(design_brief.get("target_modules") or [])
-    module_set_design = design_brief.get("module_set_design") or {}
-    if target_modules and isinstance(module_set_design, dict):
-        lines[-1] = "## Bundle Evolution Design"
-        lines.append(f"- target_modules: `{', '.join(target_modules)}`")
-        lines.append(f"- diagnosis_support_summary: {design_brief.get('diagnosis_support_summary', '')}")
-        lines.append(f"- goal: {module_set_design.get('goal', '')}")
-        lines.append(f"- mechanism: {module_set_design.get('mechanism', '')}")
-        roles = module_set_design.get("candidate_module_roles") or {}
-        if isinstance(roles, dict):
-            for module, role in roles.items():
-                if module in MODULES and str(role).strip():
-                    lines.append(f"- **{module}**: {role}")
-        handoffs = module_set_design.get("handoff_contracts") or []
-        if handoffs:
-            lines.append("- handoff_contracts:")
-            for handoff in handoffs[:10]:
-                if isinstance(handoff, dict):
-                    lines.append(
-                        f"  - {handoff.get('producer', '')} -> {handoff.get('consumer', '')}: "
-                        f"{handoff.get('contract', '')}"
-                    )
+        lines.extend([note, ""])
+    lines.extend([
+        f"- Observed primary channel: {channel}",
+        f"- Research complete: {validation.get('passed')}",
+        "",
+    ])
+
+    def section(title: str, value) -> None:
+        if value:
+            content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+            lines.extend([f"## {title}", "", content, ""])
+
+    section("Validation issues", validation.get("issues"))
+    section("Analysis", design_brief.get("analysis"))
+    section("Distribution interpretation", design_brief.get("distribution_interpretation"))
+    section("Research plan", design_brief.get("research_plan"))
+    section("Seed queries", queries)
+    section("Executed searches", design_brief.get("executed_searches"))
+    section("Sources considered but not used", design_brief.get("rejected_sources"))
+
+    target_modules = design_brief.get("target_modules") or []
+    if target_modules:
+        section("Target modules", target_modules)
+        section("Diagnosis findings", design_brief.get("diagnosis_support_summary"))
+        section("Evolution design", design_brief.get("module_set_design"))
+        section("Implementation methods", design_brief.get("functional_change_research"))
+        section("Runtime capability plan", design_brief.get("runtime_capability_mapping"))
     else:
-        lines.append(f"- distribution_interpretation: {design_brief.get('distribution_interpretation', '')}")
-        lines.append(f"- recommended_architecture: {design_brief.get('recommended_architecture', '')}")
+        design = design_brief.get("baseline_combo_design_spec") or {}
+        section("Overall strategy", design.get("overall_strategy"))
         for module in MODULES:
-            item = design_brief.get(f"{module}_design") or {}
-            lines.append(f"- **{module}**: {item.get('goal', '')}")
-            for mechanism in item.get("mechanisms", [])[:5]:
-                if mechanism:
-                    lines.append(f"  - {str(mechanism)[:900]}")
-    module_map = design_brief.get("module_source_map") or {}
-    if module_map:
-        lines.append("")
-        lines.append("## Method To Module Map")
-        for module in MODULES:
-            lines.append(f"### {module}")
-            mappings = module_map.get(module) or []
-            if not mappings:
-                lines.append("- No mapping.")
-                continue
-            for mapping in mappings[:5]:
-                if not isinstance(mapping, dict):
-                    continue
-                lines.append(
-                    "- "
-                    f"source={mapping.get('source', '')}; "
-                    f"method={mapping.get('method_idea', '')}; "
-                    f"hint={mapping.get('implementation_hint', '')}"
-                )
-    design_spec = design_brief.get("baseline_combo_design_spec") or {}
-    if design_spec:
-        lines.append("")
-        lines.append("## Baseline Combo Design Spec")
-        lines.append(f"- overall_strategy: {design_spec.get('overall_strategy', '')}")
-        for module in MODULES:
-            spec = design_spec.get(module) or {}
-            lines.append(f"- **{module}**: {spec.get('class_goal') or spec.get('goal') or ''}")
-            for mechanism in (spec.get("core_mechanisms") or spec.get("mechanisms") or [])[:5]:
-                lines.append(f"  - {mechanism}")
-    if any(design_brief.get(bucket) for bucket in RESEARCH_BUCKETS):
-        lines.append("")
-        lines.append("## Confidence And Test Buckets")
-        for bucket in RESEARCH_BUCKETS:
-            value = design_brief.get(bucket) or []
-            lines.append(f"### {bucket}")
-            if not value:
-                lines.append("- None.")
-                continue
-            for item in value[:8]:
-                if isinstance(item, dict):
-                    lines.append("- " + "; ".join(f"{k}={v}" for k, v in item.items()))
-                else:
-                    lines.append(f"- {item}")
-    if design_brief.get("codex_instructions"):
-        lines.append("")
-        lines.append("## Codex Instructions")
-        lines.append(str(design_brief.get("codex_instructions")))
+            section(module, design.get(module))
+
+    section("Sources", design_brief.get("sources_used"))
+    for bucket in RESEARCH_BUCKETS:
+        section(bucket.replace("_", " ").capitalize(), design_brief.get(bucket))
+    section("Risks", design_brief.get("risks"))
+    section("Open questions", design_brief.get("open_questions"))
+    section("Next implementation task", design_brief.get("next_task"))
     if codex_stdout and not design_brief:
-        lines.append("")
-        lines.append("## Raw Codex Output Preview")
-        lines.append(codex_stdout[:3000])
-    lines.append("")
-    lines.append("Use this research as design evidence; success still requires probe/full-eval validation.")
+        section("Research command output", codex_stdout[:3000])
     return "\n".join(lines)
 
 
@@ -1187,6 +814,9 @@ def run_deep_research(
     profile = read_json(channel_profile_path)
     diagnosis = read_json(diagnosis_path)
     review = read_json(review_path)
+    if (diagnosis.get("iter_context") or {}).get("iter_dir"):
+        from evolution.iteration_workspace import IterationWorkspace
+        diagnosis["iter_context"]["stage_context"] = IterationWorkspace(diagnosis["iter_context"]["iter_dir"]).context("research")
     if diagnosis.get("artifact_type") == "diagnosis_execution_brief":
         issues = validate_bundle_execution_brief(diagnosis)
         if issues:

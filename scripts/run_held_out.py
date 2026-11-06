@@ -21,7 +21,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--distribution-manifest", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--candidate-run", required=True)
-    parser.add_argument("--candidate-bundle", required=True)
     parser.add_argument("--train-diagnostic-report", required=True)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--structure-workers", type=int, default=4)
@@ -38,7 +37,6 @@ def main() -> int:
         "--workspace", args.workspace,
         "--distribution-manifest", args.distribution_manifest,
         "--candidate-run", args.candidate_run,
-        "--candidate-bundle", args.candidate_bundle,
         "--train-diagnostic-report", args.train_diagnostic_report,
         "--question-split", "test",
         "--concurrency", str(max(1, args.concurrency)),

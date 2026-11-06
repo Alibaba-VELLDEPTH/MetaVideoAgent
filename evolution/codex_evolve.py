@@ -6,17 +6,14 @@ import argparse
 import ast
 import copy
 import difflib
-import glob
-import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from typing import Dict, List
+from typing import Dict
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
@@ -26,13 +23,23 @@ if PROJECT_ROOT not in sys.path:
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 from runtime_paths import (
+    default_workspace,
     require_metavideoagent_runtime,
     runtime_dir,
-    runtime_output_root,
     use_runtime_path,
 )
 
 RUNTIME_DIR = use_runtime_path()
+from agent_sources import (
+    bundle_files,
+    collect_agent_source,
+    copy_agent_source,
+    materialize_agent,
+    module_resource_inputs,
+    write_agent_manifest,
+    write_source_files,
+)
+from authoring_workspace import create_authoring_workspace
 from bundle_contract import (
     COMBO_SLOT as BUNDLE_COMBO_SLOT,
 )
@@ -40,19 +47,13 @@ from bundle_contract import (
     MODULE_TYPES as BUNDLE_MODULE_TYPES,
 )
 from bundle_contract import (
-    bundle_fingerprint,
     make_candidate_bundle,
     validate_candidate_bundle,
 )
-from bundle_validation import (
-    MODULE_SOURCE_FILES,
-    get_full_module_code,
-)
 from candidate_forensics import (
     forensic_prompt_block,
+    load_codex_forensic_report,
     materialize_supervised_forensic_workspace,
-    scan_candidate_source_for_specialization,
-    validate_codex_forensic_report,
 )
 from capability_registry import PROFILE_MANUAL_PATH
 from codex_runtime_settings import (
@@ -62,17 +63,16 @@ from codex_runtime_settings import (
     resolve_codex_runtime_settings,
 )
 from coding_agent_runtime import coding_agent_environment, resolve_coding_agent_executable
-from config import DEFAULT_WORKSPACE
 from diagnosis_execution_brief import (
-    validate_bundle_machine_evaluation_contract,
     validate_bundle_execution_brief,
+    validate_bundle_machine_evaluation_contract,
 )
 from distribution_spec import load_distribution_spec, resolve_distribution_manifest_path
+from handoffs import evaluate_handoffs
+from iteration_workspace import IterationWorkspace, candidate_stage_paths
 from module_protocol import parse_json_object
+from runtime_capability_context import candidate_runtime_capabilities, runtime_profile_mismatches
 from target_selection import canonical_task_ref
-
-MAX_BUNDLE_CODEX_CONTEXT_CHARS = 900_000
-
 
 
 def _abs(path: str) -> str:
@@ -121,7 +121,6 @@ def _reference_from_report(path: str) -> str:
     return result
 
 
-
 def _resolve_report_relative(path: str, report_path: str) -> str:
     if not path:
         return ""
@@ -135,37 +134,21 @@ def _resolve_report_relative(path: str, report_path: str) -> str:
     return ""
 
 
-def _looks_like_initial_bundle(path: str) -> bool:
-    """Return True only for full five-module bundle records, not candidate modules."""
+def _is_complete_agent_bundle(path: str) -> bool:
+    """Check that a reference artifact provides source for all five module slots."""
     if not path or not os.path.exists(path):
         return False
     payload = _load_json_optional(path)
     if not isinstance(payload, dict):
         return False
-    modules = payload.get("modules")
-    combo = payload.get("combo")
-    module_names = payload.get("module_names")
-    if isinstance(modules, dict) and isinstance(combo, dict):
-        return True
-    if isinstance(module_names, dict) and isinstance(combo, dict):
-        return True
-    required_module_types = {"video_structuring", "localization", "perception", "memory", "thinking"}
-    if isinstance(modules, list):
-        found = {
-            item.get("module_type")
-            for item in modules
-            if isinstance(item, dict) and item.get("module_type")
-        }
-        return required_module_types.issubset(found) and isinstance(combo, dict)
-    return False
+    modules = _bundle_module_records(payload)
+    combo = payload.get("combo") or {}
+    return all(combo.get(module) and modules.get(module, {}).get("code")
+               for module in BUNDLE_MODULE_TYPES)
 
 
 def _reference_bundle_from_report(ref_report: dict, report_path: str) -> str:
-    """Resolve the complete five-module bundle backing a reference report.
-
-    Candidate bundles are deliberately excluded because they are not immutable
-    reference bundles for smoke replay.
-    """
+    """Resolve the complete agent bundle backing the current-best report."""
     combo_policy = ref_report.get("combo_policy") or {}
     candidates = [
         combo_policy.get("effective_bundle_path", ""),
@@ -176,10 +159,10 @@ def _reference_bundle_from_report(ref_report: dict, report_path: str) -> str:
     ]
     for raw in candidates:
         resolved = _resolve_report_relative(raw, report_path)
-        if _looks_like_initial_bundle(resolved):
+        if _is_complete_agent_bundle(resolved):
             return resolved
     local = os.path.join(os.path.dirname(_abs(report_path)), "initial_baseline_bundle.json")
-    if _looks_like_initial_bundle(local):
+    if _is_complete_agent_bundle(local):
         return local
     return ""
 
@@ -196,13 +179,14 @@ def _reference_combo_from_report(ref_report: dict) -> tuple:
     return {}, {"source": "none"}
 
 
-
-
-
 def _resolve_rollout_path(diagnosis_path: str, explicit: str = "") -> str:
     if explicit:
         return _abs(explicit)
     abs_diag = _abs(diagnosis_path)
+    report = _load_json_optional(abs_diag)
+    recorded = str(report.get("diagnosis_rollout_path") or "")
+    if recorded and os.path.isfile(recorded):
+        return recorded
     base = os.path.basename(abs_diag)
     if base.startswith("diagnosis_"):
         candidate = os.path.join(
@@ -214,39 +198,20 @@ def _resolve_rollout_path(diagnosis_path: str, explicit: str = "") -> str:
     return ""
 
 
-
-def _snapshot_files(files: List[str]) -> Dict[str, str]:
-    originals = {}
-    for rel_path in files:
-        abs_path = _abs(rel_path)
-        if os.path.exists(abs_path):
-            with open(abs_path, "r", encoding="utf-8") as f:
-                originals[rel_path] = f.read()
-    return originals
-
-
-def _restore_files(originals: Dict[str, str]) -> None:
-    for rel_path, content in originals.items():
-        abs_path = _abs(rel_path)
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(content)
+def _write_bundle_source_snapshot(bundle: dict, dest_dir: str) -> None:
+    """Materialize exactly this candidate, including deletions and new paths."""
+    if os.path.isdir(dest_dir):
+        shutil.rmtree(dest_dir)
+    os.makedirs(dest_dir)
+    write_source_files(dest_dir, bundle_files(bundle))
+    write_agent_manifest(dest_dir, bundle)
+    write_text(os.path.join(dest_dir, "implementation.md"), bundle.get("implementation_notes") or "")
 
 
-def _copy_source_snapshot(files: List[str], dest_dir: str) -> None:
-    os.makedirs(dest_dir, exist_ok=True)
-    for rel_path in files:
-        src = _abs(rel_path)
-        if not os.path.exists(src):
-            continue
-        dst = os.path.join(dest_dir, rel_path)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-
-
-def _write_source_diff(originals: Dict[str, str], diff_path: str) -> None:
+def _write_source_diff(originals: Dict[str, str], diff_path: str, *, source_dir: str) -> None:
     chunks = []
     for rel_path, before in originals.items():
-        abs_path = _abs(rel_path)
+        abs_path = os.path.join(source_dir, rel_path)
         after = ""
         if os.path.exists(abs_path):
             with open(abs_path, "r", encoding="utf-8") as f:
@@ -255,13 +220,12 @@ def _write_source_diff(originals: Dict[str, str], diff_path: str) -> None:
             difflib.unified_diff(
                 before.splitlines(keepends=True),
                 after.splitlines(keepends=True),
-                fromfile=f"source_before/{rel_path}",
-                tofile=f"source_after/{rel_path}",
+                fromfile=f"base_agent/{rel_path}",
+                tofile=f"current_agent/{rel_path}",
             )
         )
     with open(diff_path, "w", encoding="utf-8") as f:
         f.writelines(chunks)
-
 
 
 def _trim(text: str, limit: int) -> str:
@@ -269,56 +233,6 @@ def _trim(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit // 2] + "\n...[truncated]...\n" + text[-limit // 2 :]
-
-
-TEACHER_ONLY_TOOL_MAP = {
-    "DIAG_VIDEO_AUDIT": "Video review capability",
-    "DIAG_DETAIL_VIDEO_AUDIT": "Detailed video review capability",
-    "AUDIT_VIDEO": "Video review capability",
-    "AUDIT_DETAIL_VIDEO": "Detailed video review capability",
-    "AUDIT_ENHANCED_VIDEO": "Enhance video review capabilities",
-    "AUDIT_STRUCTURE": "Structure library review capability",
-    "AUDIT_TRANSCRIPT": "Subtitle/audio text review capabilities",
-    "watch_video": "Video review capability",
-    "video_review": "Video review capability",
-    "teacher_video_verification": "Video review capability",
-    "detailed_watch": "Detailed video review capability",
-    "detail_video_review": "Detailed video review capability",
-    "fine_video_review": "Detailed video review capability",
-    "teacher_detailed_video_verification": "Detailed video review capability",
-    "enhanced_watch": "Enhance video review capabilities",
-    "enhanced_video_review": "Enhance video review capabilities",
-    "teacher_enhanced_video_verification": "Enhance video review capabilities",
-    "browse_struct_db": "Structure library review capability",
-    "structure_review": "Structure library review capability",
-    "teacher_structure_db_audit": "Structure library review capability",
-    "read_transcript": "Subtitle/audio text review capabilities",
-    "transcript_review": "Subtitle/audio text review capabilities",
-    "teacher_transcript_audit": "Subtitle/audio text review capabilities",
-    "listen_audio": "Subtitle/audio text review capabilities",
-}
-
-DISALLOWED_RUNTIME_TOOL_MAP = {
-    "frame_inspect": "visual observation ability",
-    "single_frame_inspect": "visual observation ability",
-    "inspect_frames": "visual observation ability",
-    "runtime_visual_observation_tool": "visual observation ability",
-    "runtime_visual_observation_capability": "visual observation ability",
-    "search_evidence": "Positioning/structure search capabilities",
-    "clip_search": "Positioning/structure search capabilities",
-    "frame_clip_search": "Positioning/structure search capabilities",
-    "runtime_localization_or_structure_retrieval_tool": "Positioning/structure search capabilities",
-    "runtime_localization_or_structure_retrieval_capability": "Positioning/structure search capabilities",
-    "runtime_evidence_retrieval_capability": "Positioning/structure search capabilities",
-    "global_browse": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_tool": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_capability": "Global structure browsing capabilities",
-    "audio_analysis": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_evidence_tool": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_capability": "Audio/subtitle understanding ability",
-}
-
-
 
 
 def _tool_methods_from_code(code: str, class_name: str = "") -> list:
@@ -445,7 +359,7 @@ def run_codex(prompt: str, codex_cli: str, timeout: int, *, settings: dict | Non
             text=True,
             timeout=timeout,
             input=prompt,
-            env=coding_agent_environment(),
+            env=coding_agent_environment(workspace=workdir),
         )
         return {
             "ok": result.returncode == 0,
@@ -487,8 +401,6 @@ def _is_codex_runtime_environment_error(stderr: str) -> bool:
         "Read-only file system",
     )
     return any(marker in text for marker in markers)
-
-
 
 
 def _iter_jsonl_rows(path: str) -> list:
@@ -603,12 +515,7 @@ def _answer_shape_issue(answer: str) -> bool:
 
 
 def build_probe_audit(verification: dict) -> dict:
-    """Build an end-to-end, non-overfit audit from probe report + sandbox rows.
-
-    The audit intentionally abstracts away concrete answers/video timestamps.
-    It gives Codex repair feedback about behavior classes: wasteful loops,
-    weak evidence handoff, modality mismatch, answer-contract issues, etc.
-    """
+    """Connect probe outcomes to executed evidence and repair opportunities."""
     verification = verification or {}
     sandbox_dir = verification.get("sandbox_dir", "")
     probe_plan = verification.get("probe_plan") if isinstance(verification.get("probe_plan"), dict) else {}
@@ -695,11 +602,8 @@ def build_probe_audit(verification: dict) -> dict:
             item["rationales"].append(rationale)
 
     row_summaries = []
-    # Probe is a training-stage evolution signal.  Preserve every failed
-    # training trajectory (including its judged answer) for Codex analysis,
-    # while source validation forbids copying any of these literals into the
-    # generated module.  This lets Codex derive general mechanisms from real
-    # failures instead of guessing from an empty aggregate label.
+    # Failed training rows retain their observations and judged outcomes so
+    # repair can connect a proposed mechanism to the actual execution.
     train_feedback_candidates = []
     mechanism_decision_rows = 0
     mechanism_fallback_rows = 0
@@ -899,7 +803,6 @@ def build_probe_audit(verification: dict) -> dict:
         else:
             failure_stage = "none"
         row_summaries.append({
-            "task_id_hash": str(row.get("task_id", ""))[-12:],
             "is_correct": bool(is_correct),
             "steps": steps,
             "tool_counts": counts,
@@ -945,10 +848,6 @@ def build_probe_audit(verification: dict) -> dict:
                 gaps.append("final_answer_contract_not_direct")
             if decision_signal.get("mode") in {"verification_low_support", "verification_skipped_no_candidates"}:
                 gaps.append("declared_decision_mechanism_fell_back")
-            if any("asr_status\\\": \\\"not_supplied" in str(item.get("observation") or "") for item in evidence_excerpts):
-                gaps.append("requested_audio_channel_had_no_transcript")
-            if any(any(token in str(item.get("observation") or "").lower() for token in ("cannot determine", "no visible action", "sequence")) for item in evidence_excerpts):
-                gaps.append("available_evidence_is_insufficient_for_temporal_or_relational_decision")
             train_feedback_candidates.append({
                 "machine_ref": str(row.get("task_id") or ""),
                 "hypothesis_ids": sorted({
@@ -980,21 +879,16 @@ def build_probe_audit(verification: dict) -> dict:
     if missing_capabilities:
         add_issue(
             "capability_not_executed", "critical",
-            "A diagnosis-declared capability left no structured runtime event across the complete probe set.",
-            "Use the declared runtime_evidence adapter under its bounded trigger before retrying Codex.",
+            "A capability in the candidate's implementation plan left no structured runtime event across the complete probe set.",
+            "Check the planned capability's trigger and bounded runtime_evidence adapter against the probe traces before retrying Codex.",
         )
-    profile_mismatches = {
-        capability: {"expected": expected, "observed": sorted(observed_profiles_by_capability.get(capability, set()))}
-        for capability, expected in expected_profiles.items()
-        if observed_profiles_by_capability.get(capability)
-        and expected not in observed_profiles_by_capability[capability]
-    }
+    profile_mismatches = runtime_profile_mismatches(expected_profiles, observed_profiles_by_capability)
     if profile_mismatches:
         add_issue(
             "capability_profile_mismatch", "critical",
-            "A declared capability executed through a different runtime profile than the validated implementation specification: "
+            "A capability executed through a profile outside its configured runtime inventory: "
             + json.dumps(profile_mismatches, ensure_ascii=False, sort_keys=True),
-            "Keep the selected profile_id in the linked bundle's runtime_evidence adapter or update the diagnosis brief before a new candidate is generated.",
+            "Use a registered profile for this capability through the bounded runtime_evidence adapter.",
         )
 
     if verification.get("regressions"):
@@ -1034,7 +928,7 @@ def build_probe_audit(verification: dict) -> dict:
             "no_observed_probe_benefit",
             "high",
             "Probe selected repair-opportunity rows but found no correction on those targets.",
-            "Use bounded same-direction Codex feedback with aggregate failure classes and safe training witnesses; do not fit an individual probe answer.",
+            "Inspect the complete candidate/reference training trajectories, identify the cause of the missed improvement, and implement a reusable correction within the repair budget.",
         )
 
     probe_execution_complete = bool(verification.get("probe_execution_complete", True))
@@ -1147,11 +1041,7 @@ def build_probe_audit(verification: dict) -> dict:
         "issues": issues,
         "row_summaries": row_summaries[:20],
         "repair_policy": {
-            "do_not_hardcode": True,
-            "do_not_patch_specific_question": True,
-            "repair_for_behavior_class": True,
-            "module_scope_locked": True,
-            "retargeting_out_of_scope": True,
+            "scope": "Reusable implementation changes for the diagnosed mechanism.",
             "success_requirement": (
                 "Codex probe feedback handles implementation/runtime defects and "
                 "every runnable same-direction candidate that has not earned full "
@@ -1217,64 +1107,10 @@ def build_bundle_probe_audit(verification: dict, bundle: dict) -> dict:
                 for event in events
             ):
                 per_module[module]["consumer_consumption_rows"] += 1
-        for contract in contracts:
-            if not isinstance(contract, dict):
-                continue
-            producer = str(contract.get("producer") or "")
-            consumer = str(contract.get("consumer") or "")
-            fields = [str(value) for value in (contract.get("required_fields") or []) if str(value)]
-            producer_index = None
-            producer_payload = {}
-            producer_text = ""
-            for index, step in enumerate(tool_steps):
-                if str(step.get("producer_module") or "") != producer:
-                    continue
-                producer_index = index
-                producer_text = str(step.get("observation") or "")
-                producer_payload = parse_json_object(producer_text)
-                break
-            # Module bases wrap their domain payload under ``evidence``.  In
-            # addition, the persisted trajectory deliberately truncates very
-            # large observations, so an unparseable audit copy is not proof
-            # that the runtime payload lacked the declared fields.  Unwrap
-            # parseable envelopes; otherwise defer to the structured
-            # consumer-consumed event below instead of manufacturing a
-            # critical handoff failure from logging truncation.
-            payload_parseable = bool(producer_payload)
-            if isinstance(producer_payload.get("evidence"), dict):
-                producer_payload = {
-                    **producer_payload,
-                    **dict(producer_payload.get("evidence") or {}),
-                }
-            missing = (
-                [field for field in fields if field not in producer_payload]
-                if payload_parseable else []
-            )
-            consumer_seen = any(
-                str(step.get("producer_module") or "") == consumer
-                for step in tool_steps[(producer_index + 1 if producer_index is not None else 0):]
-            )
-            consumed = any(
-                isinstance(event, dict) and event.get("event") == "consumer_consumed"
-                and event.get("status") == "ok" and event.get("contract_valid") is True
-                and str(event.get("producer_module") or "") == producer
-                # Runtime instrumentation emits ``consumer``.  Keep the old
-                # spelling readable for historical probe artifacts, but never
-                # mark a real current producer→consumer handoff as missing.
-                and str(event.get("consumer") or event.get("consumer_module") or "") == consumer
-                for event in events
-            )
-            handoff_checks.append({
-                "producer": producer, "consumer": consumer,
-                "required_fields": fields,
-                "producer_observed": producer_index is not None,
-                "missing_fields": missing,
-                "payload_parseable": payload_parseable,
-                "payload_truncated_or_unparseable": bool(producer_text) and not payload_parseable,
-                "consumer_observed": consumer_seen or consumed,
-                "consumption_event": consumed,
-                "row_task_id": str(row.get("task_id") or ""),
-            })
+        handoff_checks.extend(
+            {**check, "row_task_id": str(row.get("task_id") or "")}
+            for check in evaluate_handoffs(trajectory, events, contracts)
+        )
     joint_summary = []
     issues = list(base.get("issues") or [])
     for contract in contracts:
@@ -1288,7 +1124,7 @@ def build_bundle_probe_audit(verification: dict, bundle: dict) -> dict:
         observed = [item for item in matched if item["producer_observed"]]
         valid = [
             item for item in observed
-            if not item["missing_fields"] and item["consumer_observed"]
+            if item["passed"]
         ]
         summary = {
             "producer": producer, "consumer": consumer,
@@ -1299,11 +1135,13 @@ def build_bundle_probe_audit(verification: dict, bundle: dict) -> dict:
         joint_summary.append(summary)
         # A conditional path may simply not be selected on this batch.  Only
         # diagnose a malformed handoff after its producer actually ran.
-        if observed and not valid:
+        incomplete = [item for item in observed if not item["passed"]]
+        summary["incomplete_rows"] = len(incomplete)
+        if incomplete:
             issues.append({
                 "code": "bundle_handoff_not_consumable",
                 "severity": "critical",
-                "count": len(observed),
+                "count": len(incomplete),
                 "rationales": [f"Triggered {producer}→{consumer} handoff lacked required fields or later consumption."],
                 "repair_goal": "Return a parseable declared handoff and let the downstream module consume it through the existing runtime path.",
             })
@@ -1319,8 +1157,7 @@ def build_bundle_probe_audit(verification: dict, bundle: dict) -> dict:
         "issues": issues,
         "repair_policy": {
             **dict(base.get("repair_policy") or {}),
-            "module_scope_locked": False,
-            "module_scope": "Codex may change any related module within the five-module bundle.",
+            "editable_modules": list(BUNDLE_MODULE_TYPES),
         },
     })
     return base
@@ -1335,14 +1172,7 @@ def _metric_count(value) -> int:
 
 
 def probe_result_requires_codex_repair(verification: dict, probe_audit: dict = None) -> bool:
-    """Return True only when probe exposed code/runtime breakage.
-
-    Probe is a lightweight candidate screen. A stable no-gain or behavior-level
-    risk is a round-level evolution signal, not evidence that Codex should keep
-    rewriting the same candidate. Codex repair is reserved for implementation
-    defects: invalid execution, runtime/API/tool-contract errors, or explicit
-    engineering-invalid reports.
-    """
+    """Route implementation defects to repair, separately from behavior feedback."""
     verification = verification or {}
     probe_audit = probe_audit or {}
     if probe_audit.get("execution_layer_rerun_required"):
@@ -1370,6 +1200,7 @@ def probe_result_requires_codex_repair(verification: dict, probe_audit: dict = N
         "runtime_tool_contract_failure", "output_not_consumed",
         "empty_evidence", "perception_not_reached",
         "capability_active_window_contract_failure", "capability_profile_mismatch",
+        "bundle_handoff_not_consumable",
     }:
         return True
     return False
@@ -1418,18 +1249,15 @@ def probe_result_qualifies_for_full_eval(verification: dict,
         isinstance(mechanism_execution, dict)
         and mechanism_execution.get("all_observed_decisions_fell_back")
     )
-    replay = verification.get("reference_probe_replay") or {}
-    repeatability = replay.get("repeatability") if isinstance(replay, dict) else {}
-    repeatable = bool(isinstance(repeatability, dict) and repeatability.get("passed"))
     total = int(verification.get("total_questions") or probe_audit.get("total_questions") or 0)
     candidate_correct = int(
         verification.get("candidate_correct") or 0
     )
     # Probe is a training-stage quality gate, not merely a direction signal:
     # full evaluation is worthwhile only after the candidate answers a strict
-    # majority of the fixed probe batch correctly (4/7 for the current setup).
+    # majority of the fixed probe batch correctly.
     majority_correct = total > 0 and candidate_correct > (total / 2.0)
-    return repeatable and (not mechanism_never_activated) and majority_correct and delta > 0 and corrections >= 1 and (
+    return (not mechanism_never_activated) and majority_correct and delta > 0 and corrections >= 1 and (
         regressions == 0 or corrections > regressions
     )
 
@@ -1467,7 +1295,6 @@ def probe_result_requires_same_direction_behavior_iteration(verification: dict,
     )
 
 
-
 def classify_probe_next_action(verification: dict, probe_audit: dict = None) -> dict:
     """Classify the next step after a probe without pretending probe is final eval."""
     verification = verification or {}
@@ -1499,89 +1326,23 @@ def classify_probe_next_action(verification: dict, probe_audit: dict = None) -> 
             "regression_risk": bool(regressions),
             "requires_full_eval": True,
         }
-    if probe_result_requires_same_direction_behavior_iteration(verification, probe_audit):
-        return {
-            "action": "codex_same_direction_behavior_iteration",
-            "reason": (
-                "probe was runnable but did not show enough aggregate benefit; "
-                "return complete supervised forensic evidence to Codex for a bounded "
-                "same-direction bundle iteration"
-            ),
-            "codex_feedback_allowed": True,
-            "regression_risk": _metric_count(verification.get("regressions")) > 0,
-        }
     return {
-        "action": "round_level_rediagnosis",
-        "reason": "probe routing could not be classified; require a new diagnosis audit",
-        "codex_feedback_allowed": False,
+        "action": "codex_same_direction_behavior_iteration",
+        "reason": (
+            "probe was runnable but did not show enough aggregate benefit; "
+            "continue the candidate using its training evidence and prior findings"
+        ),
+        "codex_feedback_allowed": True,
+        "regression_risk": _metric_count(verification.get("regressions")) > 0,
     }
-
-
-def _find_upward_file(start_dir: str, filename: str, max_levels: int = 6) -> str:
-    cur = _abs(start_dir)
-    for _ in range(max_levels + 1):
-        candidate = os.path.join(cur, filename)
-        if os.path.exists(candidate):
-            return candidate
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return ""
 
 
 def _load_probe_verification_from_run(run_dir: str) -> dict:
-    verification = _load_json_optional(os.path.join(run_dir, "probe_verification.json"))
-    if verification:
-        return verification
-    sandbox = _load_json_optional(os.path.join(run_dir, "sandbox_report.json"))
-    if not sandbox:
-        return {}
-    return (
-        sandbox.get("verification")
-        or sandbox.get("sandbox")
-        or (sandbox.get("conclusion") or {}).get("verification")
-        or {}
-    )
+    return _load_json_optional(candidate_stage_paths(run_dir, "probe").get("result", ""))
 
 
 def _sandbox_dir_from_probe_run(run_dir: str, verification: dict) -> str:
-    candidates = [
-        verification.get("sandbox_dir", "") if isinstance(verification, dict) else "",
-        os.path.join(run_dir, "sandbox"),
-        os.path.join(run_dir, "sandbox"),
-    ]
-    sandbox_report = _load_json_optional(os.path.join(run_dir, "sandbox_report.json"))
-    if sandbox_report:
-        nested = sandbox_report.get("verification") or sandbox_report.get("sandbox") or {}
-        if isinstance(nested, dict):
-            candidates.insert(0, nested.get("sandbox_dir", ""))
-    for item in candidates:
-        if item and os.path.exists(_abs(item)):
-            return _abs(item)
-    return ""
-
-
-def _probe_row_brief(row: dict, classification: str = "") -> dict:
-    answer = row.get("answer") or row.get("final_agent_answer") or ""
-    question = str(row.get("question", "") or "")
-    gt_answer = str(row.get("gt_answer") or row.get("ground_truth") or "")
-    return {
-        "classification": classification,
-        "task_ref": "<redacted_probe_task>",
-        "question_present": bool(question.strip()),
-        "question_chars": len(question),
-        "gt_answer_present": bool(gt_answer.strip()),
-        "agent_answer_present": bool(str(answer or "").strip()),
-        "agent_answer_chars": len(str(answer or "")),
-        "is_correct": row.get("is_correct"),
-        "steps": _trajectory_len(row),
-        "tool_counts": _tool_counts(row),
-        "runtime_contract_errors": _structured_runtime_contract_errors(row),
-        "frames_viewed": _frames_viewed(row),
-        "llm_calls": _llm_calls(row),
-        "answer_shape_issue": _answer_shape_issue(str(answer)),
-    }
+    return str(verification.get("sandbox_dir") or candidate_stage_paths(run_dir, "probe").get("sandbox_dir") or "")
 
 
 def _classification_sets(verification: dict) -> dict:
@@ -1605,27 +1366,19 @@ def _classification_sets(verification: dict) -> dict:
     }
 
 
-def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12) -> dict:
-    """Summarize a runnable-but-rejected candidate for the next round.
-
-    This is not a probe repair prompt.  It is compact evidence that a previous
-    candidate should not be repeated blindly.  It supports both candidate run
-    directories and standalone probe rerun directories nested under a candidate.
-    """
+def build_candidate_rejection_context(probe_run_dir: str) -> dict:
+    """Carry prior candidate findings and trace locations into the next task."""
     run_dir = _abs(probe_run_dir)
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"candidate rejection run is not a directory: {probe_run_dir}")
 
-    bundle_path = _find_upward_file(run_dir, "candidate_bundle.json")
-    candidate_bundle = _load_json_optional(bundle_path) if bundle_path else {}
+    bundle_path = os.path.join(run_dir, "candidate_bundle.json")
+    candidate_bundle = _load_json_optional(bundle_path)
     if not candidate_bundle:
-        raise FileNotFoundError(f"candidate bundle not found in run ancestry: {probe_run_dir}")
+        raise FileNotFoundError(f"candidate bundle not found in candidate attempt: {probe_run_dir}")
     changed = list(candidate_bundle.get("changed_modules") or [])
     verification = _load_probe_verification_from_run(run_dir)
-    if not verification:
-        parent_verification = _find_upward_file(run_dir, "probe_verification.json")
-        verification = _load_json_optional(parent_verification) if parent_verification else {}
-    audit = _load_json_optional(os.path.join(run_dir, "probe_audit.json"))
+    audit = _load_json_optional(candidate_stage_paths(run_dir, "probe").get("audit", ""))
     if not audit:
         audit = build_bundle_probe_audit(verification, candidate_bundle)
     sandbox_dir = _sandbox_dir_from_probe_run(run_dir, verification)
@@ -1633,7 +1386,7 @@ def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12)
     raw_trajectory_files = _sandbox_jsonl_files(sandbox_dir)
     valid_rows = [row for row in rows if row.get("question") or row.get("task_id")]
     class_sets = _classification_sets(verification)
-    row_briefs = []
+    evidence_index = []
     for row in rows:
         task_id = str(row.get("task_id", ""))
         label = "probe_row"
@@ -1643,17 +1396,11 @@ def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12)
             label = "correction"
         elif row.get("is_correct") is False:
             label = "unchanged_or_failed"
-        row_briefs.append(_probe_row_brief(row, label))
-
-    row_briefs = sorted(
-        row_briefs,
-        key=lambda r: (
-            {"regression": 0, "unchanged_or_failed": 1, "correction": 2, "probe_row": 3}.get(
-                r.get("classification"), 9
-            ),
-            -int(r.get("steps") or 0),
-        ),
-    )[:max_rows]
+        evidence_index.append({
+            "task_id": task_id,
+            "classification": label,
+            "execution_error": row.get("error") or "",
+        })
     engineering_repairable = probe_result_requires_codex_repair(verification, audit)
     behavior_iterable = probe_result_requires_same_direction_behavior_iteration(verification, audit)
     next_action = classify_probe_next_action(verification, audit)
@@ -1708,17 +1455,14 @@ def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12)
         "candidate_run": os.path.dirname(bundle_path),
         "candidate_bundle_path": bundle_path,
         "sandbox_dir": sandbox_dir,
-        # These are source files, not a compact audit representation.  The
-        # feedback-resume entrypoint copies every byte into its own immutable
-        # run directory before Codex is invoked.
+        # The next authoring attempt receives the complete source trajectories.
         "raw_training_trajectory_files": raw_trajectory_files,
         "raw_training_trajectory_row_count": len(valid_rows),
         "target_modules": changed,
         "candidate": {
             "name": "MetaVideoAgent bundle",
             "changed_modules": changed,
-            "bundle_fingerprint": candidate_bundle.get("bundle_fingerprint", ""),
-            "mechanism_signature": candidate_bundle.get("bundle_fingerprint", ""),
+            "mechanism": candidate_bundle.get("change_rationale", {}),
         },
         "decision": {
             "rejection_type": rejection_type,
@@ -1739,7 +1483,7 @@ def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12)
                 and not behavior_iterable
                 and next_action_name != "full_eval_candidate"
             ),
-            "mechanism_repair_budget": mechanism_repair_budget(),
+            "candidate_feedback_budget": candidate_feedback_budget(),
         },
         "probe_metrics": {
             "probe_status": verification.get("probe_status") or audit.get("probe_status"),
@@ -1764,15 +1508,15 @@ def build_candidate_rejection_context(probe_run_dir: str, *, max_rows: int = 12)
             "selected_repair_refs_count": len(audit.get("selected_repair_refs") or []),
             "selected_guard_refs_count": len(audit.get("selected_guard_refs") or []),
         },
-        "probe_row_briefs": row_briefs,
+        "probe_evidence_index": evidence_index,
         "summary": summary,
         "instructions_for_next_codex": [
-            "Use this as negative evidence about a previous candidate, not as a request to patch exact probe answers.",
-            "If rejection_type=same_direction_behavior_iteration, inspect the bundle mechanism and make a bounded general improvement using aggregate failure classes only.",
+            "Read the candidate findings together with the complete training trajectories to decide the next implementation step.",
+            "If rejection_type=same_direction_behavior_iteration, inspect the complete indexed trajectories and prior findings, identify the causal failure, and implement a reusable improvement.",
             "If rejection_type=not_rejected_full_eval_candidate, do not treat this as a rejected candidate; run full evaluation or use it only as a risk note.",
             "If rejection_type=behavior_rejected, produce a materially different mechanism or a more disciplined version justified by diagnosis and research.",
             "Keep the linked evolution direction fixed unless a new diagnosis changes it.",
-            "Do not hard-code task ids, video ids, answers, options, or time ranges from probe rows.",
+            "Implement reusable behavior across the training distribution rather than task-specific identifiers or answers.",
         ],
     }
 
@@ -1785,32 +1529,9 @@ def write_candidate_rejection_context(probe_run_dir: str, output_path: str = "")
     return _abs(output_path)
 
 
-
-
-
-
-
-def mechanism_repair_budget() -> int:
-    """Return the bounded same-mechanism repair allowance.
-
-    Malformed environment overrides must never disable the loop guard.
-    """
-    try:
-        configured = int(os.environ.get("MFP_MECHANISM_REPAIR_BUDGET", "2") or 2)
-    except (TypeError, ValueError):
-        configured = 2
-    return max(1, configured)
-
-
-
-
-
-def _history_dir(workspace_dir: str, output_root: str = "") -> str:
-    del workspace_dir
-    if output_root:
-        return os.path.abspath(output_root)
-    return os.path.join(runtime_output_root(), "codex_reports")
-
+def candidate_feedback_budget() -> int:
+    """Return the candidate continuation budget shared with orchestration."""
+    return max(0, int(os.environ.get("BUNDLE_FEEDBACK_BUDGET", "2")))
 
 
 def write_json(path: str, data: dict) -> None:
@@ -1819,9 +1540,9 @@ def write_json(path: str, data: dict) -> None:
 
 
 def write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-
 
 
 def _copy_complete_probe_trajectory_artifacts(source_path: str, run_dir: str) -> list[dict]:
@@ -1846,11 +1567,6 @@ def _copy_complete_probe_trajectory_artifacts(source_path: str, run_dir: str) ->
         # from overwriting any trajectory while retaining the original bytes.
         destination = os.path.join(destination_dir, f"{index:03d}_{os.path.basename(source)}")
         shutil.copy2(source, destination)
-        digest_state = hashlib.sha256()
-        with open(destination, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest_state.update(chunk)
-        digest = digest_state.hexdigest()
         with open(destination, "rb") as handle:
             line_count = sum(1 for _ in handle)
         manifest.append({
@@ -1858,8 +1574,6 @@ def _copy_complete_probe_trajectory_artifacts(source_path: str, run_dir: str) ->
             "path": os.path.abspath(destination),
             "bytes": os.path.getsize(destination),
             "line_count": line_count,
-            "sha256": digest,
-            "copied_byte_for_byte": True,
         })
     write_json(os.path.join(run_dir, "probe_training_trajectories_manifest.json"), {
         "schema_version": 1,
@@ -1891,19 +1605,9 @@ def _materialize_bundle_source_snapshot(bundle_path: str, destination: str) -> s
     if not isinstance(records, (list, tuple)):
         return ""
     root = _abs(destination)
-    wrote = 0
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        rel = str(record.get("source_file") or "").replace("\\", "/").lstrip("/")
-        code = str(record.get("code") or "")
-        if not rel or not code or ".." in rel.split("/"):
-            continue
-        target = os.path.join(root, rel)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        write_text(target, code)
-        wrote += 1
-    return root if wrote else ""
+    write_source_files(root, bundle_files(bundle))
+    write_agent_manifest(root, bundle)
+    return root
 
 
 def _materialize_bundle_probe_forensics(
@@ -1943,16 +1647,16 @@ def _materialize_bundle_probe_forensics(
         str(diagnosis_report.get("reference_bundle_path") or ""),
         os.path.join(run_dir, "forensics_current_best_bundle_source"),
     )
-    parent_source_before = os.path.join(parent_dir, "source_before")
     reference_artifacts = _existing_paths(
-        os.path.join(parent_dir, "probe_verification.json"),
-        os.path.join(parent_dir, "probe_audit.json"),
+        candidate_stage_paths(parent_dir, "probe").get("result", ""),
+        candidate_stage_paths(parent_dir, "probe").get("audit", ""),
         str(diagnosis_report.get("reference_report_path") or ""),
         str(diagnosis_report.get("reference_bundle_path") or ""),
         machine_contract_path,
-        parent_source_before if os.path.isdir(parent_source_before) else "",
     )
     task_manifests = _existing_paths(str(diagnosis_report.get("distribution_manifest") or ""))
+    # The investigation is working memory for this candidate, not merely a log.
+    previous_findings = _bundle_feedback_lineage(parent_dir)
     manifest = materialize_supervised_forensic_workspace(
         root,
         candidate_source_dir=parent_after,
@@ -1962,15 +1666,11 @@ def _materialize_bundle_probe_forensics(
         reference_artifact_paths=reference_artifacts,
         task_manifest_paths=task_manifests,
         metadata={
+            "previous_findings": previous_findings,
             "mode": "bundle_probe_same_direction_self_debug",
             "parent_run": _abs(parent_dir),
-            "parent_bundle_fingerprint": str(
-                (_load_json_optional(os.path.join(parent_dir, "candidate_bundle.json")) or {}).get(
-                    "bundle_fingerprint", ""
-                )
-            ),
-            "probe_verification_path": _abs(os.path.join(parent_dir, "probe_verification.json")),
-            "probe_audit_path": _abs(os.path.join(parent_dir, "probe_audit.json")),
+            "probe_verification_path": candidate_stage_paths(parent_dir, "probe").get("result", ""),
+            "probe_audit_path": candidate_stage_paths(parent_dir, "probe").get("audit", ""),
             "declared_probe_total": int(parent_verification.get("total_questions") or 0),
             "declared_candidate_correct": int(
                 parent_verification.get("candidate_correct") or 0
@@ -1979,28 +1679,11 @@ def _materialize_bundle_probe_forensics(
             "candidate_probe_replay_path": _abs(candidate_replay) if candidate_replay else "",
             "reference_probe_replay_path": _abs(reference_replay) if reference_replay else "",
             "probe_comparison_mode": str(parent_verification.get("probe_comparison_mode") or ""),
-            "complete_trace_analysis_required": bool(
-                parent_verification.get("probe_comparison_mode")
-                == "persisted_current_best_minimal_problem"
-            ),
+            "complete_trace_analysis_required": True,
             "current_best_source_policy": "materialized directly from immutable reference_bundle modules",
-            "parent_source_before": _abs(parent_source_before) if os.path.isdir(parent_source_before) else "",
         },
     )
     return manifest
-
-
-def _apply_source_snapshot(src_dir: str) -> None:
-    """Apply a recorded source_after snapshot back to the workspace."""
-    if not os.path.isdir(src_dir):
-        return
-    for root, _dirs, files in os.walk(src_dir):
-        for name in files:
-            src = os.path.join(root, name)
-            rel = os.path.relpath(src, src_dir)
-            dst = _abs(rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
 
 
 def write_final_summary(run_dir: str, report: dict, conclusion: dict = None) -> None:
@@ -2015,11 +1698,6 @@ def write_final_summary(run_dir: str, report: dict, conclusion: dict = None) -> 
         f"- target_modules: {', '.join(report.get('target_modules', []) or [])}",
         f"- changed_modules: {', '.join(candidate.get('changed_modules', []) or [])}",
         f"- status: {report.get('status', '')}",
-        f"- source_restored: {report.get('source_restored', '')}",
-        f"- output_file: {report.get('output_file', '')}",
-        f"- candidate_rounds: {report.get('candidate_rounds', '')}",
-        f"- probe_feedback_rounds_requested: {report.get('probe_feedback_rounds_requested', '')}",
-        f"- probe_feedback_rounds_run: {len(report.get('probe_feedback_rounds', []) or [])}",
         f"- probe_status: {verification.get('probe_status', '')}",
         f"- verification_scope: {verification.get('verification_scope', '')}",
         f"- accuracy_delta: {verification.get('accuracy_delta', '')}",
@@ -2034,88 +1712,34 @@ def write_final_summary(run_dir: str, report: dict, conclusion: dict = None) -> 
     write_text(os.path.join(run_dir, "final_summary.md"), "\n".join(lines) + "\n")
 
 
-def _ensure_source_record_files(run_dir: str) -> None:
-    os.makedirs(os.path.join(run_dir, "source_before"), exist_ok=True)
-    os.makedirs(os.path.join(run_dir, "source_after"), exist_ok=True)
-    diff_path = os.path.join(run_dir, "source_diff.patch")
-    if not os.path.exists(diff_path):
-        write_text(diff_path, "")
-
-
-def build_record_manifest(run_dir: str, report: dict) -> dict:
-    """Check run_dir record completeness without using git."""
-    _ensure_source_record_files(run_dir)
-    required_files = [
-        "diagnosis.json",
-        "diagnosis_rollout.json",
-        "prompt.txt",
-        "source_diff.patch",
-        "validation.json",
-        "sandbox_report.json",
-        "final_summary.md",
-    ]
-    required_dirs = ["source_before", "source_after"]
-    if report.get("candidate_bundle") or report.get("status") == "completed":
-        required_files.append("candidate_bundle.json")
-    missing_files = [
-        name for name in required_files
-        if not os.path.exists(os.path.join(run_dir, name))
-    ]
-    missing_dirs = [
-        name for name in required_dirs
-        if not os.path.isdir(os.path.join(run_dir, name))
-    ]
-    sandbox_dir = (
-        ((report.get("sandbox") or {}).get("verification") or {})
-        .get("sandbox_dir", "")
-    )
-    sandbox_inside_run_dir = (
-        not sandbox_dir
-        or os.path.abspath(sandbox_dir).startswith(os.path.abspath(run_dir) + os.sep)
-    )
-    return {
-        "schema_version": 1,
-        "run_dir": run_dir,
-        "status": report.get("status", ""),
-        "required_files": required_files,
-        "required_dirs": required_dirs,
-        "missing_files": missing_files,
-        "missing_dirs": missing_dirs,
-        "sandbox_dir": sandbox_dir,
-        "sandbox_inside_run_dir": sandbox_inside_run_dir,
-        "uses_git_for_recording": False,
-        "record_complete": (
-            not missing_files and not missing_dirs and sandbox_inside_run_dir
-        ),
-        "notes": [
-            "source_diff.patch is produced with difflib, not git",
-            "sandbox/full-eval outputs must remain under the candidate run_dir",
-        ],
-    }
-
-
 def finalize_run_record(run_dir: str, report: dict,
                         conclusion: dict = None) -> dict:
-    """Write final_summary.md and record_manifest.json for every exit path."""
-    _ensure_source_record_files(run_dir)
+    """Persist the candidate attempt's results and readable summary."""
     write_final_summary(run_dir, report, conclusion)
-    manifest = build_record_manifest(run_dir, report)
-    write_json(os.path.join(run_dir, "record_manifest.json"), manifest)
-    report["record_manifest"] = manifest
-    return manifest
-
-
-
-
-
-
-def _bundle_edit_files() -> list[str]:
-    files = []
-    for module in BUNDLE_MODULE_TYPES:
-        for path in MODULE_SOURCE_FILES.get(module, []) or []:
-            if path not in files:
-                files.append(path)
-    return files
+    if conclusion is not None:
+        report["conclusion"] = conclusion
+    action = report.get("probe_next_action") or {}
+    report["next_task"] = action or {
+        "stage": "codegen", "error": report.get("candidate_extraction_error", ""),
+    }
+    report.setdefault("summary", report.get("status", ""))
+    write_json(os.path.join(run_dir, "run_record.json"), report)
+    if report.get("iteration_dir"):
+        iteration = IterationWorkspace(report["iteration_dir"])
+        iteration.record("codegen", os.path.join(run_dir, "run_record.json"),
+                         status="complete" if report.get("candidate_bundle") else "failed",
+                         next_task=report["next_task"],
+                         notes_path=os.path.join(report["iteration_dir"], "implementation.md"))
+        for stage in ("smoke", "probe"):
+            path = ((report.get("stage_results") or {}).get(stage) or {}).get("result", "")
+            result = _load_json_optional(path)
+            if result:
+                passed = bool(result.get("passed")) if stage == "smoke" else bool(result.get("comparison_valid"))
+                iteration.record(stage, path,
+                                 status="complete" if passed else "pending",
+                                 next_task={"origin_stage": stage, **action})
+        iteration.finish("evaluation_pending" if action.get("action") == "full_eval_candidate" else "pending")
+    return report
 
 
 def _bundle_module_records(bundle: dict) -> dict[str, dict]:
@@ -2144,91 +1768,6 @@ def _bundle_module_records(bundle: dict) -> dict[str, dict]:
     return records
 
 
-def _materialize_bundle_source_workspace(bundle: dict, edit_files: list[str]) -> dict:
-    """Validate and attest a bundle without overwriting runtime ABI sources.
-
-    Bundle code is passed to Codex through the immutable codegen context and
-    is dynamically injected by the evaluator.  Writing it into files such as
-    ``memory_modules.py`` replaces the base class imported by that very code,
-    creating a circular import before any smoke input can execute.
-    """
-    records = _bundle_module_records(bundle)
-    missing = [module for module in BUNDLE_MODULE_TYPES if not records.get(module)]
-    if missing:
-        raise RuntimeError(
-            "cannot materialize immutable bundle source: missing module records="
-            + ", ".join(missing)
-        )
-    manifest = {"source_policy": "immutable_reference_bundle", "modules": {}}
-    for module in BUNDLE_MODULE_TYPES:
-        record = records[module]
-        code = str(record.get("code") or "")
-        paths = [path for path in (MODULE_SOURCE_FILES.get(module) or []) if path in edit_files]
-        if not code or not paths:
-            raise RuntimeError(
-                f"cannot materialize immutable bundle source for {module}: code/path missing"
-            )
-        manifest["modules"][module] = {
-            "name": str(record.get("name") or ""),
-            "source_file": paths[0],
-            "source_sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
-        }
-    return manifest
-
-
-def _class_change_candidates(filepath: str, original_content: str) -> list[dict]:
-    """Describe changed classes without conflating support classes and strategies."""
-    if not os.path.isfile(filepath):
-        return []
-    try:
-        with open(filepath, "r", encoding="utf-8") as handle:
-            current_content = handle.read()
-        current_tree = ast.parse(current_content)
-        original_tree = ast.parse(original_content)
-    except (OSError, SyntaxError):
-        return []
-
-    def classes(tree, content):
-        lines = content.splitlines()
-        result = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            end = node.end_lineno or len(lines)
-            result[node.name] = "\n".join(lines[node.lineno - 1:end])
-        return result
-
-    before = classes(original_tree, original_content)
-    after = classes(current_tree, current_content)
-    candidates = []
-    for name, code in after.items():
-        prior = before.get(name)
-        if prior == code:
-            continue
-        is_new = prior is None
-        delta_lines = len(set(code.splitlines()).symmetric_difference(set((prior or "").splitlines())))
-        candidates.append({
-            "name": name,
-            "code": code,
-            "is_new": is_new,
-            "delta_lines": delta_lines,
-            # The neutral module ABI consistently names infrastructure roots
-            # ``*Base``.  They are never runtime strategies by themselves.
-            "is_infrastructure": name.endswith("Base"),
-        })
-    return candidates
-
-
-def _selected_concrete_change(filepath: str, original_content: str) -> tuple[dict | None, list[dict]]:
-    """Select a changed concrete class; never promote a support/base class."""
-    candidates = _class_change_candidates(filepath, original_content)
-    concrete = [item for item in candidates if not item["is_infrastructure"]]
-    if not concrete:
-        return None, candidates
-    concrete.sort(key=lambda item: (bool(item["is_new"]), int(item["delta_lines"]), item["name"]), reverse=True)
-    return concrete[0], candidates
-
-
 def _bundle_context_artifact(artifact_id: str, title: str, purpose: str,
                              content, content_kind: str = "text") -> dict:
     if not isinstance(content, str):
@@ -2239,8 +1778,6 @@ def _bundle_context_artifact(artifact_id: str, title: str, purpose: str,
         "purpose": purpose,
         "content_kind": content_kind,
         "content": content,
-        "chars": len(content),
-        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
     }
 
 
@@ -2256,38 +1793,6 @@ def _read_codegen_context_file(relative_path: str, *, required: bool = False) ->
         return ""
 
 
-def _assert_bundle_codegen_context(artifacts: list[dict], *, context_name: str) -> None:
-    """Fail closed instead of truncating a later-round code-writing packet."""
-    try:
-        limit = int(os.environ.get("CODEX_MAX_CONTEXT_CHARS", str(MAX_BUNDLE_CODEX_CONTEXT_CHARS)))
-    except ValueError as exc:
-        raise RuntimeError("CODEX_MAX_CONTEXT_CHARS must be an integer") from exc
-    total = sum(int((item or {}).get("chars", 0) or 0) for item in artifacts if isinstance(item, dict))
-    if total > limit:
-        raise RuntimeError(
-            f"{context_name} contains {total} characters, exceeding "
-            f"CODEX_MAX_CONTEXT_CHARS={limit}; refusing to truncate Codex repair evidence"
-        )
-
-
-def _validate_bundle_context_source(records: dict[str, dict], combo: dict) -> None:
-    """Ensure an annotated context really names five executable source records."""
-    issues = []
-    for module in BUNDLE_MODULE_TYPES:
-        record = records.get(module) or {}
-        selected = str(combo.get(BUNDLE_COMBO_SLOT[module]) or "")
-        if not selected:
-            issues.append(f"combo.{BUNDLE_COMBO_SLOT[module]} is empty")
-            continue
-        if str(record.get("name") or "") != selected:
-            issues.append(f"{module} selected class does not match its source record")
-        for field in ("source_file", "code"):
-            if not str(record.get(field) or ""):
-                issues.append(f"{module}.{field} is empty")
-    if issues:
-        raise RuntimeError("invalid immutable bundle codegen source: " + "; ".join(issues))
-
-
 def build_bundle_codegen_context(diagnosis_report: dict, bundle: dict,
                                  edit_files: list[str], *,
                                  bundle_role: str = "current_best") -> dict:
@@ -2301,7 +1806,6 @@ def build_bundle_codegen_context(diagnosis_report: dict, bundle: dict,
     """
     records = _bundle_module_records(bundle)
     combo = dict((bundle or {}).get("combo") or diagnosis_report.get("reference_combo") or {})
-    _validate_bundle_context_source(records, combo)
     registry = {slot: [] for slot in ("localization", "perception")}
     contracts = {slot: {} for slot in ("localization", "perception")}
     for slot in registry:
@@ -2319,22 +1823,25 @@ def build_bundle_codegen_context(diagnosis_report: dict, bundle: dict,
             "record_name": str(record.get("name") or ""),
             "source_file": str(record.get("source_file") or ""),
             "class_role": str(record.get("class_role") or "concrete_strategy"),
-            "code_sha256": hashlib.sha256(str(record.get("code") or "").encode("utf-8")).hexdigest(),
         })
-    task = diagnosis_report.get("implementation_task") or {}
     research = diagnosis_report.get("codex_deep_research") or {}
     artifacts = [
         _bundle_context_artifact(
             "current_bundle", (
                 "Failed smoke candidate five-module bundle"
-                if bundle_role == "failed_smoke_candidate" else "Current-best five-module bundle"
+                if bundle_role == "failed_smoke_candidate" else
+                "Working candidate five-module bundle" if bundle_role == "working_candidate" else
+                "Current-best five-module bundle"
             ),
             (
                 "Authoritative failed candidate combo, class records, and source code under repair."
                 if bundle_role == "failed_smoke_candidate" else
                 "Authoritative active combo, class records, and source code from which this evolution starts."
             ),
-            {"combo": combo, "modules": records, "source_records": source_records}, "json",
+            {"combo": combo, "modules": records, "source_records": source_records,
+             "support_files": bundle.get("support_files") or {},
+             "custom_configs": bundle.get("custom_configs") or {},
+             "dependencies": bundle.get("dependencies") or []}, "json",
         ),
         _bundle_context_artifact(
             "runtime_integration_witness", "Runtime integration witness",
@@ -2349,7 +1856,7 @@ def build_bundle_codegen_context(diagnosis_report: dict, bundle: dict,
                     "dispatch_rule": "Agent resolves target_tool by getattr(localization, 'tool_'+name) then perception; tool_params are validated against inspect.signature before invocation.",
                     "result_rule": "localization/perception return current module-protocol envelopes; memory stores raw request/result events; thinking receives normalized runtime context.",
                 },
-                "candidate_extraction_rule": "Only imports, module constants, base-class chain, and the selected concrete class are serialized. Keep candidate dependencies inside the selected class, its base chain, imports, or module constants; do not depend on arbitrary top-level helper functions or unselected classes.",
+                "candidate_extraction_rule": "agent.json declares the five selected classes. Complete module sources and agent/ helpers, prompts and resources travel together; use package-relative imports and __file__-relative resource paths.",
             }, "json",
         ),
         _bundle_context_artifact(
@@ -2379,39 +1886,49 @@ def build_bundle_codegen_context(diagnosis_report: dict, bundle: dict,
         ),
         _bundle_context_artifact(
             "evolution_direction", "Diagnosis and implementation direction",
-            "Binding outer-round mechanism, module responsibilities, handoff contracts, and constraints; it sets direction but not an edit whitelist.",
-            {"execution_policy": diagnosis_report.get("execution_policy") or {}, "implementation_task": task}, "json",
+            "Proposed mechanism, module responsibilities, handoff contracts, and implementation constraints.",
+            {key: value for key, value in diagnosis_report.items() if key != "codex_deep_research"}, "json",
         ),
         _bundle_context_artifact(
-            "deep_research_handoff", "Validated Codex deep-research handoff",
-            "Implementation evidence supporting the diagnosis direction; cannot override runtime ABI or current-bundle facts.",
-            {"research_complete": research.get("research_complete"), "validation_passed": research.get("validation_passed"), "design_brief": research.get("design_brief") or {}, "summary_text": str(research.get("summary_text") or "")}, "json",
+            "deep_research_handoff", "Iteration research handoff",
+            "Research status, available source-backed findings, design tradeoffs and the next implementation task.",
+            {"skipped": research.get("skipped", False),
+             "reason": research.get("reason", ""),
+             "research_complete": research.get("research_complete"),
+             "validation_passed": research.get("validation_passed"),
+             "findings": research.get("design_brief") or research.get("summary_text") or {}}, "json",
         ),
     ]
-    _assert_bundle_codegen_context(artifacts, context_name="bundle_codegen_context")
+    continuity = (diagnosis_report.get("iter_context") or {}).get("stage_context") or {}
+    if continuity:
+        notes = {}
+        for stage, material in (continuity.get("stage_materials") or {}).items():
+            path = material.get("notes", "")
+            if path and os.path.isfile(path):
+                with open(path, encoding="utf-8") as handle:
+                    notes[stage] = handle.read()
+        artifacts.append(_bundle_context_artifact(
+            "iteration_continuity", "Completed stage findings and current pending task",
+            "Use these findings and complete notes to continue the current Agent draft; execution snapshots describe earlier executions.",
+            {"context": continuity, "notes": notes}, "json",
+        ))
     return {
         "artifact_type": "bundle_codegen_context", "schema_version": 1,
         "purpose": "complete annotated code-writing context for a coupled five-module evolution bundle",
-        "artifact_manifest": [
-            {key: artifact[key] for key in ("artifact_id", "title", "purpose", "content_kind", "chars", "sha256")}
-            for artifact in artifacts
-        ],
         "artifacts": artifacts,
-        "total_chars": sum(int(artifact["chars"]) for artifact in artifacts),
         "edit_files": list(edit_files),
     }
 
 
 _SMOKE_NO_LABEL_FIELDS = {
-    "answer", "answers", "candidate_answer", "final_agent_answer", "gold_answer",
-    "ground_truth", "gt_answer", "is_correct", "correct", "correctness", "score",
-    "question", "questions", "choices", "options", "task_id", "task_ids", "video_id",
-    "video_ids", "time_reference", "time_references",
+    "answer", "answers", "candidate_answer", "final_answer", "final_agent_answer", "gold_answer",
+    "ground_truth", "gt_answer", "is_correct", "correct", "correctness",
+    "time_reference", "time_references",
 }
 
 
 def _redact_bundle_smoke_no_label(value):
-    """Keep runtime facts while enforcing smoke's no-answer/no-task boundary."""
+    """Keep runtime inputs and observations; exclude answer supervision."""
     if isinstance(value, dict):
         return {
             str(key): _redact_bundle_smoke_no_label(item)
@@ -2453,8 +1970,21 @@ def build_bundle_smoke_repair_context(diagnosis_report: dict, bundle: dict,
         "Deterministic producer/consumer/capability failure facts and falsifiable success conditions for this repair.",
         _redact_bundle_smoke_no_label(failure_contract or {}), "json",
     ))
+    runtime_output = dict(smoke or {})
+    runtime_output.pop("failure_contract", None)
     if execution_trace_path:
         trace = _read_required_bundle_context_json(execution_trace_path, "complete_smoke_execution_trace")
+        # The saved full trace also nests its result. Keep one prompt-facing
+        # copy of the execution evidence; the raw artifact remains unchanged.
+        trace = dict(trace)
+        trace.pop("smoke_result", None)
+        runtime_output.pop("engineering_execution_trace", None)
+        trace_evidence = trace.get("trace", trace)
+        for field in ("capability_events", "handoff_checks"):
+            if field in trace_evidence:
+                runtime_output.pop(field, None)
+        if "module_stdout" in trace:
+            runtime_output.pop("logs", None)
         artifacts.append(_bundle_context_artifact(
             "complete_smoke_execution_trace", "Complete no-label smoke execution trace",
             "All persisted runtime steps, handoffs, and capability events from this smoke attempt. Diagnose the earliest actual divergence across fields.",
@@ -2462,8 +1992,8 @@ def build_bundle_smoke_repair_context(diagnosis_report: dict, bundle: dict,
         ))
     artifacts.append(_bundle_context_artifact(
         "smoke_runtime_output", "Complete no-label smoke runtime output",
-        "Runtime result, assembly facts, handoff checks, capability events, and error evidence from this exact failed candidate.",
-        _redact_bundle_smoke_no_label(smoke or {}), "json",
+        "Runtime result, assembly facts and error evidence; execution details appear in the trace when available.",
+        _redact_bundle_smoke_no_label(runtime_output), "json",
     ))
     if repair_history:
         artifacts.append(_bundle_context_artifact(
@@ -2471,16 +2001,10 @@ def build_bundle_smoke_repair_context(diagnosis_report: dict, bundle: dict,
             "Repeated signatures require repairing the earliest unchanged boundary rather than another generic envelope patch.",
             _redact_bundle_smoke_no_label(repair_history), "json",
         ))
-    _assert_bundle_codegen_context(artifacts, context_name="bundle_smoke_repair_context")
     context.update({
         "artifact_type": "bundle_smoke_repair_context", "schema_version": 1,
         "purpose": "complete no-label engineering repair context for one failed bundle smoke",
-        "artifact_manifest": [
-            {key: item[key] for key in ("artifact_id", "title", "purpose", "content_kind", "chars", "sha256")}
-            for item in artifacts
-        ],
         "artifacts": artifacts,
-        "total_chars": sum(int(item["chars"]) for item in artifacts),
     })
     return context
 
@@ -2494,37 +2018,18 @@ def _render_bundle_codegen_context(context: dict) -> str:
         parts.append(
             f"### {artifact_id}: {artifact.get('title', '')}\n"
             f"Purpose: {artifact.get('purpose', '')}\n"
-            f"Content type: {artifact.get('content_kind', '')}; sha256={artifact.get('sha256', '')}; chars={artifact.get('chars', 0)}\n"
+            f"Content type: {artifact.get('content_kind', '')}\n"
             f"<<<BEGIN {artifact_id}>>>\n{artifact.get('content', '')}\n<<<END {artifact_id}>>>"
         )
     return "\n\n".join(parts)
 
 
-def _create_bundle_codegen_staging_workspace(run_dir: str, edit_files: list[str]) -> str:
-    """Give later-round Codex the same isolated write surface as initial codegen."""
-    # Keep the stage outside ``run_dir``.  Probe feedback may need a byte-for-
-    # byte read-only copy of that run directory; placing the stage inside it
-    # would make that copy recursively include itself.
-    stage = tempfile.mkdtemp(
-        prefix=".bundle_codegen_stage_", dir=os.path.dirname(os.path.abspath(run_dir)),
-    )
-    try:
-        runtime_target = os.path.join(stage, os.path.relpath(runtime_dir(), PROJECT_ROOT))
-        shutil.copytree(RUNTIME_DIR, runtime_target)
-        # ``RUNTIME_DIR`` already contains the materialized immutable current-best
-        # source for this invocation.  Reject accidental path expansion by
-        # recording the only files whose edits will be collected.
-        write_text(
-            os.path.join(stage, "STAGING_SCOPE.md"),
-            "This isolated workspace contains the five-module MetaVideoAgent runtime.\n"
-            "Edit only the five source files listed in the Codex prompt.\n"
-            "The host will copy only those files back, extract concrete classes,\n"
-            "then perform real dynamic injection and smoke.\n",
-        )
-        return stage
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
+def _create_bundle_codegen_staging_workspace(run_dir: str, edit_files: list[str],
+                                             source_input_dir: str) -> str:
+    """Provide the current strategies and their SDK in one writable workspace."""
+    stage = create_authoring_workspace(os.path.dirname(os.path.abspath(run_dir)), ".bundle_codegen_stage_")
+    copy_agent_source(source_input_dir, stage, edit_files)
+    return stage
 
 
 def _rewrite_staged_path_references(root: str, source_root: str, staged_root: str) -> None:
@@ -2561,11 +2066,13 @@ def _stage_bundle_run_artifacts(stage: str, run_dir: str) -> str:
 
 
 def _run_bundle_codex(prompt: str, *, run_dir: str, edit_files: list[str],
+                      source_output_dir: str,
                       codex_cli: str, timeout: int, settings: dict,
+                      source_input_dir: str,
                       stage_run_artifacts: bool = False,
                       writable_artifact_paths: list[str] | None = None) -> dict:
     """Run Codex in a workspace-write stage and collect explicit artifacts only."""
-    stage = _create_bundle_codegen_staging_workspace(run_dir, edit_files)
+    stage = _create_bundle_codegen_staging_workspace(run_dir, edit_files, source_input_dir)
     try:
         prompt_for_codex = prompt
         staged_outputs: dict[str, str] = {}
@@ -2589,13 +2096,6 @@ def _run_bundle_codex(prompt: str, *, run_dir: str, edit_files: list[str],
             prompt_for_codex, codex_cli, timeout, settings=settings,
             workdir=stage,
         )
-        for rel_path in edit_files:
-            staged = os.path.join(stage, rel_path)
-            if not os.path.isfile(staged):
-                continue
-            destination = _abs(rel_path)
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
-            shutil.copy2(staged, destination)
         for host_path, staged_path in staged_outputs.items():
             if not os.path.isfile(staged_path):
                 continue
@@ -2603,42 +2103,40 @@ def _run_bundle_codex(prompt: str, *, run_dir: str, edit_files: list[str],
             shutil.copy2(staged_path, host_path)
         result["execution_scope"] = "isolated_bundle_codegen_staging_workspace"
         result["sandbox_mode"] = "workspace-write"
+        result["source_dir"] = source_output_dir
         return result
     finally:
+        copy_agent_source(stage, source_output_dir, edit_files)
         shutil.rmtree(stage, ignore_errors=True)
 
 
 def build_bundle_codex_prompt(diagnosis_report: dict, edit_files: list[str],
                               codegen_context: dict | None = None) -> str:
-    """Prompt Codex for a bundle, not a brief-locked per-module patch."""
+    """Author a complete candidate from the diagnosis and research findings."""
     policy = diagnosis_report.get("execution_policy") or {}
     task = diagnosis_report.get("implementation_task") or {}
     research = diagnosis_report.get("codex_deep_research") or {}
-    # The persisted diagnosis_for_codex handoff is the only formal bridge from
-    # deep research to code generation.  Keep it visible to the first bundle
-    # candidate and every same-direction self-debug iteration; otherwise the
-    # research stage can validate successfully while having no effect on code.
+    # Share research status and findings with authoring and same-candidate repair.
     research_context = {
+        "skipped": research.get("skipped", False),
+        "reason": research.get("reason", ""),
         "research_complete": research.get("research_complete"),
         "formal_research": research.get("formal_research"),
         "validation_passed": research.get("validation_passed"),
         "target_modules": list(research.get("target_modules") or []),
         "design_brief_path": research.get("design_brief_path", ""),
-        "design_brief": research.get("design_brief") or {},
-        "summary_text": str(research.get("summary_text") or "")[:20000],
+        "findings": research.get("design_brief") or research.get("summary_text") or {},
     }
     rendered_context = _render_bundle_codegen_context(codegen_context or {})
-    # New bundle runs carry these facts inside the annotated context packet.
-    # Do not duplicate a potentially long research report after it: duplicate
-    # instructions dilute the ABI/source facts that must dominate code edits.
+    # Full reports are embedded once in the annotated context packet.
     if rendered_context:
         direction_block = (
-            "Read the embedded `evolution_direction` artifact. It is the binding "
-            "outer-round direction, not an edit whitelist."
+            "Read the proposed mechanism and module responsibilities in "
+            "the embedded `evolution_direction` artifact."
         )
         research_block = (
-            "Read the embedded `deep_research_handoff` artifact as implementation "
-            "evidence; it cannot override the current bundle or runtime ABI."
+            "Use the embedded `deep_research_handoff` artifact for research status "
+            "and available source-backed implementation guidance."
         )
     else:
         direction_block = json.dumps(
@@ -2648,21 +2146,26 @@ def build_bundle_codex_prompt(diagnosis_report: dict, edit_files: list[str],
         research_block = json.dumps(research_context, ensure_ascii=False, indent=2)
     return f"""You are evolving one complete MetaVideoAgent five-module bundle.
 
-This adaptive bundle brief supplies an OUTER-ROUND direction. It is not an edit whitelist.
-First implementation may start from `initial_focus_modules`; after probe feedback you may
-change any related module inside the five-module bundle when that is needed to repair an
-observed producer→consumer→decision failure chain.
+Start with `initial_focus_modules` and extend changes to related modules when
+implementation or probe evidence identifies a producer→consumer→decision dependency.
 
-Allowed editable source files:
+Current module entrypoint files:
 {json.dumps(edit_files, ensure_ascii=False, indent=2)}
 
-Every authoritative code-writing input is embedded below, with its purpose and
-checksum. Read `current_bundle` and `runtime_integration_witness` before
-editing. The source files in your isolated workspace are materialized from
-`current_bundle`; do not rely on any unlisted repository state.
+Every code-writing input is embedded below with its purpose. Read the full
+diagnosis analysis, research findings, `current_bundle` and runtime interface
+references before editing. The editable source files contain the active strategy
+implementation and any unfinished changes from the current task. `current_bundle`
+describes the selected execution reference. Continue from the actual working
+files and `agent.json`; preserve behavior outside the proposed change and retain
+the current entrypoint choices and file removals during repair.
 
-## Bundle Codegen Context Manifest
-{json.dumps((codegen_context or {}).get("artifact_manifest", []), ensure_ascii=False, indent=2)}
+Before coding, reason through the behavioral delta: the observed failure,
+why the current implementation causes it, the proposed intervention, how each
+consumer uses the changed output, preserved behavior, and observable checks.
+Use upstream open questions to guide inspection; record unresolved assumptions
+and the next verification task in `implementation.md`. On repair, continue from the failed candidate and
+previous findings instead of restarting the design.
 
 ## Embedded Bundle Codegen Context
 {rendered_context}
@@ -2673,53 +2176,52 @@ Evolution direction:
 Validated deep-research handoff:
 {research_block}
 
-Use the research as implementation evidence for this outer direction. It does
-not freeze the changed module set: during probe self-debug, change any related
-module necessary to repair an observed producer→consumer→decision failure.
-
 Rules:
-- Keep a complete five-slot combo. Do not edit orchestration, evaluators, datasets, artifacts,
-  capability profiles, raw media, or any JSON/JSONL data.
-- Add or modify a concrete runtime strategy class in each source file you actually modify.
-  A shared `*Base`/helper class is infrastructure, never a combo choice: a base-only edit is
-  not a serializable candidate and will be returned for repair. Preserve interfaces and use
-  only registered runtime_evidence adapters with literal profile_id values.
-- The generic segment builder invokes `video_structuring.addStructure` with only
-  `start_sec`, `end_sec`, and `multimodal_narration` (raw VLM text or JSON).
+- Keep a complete five-slot combo. Edit the implementation and source-owned
+  resources under `agent/`, its `agent.json` manifest and `implementation.md`.
+  Source-owned resources may include JSON configuration. Leave orchestration,
+  evaluators, datasets, prior-stage execution artifacts, capability profiles and raw media unchanged.
+- Keep the five explicit class entrypoints in `agent.json`; update an entrypoint
+  when selecting a new strategy. Helpers, prompt files and configuration belong
+  under `agent/` and travel with the candidate. Use package-relative imports for
+  agent-owned helpers and resolve resources relative to __file__.
+  Each entrypoint declares `resources`: all helper, prompt and configuration files
+  it uses, including transitive imports and package initializers. Shared files
+  are listed by every consuming module. Update these lists when changing imports
+  or resource loading, and remove files that are no longer used. Store module
+  settings under the selected class name in custom_configs and controller
+  settings under custom_configs.agent.
+  Preserve interfaces and use registered runtime_evidence adapters with literal profile_id values.
+- The generic segment builder invokes `video_structuring.addStructure` with
+  `start_sec`, `end_sec`, `multimodal_narration` (raw VLM text or JSON), and
+  available `asr_text`, `asr_status`, `media_assets`, `builder_request`, `source`.
   The neutral `VideoStructuringBase.addStructure` canonicalizes it into
   `canonical_evidence` and `retrieval_document`. If you override addStructure,
   preserve the original `multimodal_narration` and call the base persistence
   path; never erase it by writing empty description/entity/action/text fields.
   Localization must report unavailable for an empty canonical record rather
   than return an `ok` candidate card.
+- A custom `buildStructure(env)` hook may replace the generic build using registered
+  scoped-media adapters. It must persist canonical time-bounded records or media
+  references; `addStructure` itself remains a persistence/indexing operation.
 - Implement and preserve parseable handoff fields required by the affected boundary contracts.
 - The five-module protocol is mandatory: structure records are time-bounded
   canonical evidence/media refs; localization emits a `localization_result`
   that may contain direct structure records or `perception_requests`;
   perception emits a `perception_result`; memory retains raw request/result
   events; thinking reads `get_runtime_context()` and returns an act plan or a
-  finish answer. These envelopes are neutral interfaces, not an edit whitelist.
+  finish answer.
 - Do not hard-code task/video identifiers, questions, answers, time windows, transcript phrases,
   or dataset-specific branches.
-- At the end, add a Python class attribute `CODEX_BUNDLE_CHANGE_REASON` to every changed class.
-  The harness derives the actual changed module set from the source diff; do not claim changes to
-  untouched files.
-- The emitted candidate is dynamically extracted. Keep every dependency of a changed concrete
-  class within that class, its inherited base chain, imports, or module constants explicitly
-  included by the extraction rule in `runtime_integration_witness`; do not rely on arbitrary
-  top-level helper functions, an unselected class, or hidden workspace state.
+- Record the behavioral change, checks, unresolved questions and next task in
+  `implementation.md`. The complete module files and agent-owned resources are
+  retained, including helpers and original prompts; do not rely on files outside
+  this candidate's source tree. Declare required packages in agent.json.dependencies.
 """
 
 
-
 def bundle_smoke_failure_contract(smoke: dict, bundle: dict) -> dict:
-    """Compile a task-free, machine-derived repair contract from real smoke.
-
-    The real smoke may contain a training question in stdout.  That data is
-    deliberately *not* forwarded to ordinary smoke repair.  The contract only
-    carries interface, producer/consumer and capability-event facts that Codex
-    can falsify by making the same generic smoke pass.
-    """
+    """Summarize failed interfaces, handoffs and capability events for repair."""
     smoke = smoke if isinstance(smoke, dict) else {}
     bundle = bundle if isinstance(bundle, dict) else {}
     handoff_checks = []
@@ -2745,7 +2247,7 @@ def bundle_smoke_failure_contract(smoke: dict, bundle: dict) -> dict:
             "status": str(item.get("status") or ""),
             "profile_id": str(item.get("profile_id") or ""),
             "producer_module": str(item.get("producer_module") or ""),
-            "consumer_module": str(item.get("consumer_module") or ""),
+            "consumer": str(item.get("consumer") or ""),
         })
     error = str(smoke.get("error") or "")
     assembly_preflight = dict(smoke.get("assembly_preflight") or {})
@@ -2753,11 +2255,7 @@ def bundle_smoke_failure_contract(smoke: dict, bundle: dict) -> dict:
     matched = re.search(r"(?:^|[\n: ])([A-Z][A-Za-z_]*(?:Error|Exception))(?:[: ]|$)", error)
     if matched:
         error_class = matched.group(1)
-    # A missing runtime tool is the earliest actionable divergence for a
-    # generated agent.  Merely reporting downstream absent handoff fields
-    # makes Codex repeatedly patch envelopes that can never be produced.  The
-    # no-label engineering trace is authoritative; compile its first failed
-    # dispatch into a compact, task-free fact for the repair prompt.
+    # Report the first failed dispatch before its downstream handoff symptoms.
     first_runtime_divergence = {}
     trace = smoke.get("engineering_execution_trace") or {}
     trajectory = trace.get("trajectory") if isinstance(trace, dict) else []
@@ -2774,9 +2272,7 @@ def bundle_smoke_failure_contract(smoke: dict, bundle: dict) -> dict:
                 "requested_tool": str(item.get("action") or ""),
                 "execution_status": status,
                 "error_code": error_code,
-                # The executor emits deterministic tool-contract messages;
-                # retain only this bounded engineering fact, never a model
-                # observation or candidate answer.
+                # Keep the dispatch observation available alongside the full trace.
                 "dispatch_message": str(item.get("observation") or "")[:500],
             }
             break
@@ -2812,7 +2308,7 @@ def bundle_smoke_failure_contract(smoke: dict, bundle: dict) -> dict:
         "falsifiable_success": [
             "The same real single-question smoke completes without candidate-contract errors.",
             "Every handoff that is actually triggered has a parseable producer result with its required fields and a later consumer or valid consumption event.",
-            "Only declared runtime profiles are used when their conditional capability is triggered.",
+            "Every triggered capability uses a profile registered for it in the configured inventory and a bounded runtime adapter.",
         ],
     }
 
@@ -2848,7 +2344,7 @@ def _write_bundle_engineering_trace(run_dir: str, attempt: int, smoke: dict) -> 
     return path
 
 
-def _persist_bundle_smoke_attempt(run_dir: str, attempt: int, bundle: dict,
+def _persist_bundle_smoke_attempt(attempt_dir: str, attempt: int, bundle: dict,
                                   smoke: dict, failure_contract: dict | None = None) -> dict:
     """Persist one immutable smoke attempt before a later repair can overwrite it.
 
@@ -2857,7 +2353,6 @@ def _persist_bundle_smoke_attempt(run_dir: str, attempt: int, bundle: dict,
     and by the next evolution round; retaining only the final in-memory
     ``smoke`` object destroys the evidence that justified earlier repairs.
     """
-    attempt_dir = os.path.join(run_dir, "bundle_smoke_attempts", f"attempt_{int(attempt)}")
     os.makedirs(attempt_dir, exist_ok=True)
     bundle_path = os.path.join(attempt_dir, "candidate_bundle_before_smoke.json")
     result_path = os.path.join(attempt_dir, "smoke_result.json")
@@ -2890,247 +2385,201 @@ def _persist_bundle_smoke_attempt(run_dir: str, attempt: int, bundle: dict,
     }
 
 
-def build_bundle_smoke_repair_prompt(contract: dict, edit_files: list[str],
-                                     execution_trace_path: str = "",
-                                     candidate_bundle_path: str = "",
-                                     repair_history: list[dict] | None = None,
-                                     codegen_context: dict | None = None) -> str:
+def build_bundle_smoke_repair_prompt(codegen_context: dict) -> str:
     """Repair prompt for a real-runtime failure using no-label raw execution."""
-    artifact_ids = {
-        str(item.get("artifact_id") or "")
-        for item in (codegen_context or {}).get("artifacts") or []
-        if isinstance(item, dict)
-    }
-    has_embedded_smoke_evidence = bool(
-        {"smoke_failure_boundary", "smoke_runtime_output"} <= artifact_ids
-    )
-    trace_instruction = (
-        "\nThe complete deterministic no-label engineering execution trace is embedded below. "
-        "Use it to locate the broken implementation/dataflow boundary; do not infer or optimize an answer.\n"
-        if has_embedded_smoke_evidence and execution_trace_path else
-        "\nBefore editing, read the complete deterministic engineering execution trace at "
-        f"`{execution_trace_path}`. It preserves every runtime step, handoff and capability event, "
-        "but deliberately removes gold labels, candidate final answers, correctness and scores. "
-        "Use it to locate the broken implementation/dataflow boundary; do not infer or optimize an answer.\n"
-        if execution_trace_path else
-        "\nNo complete runtime trace was available because smoke failed before an Agent trajectory existed. "
-        "Use the task-free contract below to repair the pre-trajectory engineering failure.\n"
-    )
-    bundle_instruction = (
-        "\nThe complete failed candidate bundle is embedded below. Its `combo` is the actual "
-        "five-class runtime selection, not a suggestion. A `*Base`/support class "
-        "must never replace a selected combo slot. If you modify shared support "
-        "code, preserve and, where necessary, modify the selected concrete strategy "
-        "class in the same editable source so the bundle can serialize and inject it.\n"
-        if has_embedded_smoke_evidence else
-        "\nRead the complete current candidate bundle at "
-        f"`{candidate_bundle_path}` before editing. Its `combo` is the actual "
-        "five-class runtime selection, not a suggestion. A `*Base`/support class "
-        "must never replace a selected combo slot. If you modify shared support "
-        "code, preserve and, where necessary, modify the selected concrete strategy "
-        "class in the same editable source so the bundle can serialize and inject it.\n"
-        if candidate_bundle_path else ""
-    )
-    history_instruction = ""
-    if repair_history:
-        history_instruction = (
-            "\nEarlier repair attempts in this same candidate lineage are listed below. "
-            "If a failure signature repeats, do not apply another generic envelope-only "
-            "patch: repair the earliest unchanged runtime boundary.\n"
-            + json.dumps(repair_history, ensure_ascii=False, indent=2) + "\n"
-        )
-    rendered_context = _render_bundle_codegen_context(codegen_context or {})
-    context_instruction = (
-        "\nThe complete annotated code-writing context is embedded below. "
-        "Read `current_bundle` and `runtime_integration_witness` before editing; "
-        "they are authoritative for the failed candidate's selected classes, injected runtime source, "
-        "tool names, and call signatures.\n\n"
-        "## Embedded Bundle Codegen Context\n"
-        f"{rendered_context}\n"
-        if rendered_context else ""
-    )
+    rendered_context = _render_bundle_codegen_context(codegen_context)
     return f"""You are repairing a generated five-module MetaVideoAgent bundle after a
-real single-question smoke failed its engineering contract. The source files
-currently contain the failed candidate. This is an engineering repair, not a
-small-sample accuracy judgment.
+real single-question smoke failed its engineering contract. Repair executable
+behavior and evidence flow; this stage does not judge answer accuracy.
 
-Edit only these bundle source files:
-{json.dumps(edit_files, ensure_ascii=False, indent=2)}
+Current module entrypoint files:
+{json.dumps(codegen_context.get('edit_files') or [], ensure_ascii=False, indent=2)}
 
-Machine-derived failure contract:
-{json.dumps(contract, ensure_ascii=False, indent=2)}
-{trace_instruction}{bundle_instruction}{history_instruction}{context_instruction}
+Read `current_bundle`, `runtime_integration_witness` and the ABI references. The
+bundle records the tested five-class selection; the working files and
+`agent.json` contain the editable draft. Continue from those files and earlier
+findings, preserving unaffected behavior and intentional file removals.
 
-Repair the producer→consumer/runtime dataflow, not answer accuracy. Keep the
-complete five-module bundle and use only registered runtime_evidence adapters
-with literal profile IDs. Do not alter orchestration, datasets, artifacts,
-profiles, raw media, or JSON/JSONL files. Do not hard-code task-specific data.
-Add/update CODEX_BUNDLE_CHANGE_REASON on every class you change.
+Use `smoke_failure_boundary` and the complete execution evidence to locate the
+earliest producer→consumer break: the actual output fields, later consumption,
+tool calls and control flow. If execution stopped before a trajectory existed,
+use the supplied assembly errors and runtime output. Repeated failures call for
+repairing the unchanged cause, not adding another output envelope.
+
+## Embedded Repair Context
+{rendered_context}
+
+Edit implementation, helpers, prompts and source-owned configuration under
+`agent/`, its `agent.json` manifest and `implementation.md`. JSON configuration
+resources are allowed. Leave orchestration, evaluators, datasets, prior-stage
+execution artifacts, capability profiles and raw media unchanged.
+
+Keep five concrete strategy entrypoints, updating `agent.json` if an entrypoint
+changes. Shared helpers must remain reachable from the selected classes; declare
+each resource's consuming modules in their `resources` lists. Use package-relative
+imports for bundled helpers and registered runtime_evidence adapters with literal
+profile IDs for bounded media/model operations. Preserve active media windows.
+
+Implement general behavior, without task-specific questions, answers, video IDs
+or time ranges. Record the causal finding, behavioral repair, expected downstream
+effect, next checks and unresolved assumptions in `implementation.md`.
 """
 
 
-def _parent_bundle_inheritance_issues(bundle: dict, parent_bundle: dict) -> list[str]:
-    """Ensure a feedback child cannot lose untouched parent candidate code."""
-    if not parent_bundle:
-        return []
-    issues = []
-    child_modules = bundle.get("modules") or {}
-    parent_modules = parent_bundle.get("modules") or {}
-    changed = set(bundle.get("changed_modules") or [])
-    for module in BUNDLE_MODULE_TYPES:
-        if module in changed:
-            continue
-        child = child_modules.get(module) if isinstance(child_modules, dict) else {}
-        parent = parent_modules.get(module) if isinstance(parent_modules, dict) else {}
-        for field in ("name", "source_file", "code"):
-            if str((child or {}).get(field) or "") != str((parent or {}).get(field) or ""):
-                issues.append(
-                    f"feedback child did not retain parent {module}.{field}; untouched module code must be byte-identical"
-                )
-                break
-    return issues
-
-
-def extract_candidate_bundle(*, edit_files: list[str], originals: dict,
-                             diagnosis_report: dict,
+def extract_candidate_bundle(*, diagnosis_report: dict, source_dir: str,
                              retained_base_bundle: dict | None = None,
                              active_bundle: dict | None = None) -> dict:
-    """Extract every changed concrete strategy into one atomic candidate artifact.
+    """Collect the draft and distinguish final changes from per-attempt edits.
 
-    A source diff may legitimately touch a shared ``*Base`` helper.  That is
-    not a request to replace a combo slot with the helper itself.  When a
-    repair changes only such support code, the already-selected concrete class
-    remains the active slot and is re-serialized from the current source.
+    Current best defines the candidate's impact; the preceding candidate only
+    describes what the latest authoring or repair attempt edited.
     """
-    changed_records: dict[str, dict] = {}
-    active_records = _bundle_module_records(active_bundle or {})
-    for module_type in BUNDLE_MODULE_TYPES:
-        paths = MODULE_SOURCE_FILES.get(module_type, []) or []
-        for rel_path in paths:
-            if rel_path not in edit_files:
-                continue
-            path = _abs(rel_path)
-            original = originals.get(rel_path, "")
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    current = handle.read()
-            except OSError:
-                continue
-            if current == original:
-                continue
-            selected, candidates = _selected_concrete_change(path, original)
-            if selected is None:
-                # A support-only edit is representable only if this run already
-                # has an explicit concrete strategy for the same slot.  Never
-                # let the historical "largest changed class" heuristic turn a
-                # base/helper into a runtime combo choice.
-                active = active_records.get(module_type) or {}
-                active_name = str(active.get("name") or "")
-                if not active_name or active_name.endswith("Base"):
-                    changed_names = [item["name"] for item in candidates]
-                    raise RuntimeError(
-                        "candidate extraction found only infrastructure changes for "
-                        f"{module_type}: {changed_names}; add or modify an explicit concrete "
-                        "runtime strategy class instead of selecting a *Base helper"
-                    )
-                current_code = get_full_module_code(path, active_name)
-                if not current_code:
-                    # The active class can be in an immutable external source
-                    # file.  A base-only change cannot be safely injected into
-                    # it without a complete source closure, so fail closed and
-                    # give the repair loop an actionable engineering fact.
-                    raise RuntimeError(
-                        "candidate extraction cannot serialize the active concrete "
-                        f"{module_type} class {active_name!r} after a support-only edit; "
-                        "modify the concrete strategy in the editable source file"
-                    )
-                selected = {"name": active_name, "code": current_code,
-                            "is_new": False, "delta_lines": 0,
-                            "is_infrastructure": False}
-            class_name = str(selected["name"])
-            class_code = str(selected["code"])
-            changed_records[module_type] = {
-                "name": class_name,
-                "module_type": module_type,
-                "source_file": rel_path,
-                "code": get_full_module_code(path, class_name) or class_code,
-                "class_role": "concrete_strategy",
-                "evolution_mode": "generate_bundle_code:codex",
-            }
-            break
-    if not changed_records:
-        return {}
-    # A probe-feedback iteration is an edit of the *previous candidate*, not
-    # an unrelated fresh edit of current best.  Reconstituting retained slots
-    # from current best here silently discarded earlier coupled changes when
-    # Codex touched only one file on the next iteration.
-    reference_path = _abs(str(diagnosis_report.get("reference_bundle_path") or ""))
-    reference_bundle = (
-        dict(retained_base_bundle)
-        if isinstance(retained_base_bundle, dict) and retained_base_bundle
-        else (_load_json_optional(reference_path) if reference_path else {})
-    )
-    reference_records = _bundle_module_records(reference_bundle)
-    missing_reference = [module for module in BUNDLE_MODULE_TYPES if module not in reference_records]
-    if missing_reference:
+    root = source_dir
+    reference_path = str(diagnosis_report.get("reference_bundle_path") or "")
+    previous_bundle = retained_base_bundle or active_bundle or {}
+    reference = (_load_json_required(reference_path, "current-best bundle")
+                 if reference_path else active_bundle or previous_bundle)
+    previous_bundle = previous_bundle or reference
+    reference_records = _bundle_module_records(reference)
+    records = _bundle_module_records(previous_bundle)
+    if set(records) != set(BUNDLE_MODULE_TYPES) or set(reference_records) != set(BUNDLE_MODULE_TYPES):
+        raise RuntimeError("Candidate authoring requires a complete five-module source bundle.")
+    manifest = collect_agent_source(root)
+    modules = {}
+    for module in BUNDLE_MODULE_TYPES:
+        entrypoint = manifest["modules"][module]
+        relative, code = entrypoint["source_file"], entrypoint["code"]
+        previous = records[module]
+        record = {**previous, **entrypoint}
+        try:
+            compile(code, relative, "exec")
+        except SyntaxError as exc:
+            raise RuntimeError(f"Candidate source cannot compile: {relative}: {exc}") from exc
+        modules[module] = record
+    support = manifest["support_files"]
+    configs = manifest.get("custom_configs", {})
+    dependencies = manifest.get("dependencies", [])
+    if not isinstance(configs, dict) or not isinstance(dependencies, list):
+        raise RuntimeError("agent.json requires custom_configs as an object and dependencies as a list.")
+    candidate_inputs = {"modules": modules, "support_files": support, "custom_configs": configs}
+    previous_support = previous_bundle.get("support_files") or {}
+    changed_support = {path for path in set(previous_support) | set(support)
+                       if previous_support.get(path) != support.get(path)}
+    owned = {path for record in list(records.values()) + list(modules.values())
+             for path in record.get("resources") or []}
+    unassigned = sorted(changed_support - owned)
+    if unassigned:
         raise RuntimeError(
-            "candidate extraction requires a self-contained current-best reference bundle; "
-            f"missing modules={missing_reference}, reference_bundle={reference_path!r}"
+            f"Declare the consuming modules for changed resources in agent.json resources: {unassigned}"
         )
-    # Keep the exact code for retained slots in the candidate artifact; the
-    # changed records then replace only their corresponding reference slots.
-    modules = reference_records
-    modules.update(changed_records)
-    base_combo = dict(reference_bundle.get("combo") or diagnosis_report.get("reference_combo") or {})
-    # Diagnosis and runtime use the same canonical module vocabulary.
-    combo = {
-        "video_structuring": base_combo.get("video_structuring") or "",
-        "localization": base_combo.get("localization") or "",
-        "perception": base_combo.get("perception") or "",
-        "memory": base_combo.get("memory") or "",
-        "thinking": base_combo.get("thinking") or "",
-    }
-    for module, record in changed_records.items():
-        combo[BUNDLE_COMBO_SLOT[module]] = record["name"]
+
+    def changes_from(bundle: dict, module_records: dict) -> list[str]:
+        return [module for module in BUNDLE_MODULE_TYPES if (
+            any(modules[module][key] != module_records[module][key]
+                for key in ("code", "name", "source_file"))
+            or module_resource_inputs(candidate_inputs, module) != module_resource_inputs(bundle, module)
+        )]
+
+    edited = changes_from(previous_bundle, records)
+    changed = changes_from(reference, reference_records)
+    if not changed:
+        return {}
+    notes_path = os.path.join(root, "implementation.md")
+    notes = ""
+    if os.path.isfile(notes_path):
+        with open(notes_path, encoding="utf-8") as handle:
+            notes = handle.read()
     task = diagnosis_report.get("implementation_task") or {}
+    rationale = {module: value for module, value in (previous_bundle.get("change_rationale") or {}).items()
+                 if module in changed}
+    rationale.update({module: {"analysis": notes or "Implementation updated from the current diagnosis and runtime evidence."}
+                      for module in changed if module in edited or module not in rationale})
     bundle = make_candidate_bundle(
-        combo=combo,
-        modules=modules,
-        changed_modules=list(changed_records),
+        combo={module: modules[module]["name"] for module in BUNDLE_MODULE_TYPES},
+        modules=modules, changed_modules=changed,
         handoff_contracts=list(task.get("handoff_contracts") or []),
-        rationale={
-            module: "Codex changed this module in response to the evolution brief or probe feedback."
-            for module in changed_records
-        },
+        rationale=rationale,
         implementation_spec={
             "contract_mode": "adaptive_bundle",
             "target_modules": list((diagnosis_report.get("execution_policy") or {}).get("target_modules") or []),
             "handoff_contracts": list(task.get("handoff_contracts") or []),
-            "runtime_capabilities": list(task.get("runtime_capabilities") or []),
+            "runtime_capabilities": candidate_runtime_capabilities(diagnosis_report),
             "module_responsibilities": dict(task.get("module_responsibilities") or {}),
             "module_protocol_version": "metavideoagent_module_protocol",
         },
     )
-    if retained_base_bundle:
-        bundle["parent_bundle_fingerprint"] = str(
-            retained_base_bundle.get("bundle_fingerprint") or bundle_fingerprint(retained_base_bundle)
-        )
+    bundle.update({
+        "support_files": support, "custom_configs": configs, "dependencies": dependencies,
+        "implementation_notes": notes, "edited_modules_this_attempt": edited,
+    })
     return bundle
 
 
-def pre_validate_candidate_bundle(bundle: dict, *, workspace_dir: str = "") -> dict:
+def pre_validate_candidate_bundle(bundle: dict) -> dict:
     """Validate only the serializable adaptive-bundle manifest.
 
-    Candidate code is never accepted or rejected here.  The subsequent
-    task-free/runtime smoke performs real dynamic injection and execution.
+    Runtime smoke subsequently injects and executes the assembled candidate.
     """
     issues = validate_candidate_bundle(bundle)
     return {
         "passed": not issues,
-        "validation_mode": "bundle_assembly_only_no_source_introspection",
+        "validation_mode": "bundle_assembly",
         "error": "; ".join(issues),
         "issues": issues,
     }
+
+
+def _collect_authored_candidate(*, result: dict, source_dir: str, prompt: str,
+                                 run_dir: str, edit_files: list[str],
+                                 diagnosis_report: dict, active_bundle: dict,
+                                 retained_base_bundle: dict | None, repair_budget: int,
+                                 args, attempt_tag: str, stage_run_artifacts: bool = False,
+                                 writable_artifact_paths: list[str] | None = None) -> dict:
+    """Repair source/manifest errors in-place within the current authoring task."""
+    repairs = []
+    error = ""
+    bundle = {}
+    while result.get("ok"):
+        try:
+            bundle = extract_candidate_bundle(
+                diagnosis_report=diagnosis_report,
+                active_bundle=active_bundle, retained_base_bundle=retained_base_bundle,
+                source_dir=source_dir,
+            )
+            error = "" if bundle else "Authoring produced no module, resource or configuration changes."
+            break
+        except RuntimeError as exc:
+            error = str(exc)
+        failure = {"stage": "source_assembly", "error": error, "source_dir": source_dir,
+                   "next_task": "Repair this draft's explicit entrypoints, source and resource declarations."}
+        write_json(os.path.join(run_dir, "assembly_failure.json"), failure)
+        if len(repairs) >= repair_budget:
+            break
+        prefix = os.path.join(run_dir, "authoring_attempts", f"{attempt_tag}_assembly_repair_{len(repairs) + 1}")
+        repair_prompt = prompt + (
+            "\n\n## Current authoring task: source assembly repair\n"
+            "The workspace contains the exact draft that just failed collection, including its agent.json. "
+            "Continue from that draft. The embedded earlier bundle is comparison context, not replacement source. "
+            "Keep the current evolution direction and repair the reported integration problem; "
+            "write the actual selected source files and their consuming modules' resource lists. "
+            "Do not replace missing source with a previous implementation.\n"
+            + json.dumps(failure, indent=2) + "\n"
+        )
+        write_text(prefix + "_prompt.txt", repair_prompt)
+        result = _run_bundle_codex(
+            repair_prompt, run_dir=run_dir, edit_files=edit_files,
+            source_input_dir=source_dir, source_output_dir=source_dir,
+            codex_cli=resolve_coding_agent_executable(args.codex_cli), timeout=args.timeout,
+            settings=args.codex_runtime_settings,
+            stage_run_artifacts=stage_run_artifacts,
+            writable_artifact_paths=writable_artifact_paths,
+        )
+        write_text(prefix + "_stdout.txt", result.get("stdout", ""))
+        write_text(prefix + "_stderr.txt", result.get("stderr", ""))
+        repairs.append({"input_failure": failure, "codex": result})
+        source_dir = result["source_dir"]
+    return {"bundle": bundle, "error": "" if bundle else error, "result": result,
+            "source_dir": source_dir, "repairs": repairs}
 
 
 def run_bundle_sandbox_verification(diagnosis_report: dict, workspace_dir: str,
@@ -3145,24 +2594,9 @@ def run_bundle_sandbox_verification(diagnosis_report: dict, workspace_dir: str,
         sandbox_dir=sandbox_dir,
     )
     agent.evolved_bundle = bundle
-    agent._strategies_tried = [{"strategy": "generate_bundle_code:codex", "success": True,
-                                "module_name": bundle.get("bundle_fingerprint", "")}]
-    # Bundle evolution owns every source mutation through its explicit
-    # assembly, smoke, and probe loops. In-process API repair is disabled
-    # because it would edit shared runtime
-    # files for a provider/environment failure and invalidate candidate lineage.
-    old_disable_repair = os.environ.get("SANDBOX_DISABLE_INTERNAL_ENGINEERING_REPAIR")
-    os.environ["SANDBOX_DISABLE_INTERNAL_ENGINEERING_REPAIR"] = "1"
-    try:
-        agent._step4_verify()
-    finally:
-        if old_disable_repair is None:
-            os.environ.pop("SANDBOX_DISABLE_INTERNAL_ENGINEERING_REPAIR", None)
-        else:
-            os.environ["SANDBOX_DISABLE_INTERNAL_ENGINEERING_REPAIR"] = old_disable_repair
+    agent._step4_verify()
     verification = dict(agent.verification_report or {})
-    verification["candidate_bundle"] = bundle_fingerprint(bundle)
-    verification["changed_modules"] = changed
+    verification["changed_modules"] = list(bundle.get("changed_modules") or [])
     verification["handoff_contracts"] = bundle.get("handoff_contracts") or []
     verification["implementation_spec"] = dict(bundle.get("implementation_spec") or {})
     return {
@@ -3197,7 +2631,7 @@ def _reference_bundle_for_probe_replay(diagnosis_report: dict) -> dict:
     handoffs = list((diagnosis_report.get("implementation_task") or {}).get("handoff_contracts") or [])
     if not handoffs:
         handoffs = list(raw.get("handoff_contracts") or [])
-    return make_candidate_bundle(
+    bundle = make_candidate_bundle(
         combo=combo, modules=modules, changed_modules=list(BUNDLE_MODULE_TYPES),
         handoff_contracts=handoffs,
         rationale={item: "Current-best fixed-batch reference replay." for item in BUNDLE_MODULE_TYPES},
@@ -3205,11 +2639,15 @@ def _reference_bundle_for_probe_replay(diagnosis_report: dict) -> dict:
             "contract_mode": "adaptive_bundle",
             "target_modules": list(BUNDLE_MODULE_TYPES),
             "handoff_contracts": handoffs,
-            "runtime_capabilities": list((diagnosis_report.get("implementation_task") or {}).get("runtime_capabilities") or []),
+            "runtime_capabilities": candidate_runtime_capabilities(diagnosis_report),
             "module_responsibilities": dict((diagnosis_report.get("implementation_task") or {}).get("module_responsibilities") or {}),
             "module_protocol_version": "metavideoagent_module_protocol",
         },
     )
+    for key in ("support_files", "custom_configs", "dependencies", "implementation_notes"):
+        if key in raw:
+            bundle[key] = copy.deepcopy(raw[key])
+    return bundle
 
 
 def _write_replay_jsonl(path: str, rows: list[dict]) -> str:
@@ -3220,18 +2658,22 @@ def _write_replay_jsonl(path: str, rows: list[dict]) -> str:
     return _abs(path)
 
 
+def _invalidate_probe_comparison(comparison: dict) -> None:
+    """An unavailable comparison provides no measured gain or regression."""
+    comparison.update(
+        comparison_valid=False, is_effective=False, accuracy_delta=None, accuracy_delta_vs_reference=None,
+        steps_delta=None, steps_delta_vs_reference=None,
+        corrections=[], regressions=[], efficiency_gains=[], unchanged_correct=[], unchanged_incorrect=[],
+        delta_metrics={"accuracy_delta": None, "steps_delta": None, "corrections": 0, "regressions": 0},
+    )
+
+
 def apply_live_probe_comparison(verification: dict, candidate_rows: list[dict],
                                 reference_rows: list[dict], *,
                                 candidate_replay_path: str,
-                                reference_replay_path: str) -> dict:
-    """Replace historical probe deltas with the current fixed-batch replay.
-
-    Probe selection can consult an old full-eval report, but candidate promotion
-    must compare two executions made now under the same bounded task batch.
-    Keeping this transformation in one helper prevents a later caller from
-    accidentally gating on the historical fields after it has generated a
-    fresh reference replay.
-    """
+                                reference_replay_path: str,
+                                reference_verification: dict | None = None) -> dict:
+    """Compare the candidate and current best on the same fixed probe batch."""
     from sandbox_evaluator import build_reference_lookup, compare_with_reference
 
     live_comparison = compare_with_reference(
@@ -3240,21 +2682,33 @@ def apply_live_probe_comparison(verification: dict, candidate_rows: list[dict],
         reference_label="current_best_probe_replay",
         reference_source=reference_replay_path,
     )
-    historical_metrics = {
-        key: verification.get(key)
-        for key in (
-            "reference_correct", "candidate_correct", "accuracy_delta",
-            "corrections", "regressions", "comparison_valid",
+    reference_execution = reference_verification or {}
+    reference_failed = bool(
+        reference_execution.get("engineering_invalid")
+        or reference_execution.get("execution_layer_rerun_required")
+        or reference_execution.get("evaluation_complete") is False
+        or any(row.get("error") or any(
+            event.get("status") in {"api_error", "asset_error"}
+            for event in _capability_events(row)
+        ) for row in reference_rows)
+    )
+    if reference_failed:
+        verification.update(
+            engineering_invalid=True, execution_layer_rerun_required=True,
+            engineering_invalid_reason="Current-best probe execution failed; rerun the paired probe after resolving its execution failure.",
         )
-    }
+    if (verification.get("engineering_invalid")
+            or verification.get("execution_layer_rerun_required")
+            or verification.get("evaluation_complete") is False):
+        _invalidate_probe_comparison(live_comparison)
     for key in (
         "total_questions", "reference_correct", "candidate_correct",
-        "reference_correct", "reference_accuracy", "reference_total_steps",
-        "reference_coverage", "candidate_correct", "candidate_accuracy",
+        "reference_accuracy", "reference_total_steps",
+        "reference_coverage", "candidate_accuracy",
         "candidate_total_steps", "accuracy_delta", "accuracy_delta_vs_reference",
         "steps_delta", "steps_delta_vs_reference", "corrections", "regressions",
         "efficiency_gains", "unchanged_correct", "unchanged_incorrect",
-        "comparison_valid", "missing_reference", "missing_reference",
+        "comparison_valid", "is_effective", "missing_reference",
         "reference_metrics", "candidate_metrics", "delta_metrics",
     ):
         if key in live_comparison:
@@ -3265,92 +2719,35 @@ def apply_live_probe_comparison(verification: dict, candidate_rows: list[dict],
         "candidate_replay_path": candidate_replay_path,
         "reference_replay_path": reference_replay_path,
         "metrics": live_comparison,
-        "historical_metrics_retained_for_audit": historical_metrics,
     }
     return live_comparison
 
 
 def _bundle_feedback_rounds(parent_dir: str) -> int:
-    """Count bundle feedback ancestry without using a module/mechanism key."""
-    count, seen, current = 0, set(), _abs(parent_dir)
-    while current and current not in seen and os.path.isdir(current):
-        seen.add(current)
-        info = _load_json_optional(os.path.join(current, "probe_failed_input.json"))
-        if not isinstance(info, dict) or not info.get("probe_failed_run"):
-            break
-        count += 1
-        current = _abs(str(info.get("probe_failed_run") or ""))
-    return count
-
-
-def _bundle_engineering_feedback_rounds(parent_dir: str) -> int:
-    """Count resumptions of an exhausted assembly/runtime smoke candidate."""
-    count, seen, current = 0, set(), _abs(parent_dir)
-    while current and current not in seen and os.path.isdir(current):
-        seen.add(current)
-        info = _load_json_optional(os.path.join(current, "engineering_failed_input.json"))
-        if not isinstance(info, dict) or not info.get("engineering_failed_run"):
-            break
-        count += 1
-        current = _abs(str(info.get("engineering_failed_run") or ""))
-    return count
-
-
-def _source_tree_fingerprint(source_dir: str) -> str:
-    digest = hashlib.sha256()
-    root = _abs(source_dir)
-    if not root or not os.path.isdir(root):
-        return ""
-    for current, _dirs, files in os.walk(root):
-        for name in sorted(files):
-            path = os.path.join(current, name)
-            relative = os.path.relpath(path, root).replace(os.sep, "/")
-            digest.update(relative.encode("utf-8"))
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    return digest.hexdigest()
+    """Read the persisted continuation count, without walking old run trees."""
+    return int(_load_json_optional(os.path.join(parent_dir, "run_record.json")).get("feedback_round") or 0)
 
 
 def _bundle_feedback_lineage(parent_dir: str) -> list[dict]:
-    """Recover source/report/replay/route facts from immutable parent runs."""
-    lineage, seen, current = [], set(), _abs(parent_dir)
-    while current and current not in seen and os.path.isdir(current):
-        seen.add(current)
-        candidate = _load_json_optional(os.path.join(current, "candidate_bundle.json"))
-        validation = _load_json_optional(os.path.join(current, "validation.json"))
-        probe = _load_json_optional(os.path.join(current, "probe_verification.json"))
-        forensic = _load_json_optional(os.path.join(current, "probe_failed_input.json"))
-        engineering = _load_json_optional(os.path.join(current, "engineering_failed_input.json"))
-        lineage.append({
-            "candidate_run": current,
-            "bundle_fingerprint": str(candidate.get("bundle_fingerprint") or ""),
-            "source_after_fingerprint": _source_tree_fingerprint(os.path.join(current, "source_after")),
-            "probe_next_action": (validation.get("probe_next_action") or {}),
-            "forensic_report_path": str(((forensic.get("supervised_forensic_workspace") or {}).get("forensic_report_path") or "")),
-            "reference_probe_replay": probe.get("reference_probe_replay") or {},
-            "engineering_feedback": engineering,
-        })
-        parent = ""
-        if isinstance(forensic, dict):
-            parent = str(forensic.get("probe_failed_run") or "")
-        if not parent and isinstance(engineering, dict):
-            parent = str(engineering.get("engineering_failed_run") or "")
-        current = _abs(parent)
-    return list(reversed(lineage))
+    """Pass the preceding attempt's explicit findings to the next attempt."""
+    return list((_load_json_optional(os.path.join(parent_dir, "bundle_feedback_lineage.json"))).get("attempts") or [])
 
 
 def _write_bundle_lineage(run_dir: str, parent_dir: str = "") -> str:
     lineage = _bundle_feedback_lineage(parent_dir) if parent_dir else []
     candidate = _load_json_optional(os.path.join(run_dir, "candidate_bundle.json"))
     validation = _load_json_optional(os.path.join(run_dir, "validation.json"))
-    probe = _load_json_optional(os.path.join(run_dir, "probe_verification.json"))
+    probe = _load_probe_verification_from_run(run_dir)
+    forensic = _load_json_optional(os.path.join(run_dir, "probe_failed_input.json"))
+    notes_path = str(((forensic.get("supervised_forensic_workspace") or {}).get("forensic_report_path") or ""))
     lineage.append({
         "candidate_run": _abs(run_dir),
-        "bundle_fingerprint": str(candidate.get("bundle_fingerprint") or ""),
-        "source_after_fingerprint": _source_tree_fingerprint(os.path.join(run_dir, "source_after")),
+        "changed_modules": candidate.get("changed_modules", []),
+        "analysis": candidate.get("change_rationale", {}),
         "probe_next_action": validation.get("probe_next_action") or {},
-        "forensic_report_path": str((((_load_json_optional(os.path.join(run_dir, "probe_failed_input.json"))).get("supervised_forensic_workspace") or {}).get("forensic_report_path") or "")),
+        "forensic_report_path": notes_path,
+        "investigation": _load_json_optional(notes_path),
+        "engineering_feedback": _load_json_optional(os.path.join(run_dir, "engineering_failed_input.json")),
         "reference_probe_replay": probe.get("reference_probe_replay") or {},
     })
     path = os.path.join(run_dir, "bundle_feedback_lineage.json")
@@ -3358,7 +2755,7 @@ def _write_bundle_lineage(run_dir: str, parent_dir: str = "") -> str:
     return path
 
 
-def _latest_bundle_engineering_trace(parent_dir: str, validation: dict, report: dict) -> str:
+def _bundle_engineering_trace(validation: dict, report: dict) -> str:
     """Find the immutable no-label trace for an engineering-resume candidate."""
     candidates = [
         str((report or {}).get("bundle_smoke_full_execution_trace_path") or ""),
@@ -3366,8 +2763,8 @@ def _latest_bundle_engineering_trace(parent_dir: str, validation: dict, report: 
         str((report or {}).get("bundle_smoke_execution_trace_path") or ""),
         str((validation or {}).get("bundle_smoke_execution_trace_path") or ""),
     ]
-    candidates.extend(sorted(glob.glob(os.path.join(parent_dir, "bundle_smoke_attempts", "attempt_*", "smoke_full_execution_trace.json")), reverse=True))
-    candidates.extend(sorted(glob.glob(os.path.join(parent_dir, "bundle_smoke_execution_trace_attempt_*.json")), reverse=True))
+    for attempt in reversed((report or {}).get("bundle_smoke_attempts") or []):
+        candidates.extend(str(attempt.get(key) or "") for key in ("full_execution_trace_path", "execution_trace_path"))
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
             return _abs(candidate)
@@ -3375,23 +2772,11 @@ def _latest_bundle_engineering_trace(parent_dir: str, validation: dict, report: 
 
 
 def _hydrate_bundle_reference_context(diagnosis_report: dict, args: argparse.Namespace) -> dict:
-    """Attach execution-only current-best paths before adaptive bundle dispatch.
-
-    The adaptive bundle brief is intentionally model-clean, and ``main`` dispatches
-    it to the bundle path before its previous reference hydration block.  Bundle
-    smoke still needs the explicit current-best JSONL, bundle and report.
-    Hydrate a private runtime copy here; do not write these paths back into the
-    model-facing diagnosis artifact.
-    """
+    """Resolve current-best bundle, results and report for candidate execution."""
     report = dict(diagnosis_report or {})
-    # An adaptive diagnosis_for_codex artifact may carry an explicitly attested
-    # current-best bundle from an explicitly attested staged run. Command-line
-    # reports are supplemental hydration inputs only: their historical
-    # combo_policy can contain a relocated path that no longer exists and
-    # then fall back to an *initial* base bundle.  Never replace an existing
-    # validated diagnosis reference with that fallback.
-    attested_bundle_path = str(report.get("reference_bundle_path") or "")
-    attested_bundle_is_valid = _looks_like_initial_bundle(attested_bundle_path)
+    # Use the diagnosis reference when available; supplement it with CLI inputs.
+    diagnosis_bundle_path = str(report.get("reference_bundle_path") or "")
+    diagnosis_bundle_is_valid = _is_complete_agent_bundle(diagnosis_bundle_path)
     reference_results = str(getattr(args, "reference_results", "") or "")
     # Do not resolve an omitted optional path: ``_abs("")`` is the project
     # root, which is a directory and must never be treated as a JSON report.
@@ -3407,7 +2792,7 @@ def _hydrate_bundle_reference_context(diagnosis_report: dict, args: argparse.Nam
             report["reference_combo"] = combo
             report["reference_combo_policy"] = policy
         bundle_path = _reference_bundle_from_report(ref_report, reference_report_path)
-        if bundle_path and not attested_bundle_is_valid:
+        if bundle_path and not diagnosis_bundle_is_valid:
             report["reference_bundle_path"] = bundle_path
         report["reference_report_path"] = reference_report_path
     if reference_results:
@@ -3430,7 +2815,7 @@ def _hydrate_bundle_reference_context(diagnosis_report: dict, args: argparse.Nam
 
 def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                          workspace_dir: str) -> int:
-    """Current adaptive evolve path with atomic source snapshots and bundle artifacts."""
+    """Author and evaluate a candidate in its own run directory."""
     from diagnosis_execution_brief import validate_bundle_execution_brief
     issues = validate_bundle_execution_brief(diagnosis_report)
     if issues:
@@ -3445,31 +2830,22 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
     diagnosis_report = _hydrate_bundle_reference_context(diagnosis_report, args)
     diagnosis_report["_machine_evaluation_contract"] = machine_contract
     diagnosis_report["machine_evaluation_contract_path"] = contract_path
-    edit_files = _bundle_edit_files()
-    started = int(time.time())
-    history_dir = _history_dir(workspace_dir, args.output_root)
-    run_dir = os.path.join(history_dir, "codex_candidates", f"{started}_bundle_codex")
+    edit_files = []
+    iteration = IterationWorkspace(args.iteration_dir)
+    run_dir = os.path.abspath(args.candidate_dir)
     os.makedirs(run_dir, exist_ok=True)
-    # Keep bundle-mode records complete on every exit path.  The previous path
-    # already snapshots its diagnosis rollout; without this twin artifact a
-    # valid bundle smoke could be marked record-incomplete solely because it
-    # used the adaptive dispatcher.
+    # Retain the diagnosis conversation when the handoff includes it.
     rollout_path = _resolve_rollout_path(args.diagnosis, args.diagnosis_rollout)
     if rollout_path and os.path.isfile(rollout_path):
         shutil.copy2(rollout_path, os.path.join(run_dir, "diagnosis_rollout.json"))
-    else:
-        write_text(
-            os.path.join(run_dir, "diagnosis_rollout.json"),
-            json.dumps({"unused_reason": "diagnosis rollout not found"}, ensure_ascii=False, indent=2),
-        )
-    # The effective prompt cannot be constructed until the immutable reference
-    # (or failed parent) source has been materialized.  Otherwise later-round
-    # Codex sees only a diagnosis and not the concrete bundle it must evolve.
+    # Resolve the active reference (or failed parent) before constructing the
+    # prompt so Codex receives its full strategy source as well as diagnosis.
     prompt = ""
     report = {"status": "", "mode": "adaptive_bundle", "run_dir": run_dir,
               "changed_modules": [], "edit_files": edit_files,
               "codex_runtime_settings": args.codex_runtime_settings,
-              "authoring_engine": "codex"}
+              "authoring_engine": "codex", "iteration_dir": str(iteration.root),
+              "feedback_round": 0}
     if args.dry_run:
         # Dry-run remains a consumable planning artifact.  It must not mutate
         # runtime sources, but it should expose the same prompt shape whenever
@@ -3482,8 +2858,15 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             str(diagnosis_report.get("reference_bundle_path") or "")
         )
         dry_bundle = _load_json_optional(dry_bundle_path) if dry_bundle_path else {}
+        edit_files = list(dict.fromkeys(record["source_file"] for record in _bundle_module_records(dry_bundle).values()))
+        report["edit_files"] = edit_files
         dry_context = (
-            build_bundle_codegen_context(diagnosis_report, dry_bundle, edit_files)
+            build_bundle_codegen_context(
+                diagnosis_report, dry_bundle, edit_files,
+                bundle_role="working_candidate" if getattr(args, "probe_failed_run", "") else (
+                    "failed_smoke_candidate" if getattr(args, "engineering_failed_run", "") else "current_best"
+                ),
+            )
             if dry_bundle else {}
         )
         prompt = build_bundle_codex_prompt(diagnosis_report, edit_files, dry_context)
@@ -3494,43 +2877,47 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         report["status"] = "dry_run"
         report["dry_run_context_available"] = bool(dry_context)
         write_json(os.path.join(run_dir, "validation.json"), {})
-        write_json(os.path.join(run_dir, "sandbox_report.json"), {})
         finalize_run_record(run_dir, report)
         return 0
     # A bundle behavior iteration starts from the previous candidate source,
     # not from the mutable repository baseline.  Copy every raw sandbox JSONL
     # byte-for-byte and tell Codex to inspect the files directly; no audit
     # excerpt can replace the supervised train trajectories.
-    workspace_originals = _snapshot_files(edit_files)
     feedback_parent = {}
     engineering_feedback = {}
     parent_bundle: dict = {}
     active_source_bundle: dict = {}
     forensic_manifest: dict = {}
-    source_origin_manifest: dict = {}
     engineering_smoke_payload: dict = {}
+    engineering_parent = str(getattr(args, "engineering_failed_run", "") or "")
+    if engineering_parent and _load_probe_verification_from_run(engineering_parent):
+        # A probe engineering defect needs its probe traces, not an earlier
+        # successful smoke. Both CLI resume forms converge on that evidence.
+        args.probe_failed_run = engineering_parent
+        args.engineering_failed_run = ""
     if getattr(args, "engineering_failed_run", ""):
         parent_dir = _abs(args.engineering_failed_run)
         parent_bundle = _load_json_optional(os.path.join(parent_dir, "candidate_bundle.json"))
-        parent_after = os.path.join(parent_dir, "source_after")
+        parent_after = os.path.join(parent_dir, "agent_snapshot")
         parent_validation_payload = _load_json_optional(os.path.join(parent_dir, "validation.json"))
         parent_report = _load_json_optional(os.path.join(parent_dir, "run_record.json"))
         if not parent_bundle or not os.path.isdir(parent_after):
             raise RuntimeError(
-                "--engineering-failed-run requires candidate_bundle.json and source_after/; "
+                "--engineering-failed-run requires candidate_bundle.json and agent_snapshot/; "
                 "it is only for a persisted assembly/runtime smoke candidate"
             )
-        prior_rounds = _bundle_engineering_feedback_rounds(parent_dir)
-        budget = max(1, int(os.environ.get("BUNDLE_ENGINEERING_FEEDBACK_BUDGET", "2") or 2))
+        prior_rounds = _bundle_feedback_rounds(parent_dir)
+        report["feedback_round"] = prior_rounds + 1
+        budget = candidate_feedback_budget()
         if prior_rounds >= budget:
             raise RuntimeError(
-                "engineering feedback budget exhausted for this candidate lineage; "
-                "start a new outer diagnosis direction"
+                "Candidate feedback budget exhausted. Retain current best or "
+                "explicitly configure a larger continuation budget."
             )
         parent_validation = dict(parent_validation_payload.get("assembly_validation") or parent_validation_payload or {})
         parent_smoke = dict(parent_validation_payload.get("bundle_smoke") or parent_validation.get("bundle_smoke") or {})
         engineering_smoke_payload = parent_smoke
-        trace_path = _latest_bundle_engineering_trace(parent_dir, parent_validation_payload, parent_report)
+        trace_path = _bundle_engineering_trace(parent_validation_payload, parent_report)
         if parent_smoke:
             engineering_contract = bundle_smoke_failure_contract(parent_smoke, parent_bundle)
         else:
@@ -3539,16 +2926,9 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 "failure_kind": "candidate_contract",
                 "observed_contract_issues": [str(parent_validation.get("error") or "runtime smoke was not recorded")],
             }
-        _apply_source_snapshot(parent_after)
         active_source_bundle = parent_bundle
-        source_origin_manifest = {
-            "source_policy": "immutable_parent_candidate_snapshot",
-            "parent_run": parent_dir,
-            "snapshot": parent_after,
-        }
         engineering_feedback = {
             "engineering_failed_run": parent_dir,
-            "parent_bundle_fingerprint": parent_bundle.get("bundle_fingerprint", ""),
             "engineering_feedback_round": prior_rounds + 1,
             "engineering_feedback_budget": budget,
             "failure_contract": engineering_contract,
@@ -3559,27 +2939,25 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         if engineering_feedback:
             raise RuntimeError("do not mix --engineering-failed-run with --probe-failed-run")
         parent_dir = _abs(args.probe_failed_run)
-        budget = int(os.environ.get("BUNDLE_FEEDBACK_BUDGET", "2") or 2)
+        budget = candidate_feedback_budget()
         prior_rounds = _bundle_feedback_rounds(parent_dir)
-        requested_round = int(getattr(args, "probe_feedback_round", 0) or prior_rounds + 1)
-        # The CLI default is 1. After the first feedback hop it is treated as an
-        # omitted-value sentinel after the first hop; ancestry remains the
-        # source of truth and cannot be reset by changing module sets.
-        if requested_round == 1 and prior_rounds:
-            requested_round = prior_rounds + 1
-        if requested_round != prior_rounds + 1 or requested_round > budget:
+        report["feedback_round"] = prior_rounds + 1
+        requested_round = prior_rounds + 1
+        if requested_round > budget:
             raise RuntimeError(
                 "bundle feedback round is outside the immutable outer-direction budget: "
                 f"requested={requested_round}, expected={prior_rounds + 1}, budget={budget}"
             )
         parent_bundle = _load_json_optional(os.path.join(parent_dir, "candidate_bundle.json"))
-        parent_after = os.path.join(parent_dir, "source_after")
+        parent_after = os.path.join(parent_dir, "agent_snapshot")
         if not parent_bundle or not os.path.isdir(parent_after):
             raise RuntimeError(
-                "--probe-failed-run requires candidate_bundle.json and source_after/"
+                "--probe-failed-run requires candidate_bundle.json and agent_snapshot/"
             )
-        parent_verification = _load_json_optional(os.path.join(parent_dir, "probe_verification.json"))
-        parent_audit = _load_json_optional(os.path.join(parent_dir, "probe_audit.json"))
+        parent_verification = _load_probe_verification_from_run(parent_dir)
+        parent_audit = _load_json_optional(candidate_stage_paths(parent_dir, "probe").get("audit", ""))
+        probe_action = classify_probe_next_action(parent_verification, parent_audit)
+        probe_engineering_repair = probe_action.get("action") == "codex_engineering_repair"
         fixed_probe_task_ids = list(
             ((parent_verification.get("probe_plan") or {}).get("selected_refs") or [])
             if isinstance(parent_verification, dict) else []
@@ -3591,24 +2969,26 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 "refusing to rotate to a newly selected question batch"
             )
         replay_info = parent_verification.get("reference_probe_replay") if isinstance(parent_verification, dict) else {}
-        if not isinstance(replay_info, dict) or not replay_info.get("passed"):
+        if not probe_engineering_repair and (not isinstance(replay_info, dict) or not replay_info.get("passed")):
             raise RuntimeError(
                 "bundle probe feedback requires a completed same-batch candidate/reference replay; "
                 "rerun the exact candidate probe before supervised Codex feedback"
             )
-        for key in ("candidate_replay_path", "reference_replay_path"):
+        for key in (() if probe_engineering_repair else ("candidate_replay_path", "reference_replay_path")):
             if not os.path.isfile(str(replay_info.get(key) or "")):
                 raise RuntimeError(f"bundle probe feedback replay artifact missing: {key}")
         diagnosis_report["fixed_probe_task_ids"] = fixed_probe_task_ids
+        diagnosis_report["fixed_probe_plan"] = dict(parent_verification["probe_plan"])
         raw_source = str(parent_verification.get("sandbox_dir") or parent_audit.get("sandbox_dir") or "")
         raw_artifacts = _copy_complete_probe_trajectory_artifacts(raw_source, run_dir)
         feedback_path = os.path.join(run_dir, "bundle_probe_feedback.json")
         write_json(feedback_path, {
             "artifact_type": "bundle_probe_feedback",
             "schema_version": 1,
+            "origin_stage": "probe",
+            "next_action": probe_action,
             "feedback_mode": "automatic_codex_same_batch_replay",
             "previous_candidate": {
-                "bundle_fingerprint": parent_bundle.get("bundle_fingerprint", ""),
                 "changed_modules": parent_bundle.get("changed_modules") or [],
                 "handoff_contracts": parent_bundle.get("handoff_contracts") or [],
             },
@@ -3625,7 +3005,7 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 "reference_results_path": parent_verification.get("persisted_reference_minimal_results_path")
                 or parent_verification.get("persisted_reference_results_path", ""),
                 "selected_task_ids": fixed_probe_task_ids,
-                "reference_replay_not_required": False,
+                "reference_replay_not_required": probe_engineering_repair,
             },
         })
         parent_diff = os.path.join(parent_dir, "source_diff.patch")
@@ -3633,16 +3013,9 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         if os.path.isfile(parent_diff):
             copied_parent_diff = os.path.join(run_dir, "parent_source_diff.patch")
             shutil.copy2(parent_diff, copied_parent_diff)
-        _apply_source_snapshot(parent_after)
         active_source_bundle = parent_bundle
-        source_origin_manifest = {
-            "source_policy": "immutable_parent_candidate_snapshot",
-            "parent_run": parent_dir,
-            "snapshot": parent_after,
-        }
         feedback_parent = {
             "probe_failed_run": parent_dir,
-            "candidate_bundle_fingerprint": parent_bundle.get("bundle_fingerprint", ""),
             "changed_modules": parent_bundle.get("changed_modules") or [],
             "raw_training_trajectory_artifacts": raw_artifacts,
             "raw_trajectory_manifest": os.path.join(run_dir, "probe_training_trajectories_manifest.json"),
@@ -3658,28 +3031,48 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         reference_bundle_path = str(diagnosis_report.get("reference_bundle_path") or "")
         reference_bundle = _load_json_optional(reference_bundle_path) if reference_bundle_path else {}
         if not reference_bundle:
-            _restore_files(workspace_originals)
             raise RuntimeError(
                 "bundle codegen requires diagnosis.reference_bundle_path with a complete immutable current-best bundle"
             )
-        try:
-            source_origin_manifest = _materialize_bundle_source_workspace(reference_bundle, edit_files)
-        except Exception:
-            _restore_files(workspace_originals)
-            raise
-        source_origin_manifest["reference_bundle_path"] = _abs(reference_bundle_path)
-        source_origin_manifest["reference_bundle_fingerprint"] = str(
-            reference_bundle.get("bundle_fingerprint") or ""
-        )
         active_source_bundle = reference_bundle
-    write_json(os.path.join(run_dir, "source_origin_manifest.json"), source_origin_manifest)
-    originals = _snapshot_files(edit_files)
-    _copy_source_snapshot(edit_files, os.path.join(run_dir, "source_before"))
+    resume_bundle_path = str(getattr(args, "resume_bundle", "") or "")
+    resume_stage = str(getattr(args, "resume_stage", "") or "")
+    resume_bundle = _load_json_required(resume_bundle_path, "runtime continuation bundle") if resume_stage else {}
+    resume_parent = os.path.dirname(resume_bundle_path) if resume_stage else ""
+    if resume_parent:
+        report["feedback_round"] = _bundle_feedback_rounds(resume_parent)
+        previous_probe = _load_probe_verification_from_run(resume_parent)
+        previous_probe_paths = candidate_stage_paths(resume_parent, "probe")
+        previous_request = _load_json_optional(os.path.join(resume_parent, "request.json")).get("diagnosis") or {}
+        probe_plan = (
+            previous_probe.get("probe_plan")
+            or _load_json_optional(previous_probe_paths.get("plan", ""))
+            or previous_request.get("fixed_probe_plan")
+            or {"selected_refs": previous_request.get("fixed_probe_task_ids") or []}
+        )
+        if probe_plan.get("selected_refs"):
+            diagnosis_report["fixed_probe_task_ids"] = list(probe_plan["selected_refs"])
+            diagnosis_report["fixed_probe_plan"] = probe_plan
+    lineage_parent = str(feedback_parent.get("probe_failed_run") or engineering_feedback.get("engineering_failed_run") or resume_parent)
+    edit_files = list(dict.fromkeys(record["source_file"] for record in _bundle_module_records(active_source_bundle).values()))
+    report["edit_files"] = edit_files
+    originals = {}
+    for module, record in _bundle_module_records(active_source_bundle).items():
+        if record.get("code"):
+            originals[record["source_file"]] = str(record["code"])
+    if not (iteration.root / "agent.json").exists() and not (iteration.root / "agent").exists():
+        materialize_agent(resume_bundle or active_source_bundle, iteration.root)
+    iteration.bind_base(bundle=str(diagnosis_report.get("reference_bundle_path") or ""),
+                        report=str(diagnosis_report.get("reference_report_path") or ""),
+                        results=str(diagnosis_report.get("reference_results_path") or ""))
     if not active_source_bundle:
-        _restore_files(workspace_originals)
         raise RuntimeError("bundle codegen did not resolve an immutable active source bundle")
+    diagnosis_report.setdefault("iter_context", {})["stage_context"] = iteration.context("codegen")
     codegen_context = build_bundle_codegen_context(
         diagnosis_report, active_source_bundle, edit_files,
+        bundle_role="working_candidate" if feedback_parent else (
+            "failed_smoke_candidate" if engineering_feedback else "current_best"
+        ),
     )
     write_json(os.path.join(run_dir, "bundle_codegen_context.json"), codegen_context)
     if engineering_feedback:
@@ -3689,12 +3082,7 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             execution_trace_path=trace_path,
         )
         write_json(os.path.join(run_dir, "bundle_smoke_repair_context.json"), repair_context)
-        prompt = build_bundle_smoke_repair_prompt(
-            engineering_contract, edit_files,
-            execution_trace_path=trace_path,
-            candidate_bundle_path=os.path.join(parent_dir, "candidate_bundle.json"),
-            codegen_context=repair_context,
-        )
+        prompt = build_bundle_smoke_repair_prompt(repair_context)
     else:
         prompt = build_bundle_codex_prompt(diagnosis_report, edit_files, codegen_context)
     if feedback_parent:
@@ -3720,107 +3108,96 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         write_json(os.path.join(run_dir, "probe_failed_input.json"), feedback_parent)
         prompt += (
             f"\n\nThis is a bundle self-debug iteration. The workspace already contains the previous candidate; "
-            f"its immutable snapshot is `{os.path.join(run_dir, 'source_before')}`. Before editing, read every JSONL "
+            f"its tested snapshot is `{parent_after}`. Before editing, read every JSONL "
             f"listed in `{os.path.join(run_dir, 'probe_training_trajectories_manifest.json')}`; they are "
             "complete raw training trajectories copied byte-for-byte. Read the complete structured runtime audit and "
             f"verification at `{feedback_path}` and the previous source diff at `{copied_parent_diff}` when present. "
             "Diagnose concrete producer→consumer→decision failures, then adapt any related bundle modules needed for "
             "a general solution.\n"
+            "Continue the earlier analysis and pending tasks below. Revisit an assumption when new runtime "
+            "evidence contradicts it; do not repeat a failed patch without explaining what changed.\n"
+            + json.dumps(_bundle_feedback_lineage(parent_dir), ensure_ascii=False, indent=2)
+            + "\n"
         )
         prompt += forensic_prompt_block(forensic_manifest)
     # Persist the effective fixed-batch IDs as part of the immutable attempt,
     # not only in in-memory runtime state.
     write_json(os.path.join(run_dir, "diagnosis.json"), diagnosis_report)
     write_text(os.path.join(run_dir, "prompt.txt"), prompt)
-    extraction_error = ""
     writable_codegen_artifacts = []
     if forensic_manifest:
         writable_codegen_artifacts.append(str(forensic_manifest.get("forensic_report_path") or ""))
-    result = _run_bundle_codex(
-        prompt, run_dir=run_dir, edit_files=edit_files,
-        codex_cli=resolve_coding_agent_executable(args.codex_cli), timeout=args.timeout,
-        settings=args.codex_runtime_settings,
-        stage_run_artifacts=bool(feedback_parent),
-        writable_artifact_paths=[path for path in writable_codegen_artifacts if path],
-    )
+    authored_source = str(iteration.root)
+    write_json(os.path.join(run_dir, "request.json"), {
+        "stage": "codegen", "iteration_dir": str(iteration.root),
+        "context": iteration.context("codegen"), "diagnosis": diagnosis_report,
+        "prompt_path": os.path.join(run_dir, "prompt.txt"),
+    })
+    if resume_stage:
+        result = {"ok": True, "source_dir": authored_source, "resumed_stage": resume_stage}
+        report["runtime_continuation"] = {"stage": resume_stage, "bundle": resume_bundle_path}
+    else:
+        result = _run_bundle_codex(
+            prompt, run_dir=run_dir, edit_files=edit_files,
+            source_output_dir=authored_source,
+            source_input_dir=authored_source,
+            codex_cli=resolve_coding_agent_executable(args.codex_cli), timeout=args.timeout,
+            settings=args.codex_runtime_settings,
+            stage_run_artifacts=bool(feedback_parent),
+            writable_artifact_paths=[path for path in writable_codegen_artifacts if path],
+        )
     write_text(os.path.join(run_dir, "authoring_stdout.txt"), result.get("stdout", ""))
     write_text(os.path.join(run_dir, "authoring_stderr.txt"), result.get("stderr", ""))
-    if result.get("ok"):
-        try:
-            bundle = extract_candidate_bundle(
-                edit_files=edit_files, originals=originals, diagnosis_report=diagnosis_report,
-                retained_base_bundle=parent_bundle or None,
-            )
-        except RuntimeError as exc:
-            bundle = {}
-            extraction_error = str(exc)
+    write_json(os.path.join(run_dir, "response.json"), result)
+    repair_calls_remaining = max(
+        0, int(os.environ.get("BUNDLE_SMOKE_REPAIR_ATTEMPTS", str(args.repair_attempts)) or 0),
+    )
+    if resume_stage == "probe":
+        collected = {"bundle": resume_bundle, "error": "", "result": result,
+                     "source_dir": authored_source, "repairs": []}
     else:
-        bundle = {}
-    forensic_validation = (
-        validate_codex_forensic_report(forensic_manifest)
-        if forensic_manifest else {"passed": True, "skipped": True, "reason": "initial_bundle_codegen"}
+        collected = _collect_authored_candidate(
+            result=result, source_dir=authored_source, prompt=prompt,
+            run_dir=run_dir, edit_files=edit_files,
+            diagnosis_report=diagnosis_report, active_bundle=active_source_bundle,
+            retained_base_bundle=resume_bundle or parent_bundle or None,
+            repair_budget=repair_calls_remaining, args=args, attempt_tag="initial",
+            stage_run_artifacts=bool(feedback_parent),
+            writable_artifact_paths=[path for path in writable_codegen_artifacts if path],
+        )
+    bundle, extraction_error = collected["bundle"], collected["error"]
+    result, authored_source = collected["result"], collected["source_dir"]
+    repair_calls_remaining -= len(collected["repairs"])
+    report["source_assembly_repairs"] = collected["repairs"]
+    forensic_notes = (
+        load_codex_forensic_report(forensic_manifest)
+        if forensic_manifest else {"available": False, "reason": "initial_bundle_codegen"}
     )
-    validation = pre_validate_candidate_bundle(bundle, workspace_dir=workspace_dir) if bundle else {}
-    specialization_validation = (
-        scan_candidate_source_for_specialization(bundle, forensic_manifest)
-        if forensic_manifest and bundle else {"passed": True, "skipped": True}
-    )
-    if not forensic_validation.get("passed"):
-        validation = dict(validation or {})
-        validation["passed"] = False
-        validation["forensic_report_validation"] = forensic_validation
-        validation["error"] = "; ".join(filter(None, [
-            str(validation.get("error") or ""),
-            "supervised forensic report incomplete: " + str(forensic_validation.get("error") or "unknown"),
-        ]))
-    if not specialization_validation.get("passed"):
-        validation = dict(validation or {})
-        validation["passed"] = False
-        validation["supervised_specialization_validation"] = specialization_validation
-        validation["error"] = "; ".join(filter(None, [
-            str(validation.get("error") or ""),
-            "supervised literal crossed into candidate source",
-        ]))
-    codex_engineering_repairs = []
-
-    _copy_source_snapshot(edit_files, os.path.join(run_dir, "source_after"))
-    _write_source_diff(originals, os.path.join(run_dir, "source_diff.patch"))
-    if not args.keep_source_edits:
-        _restore_files(workspace_originals)
+    validation = pre_validate_candidate_bundle(bundle) if bundle else {}
+    if result.get("ok"):
+        _write_source_diff(originals, os.path.join(run_dir, "source_diff.patch"), source_dir=authored_source)
     if not bundle:
         report.update({
             "status": "bundle_codegen_failed",
             "codex": result,
             "candidate_extraction_error": extraction_error,
-            "supervised_forensic_report_validation": forensic_validation,
-            "supervised_specialization_validation": specialization_validation,
+            "coding_analysis": forensic_notes,
         })
         write_json(os.path.join(run_dir, "validation.json"), {})
-        write_json(os.path.join(run_dir, "sandbox_report.json"), {})
         finalize_run_record(run_dir, report)
         return 1
-    inheritance_issues = _parent_bundle_inheritance_issues(bundle, parent_bundle)
-    if inheritance_issues:
-        validation = dict(validation or {})
-        validation["passed"] = False
-        validation["parent_bundle_inheritance_issues"] = inheritance_issues
-        validation["error"] = "; ".join(
-            [str(validation.get("error") or "")] + inheritance_issues
-        ).strip("; ")
-    write_json(os.path.join(run_dir, "candidate_bundle.json"), bundle)
-    write_json(os.path.join(run_dir, "validation.json"), {"assembly_validation": validation})
     report.update({"candidate_bundle": {key: value for key, value in bundle.items() if key != "modules"},
                    "changed_modules": bundle["changed_modules"], "codex": result,
-                   "task_free_engineering_repairs": codex_engineering_repairs,
                    "validation": validation,
-                   "supervised_forensic_report_validation": forensic_validation,
-                   "supervised_specialization_validation": specialization_validation,
+                   "coding_analysis": forensic_notes,
                    })
     if feedback_parent:
         report["probe_failed_input"] = feedback_parent
     if engineering_feedback:
         report["engineering_failed_input"] = engineering_feedback
     if not validation.get("passed"):
+        _write_bundle_source_snapshot(bundle, os.path.join(run_dir, "agent_snapshot"))
+        write_json(os.path.join(run_dir, "candidate_bundle.json"), bundle)
         validation["probe_next_action"] = {
             "action": "codex_engineering_repair",
             "reason": "candidate bundle assembly is incomplete; regenerate the bundle artifact before runtime smoke",
@@ -3830,13 +3207,27 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         write_json(os.path.join(run_dir, "validation.json"), {"assembly_validation": validation})
         report["status"] = "bundle_assembly_invalid"
         report["probe_next_action"] = validation["probe_next_action"]
-        write_json(os.path.join(run_dir, "sandbox_report.json"), {})
         report["bundle_feedback_lineage_path"] = _write_bundle_lineage(
-            run_dir,
-            str(feedback_parent.get("probe_failed_run") or engineering_feedback.get("engineering_failed_run") or ""),
+            run_dir, lineage_parent,
         )
         finalize_run_record(run_dir, report)
         return 0
+
+    def checkpoint_for_smoke() -> None:
+        next_task = {"stage": "smoke", "task": "Run runtime smoke on the current authored draft."}
+        _write_bundle_source_snapshot(bundle, os.path.join(run_dir, "agent_snapshot"))
+        write_json(os.path.join(run_dir, "candidate_bundle.json"), bundle)
+        write_json(os.path.join(run_dir, "validation.json"), {"assembly_validation": validation})
+        report.update({
+            "status": "bundle_authored", "next_task": next_task,
+            "candidate_bundle": {key: value for key, value in bundle.items() if key != "modules"},
+            "changed_modules": bundle["changed_modules"], "validation": validation,
+        })
+        write_json(os.path.join(run_dir, "run_record.json"), report)
+        iteration.record("codegen", os.path.join(run_dir, "run_record.json"), status="complete",
+                         next_task=next_task, notes_path=iteration.root / "implementation.md")
+
+    checkpoint_for_smoke()
     # Smoke is a separate, fast, real-runtime gate.  It injects every changed
     # class into the same Agent invocation, so a bundle cannot reach probe
     # merely because each file compiled in isolation.  Candidate-contract
@@ -3847,11 +3238,33 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
     smoke_repairs = []
     repair_history: list[dict] = []
     smoke_attempts = []
-    smoke_repair_budget = max(
-        0,
-        int(os.environ.get("BUNDLE_SMOKE_REPAIR_ATTEMPTS", str(args.repair_attempts)) or 0),
-    )
-    for smoke_attempt in range(smoke_repair_budget + 1):
+
+    def record_smoke_attempt(smoke_dir: str, attempt: int, contract: dict | None = None) -> dict:
+        artifacts = _persist_bundle_smoke_attempt(smoke_dir, attempt, bundle, smoke, contract)
+        smoke_attempts.append(artifacts)
+        report["bundle_smoke_attempts"] = smoke_attempts
+        report.setdefault("stage_results", {})["smoke"] = {"result": artifacts["smoke_result_path"]}
+        write_json(os.path.join(run_dir, "validation.json"), {
+            "assembly_validation": validation, "bundle_smoke": smoke,
+            "bundle_smoke_attempts": smoke_attempts, "bundle_smoke_repairs": smoke_repairs,
+        })
+        write_json(os.path.join(run_dir, "run_record.json"), report)
+        iteration.record("smoke", artifacts["smoke_result_path"],
+                         status="complete" if smoke.get("passed") else "pending",
+                         next_task={"stage": "probe" if smoke.get("passed") else "smoke"})
+        return artifacts
+
+    for smoke_attempt in range(repair_calls_remaining + 1):
+        smoke_dir = str(iteration.reserve("smoke"))
+        if resume_stage == "probe":
+            previous_validation = _load_json_required(
+                os.path.join(os.path.dirname(resume_bundle_path), "validation.json"), "completed smoke result",
+            )
+            smoke = previous_validation.get("bundle_smoke") or {}
+            if not smoke.get("passed"):
+                raise RuntimeError("Probe continuation requires the frozen candidate's passed smoke result.")
+            record_smoke_attempt(smoke_dir, 1)
+            break
         if validation.get("passed"):
             smoke = bundle_smoke_test(
                 bundle,
@@ -3859,7 +3272,6 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 distribution_manifest=getattr(args, "distribution_manifest", ""),
                 reference_results=str(diagnosis_report.get("reference_results_path") or ""),
                 reference_report=str(diagnosis_report.get("reference_report_path") or ""),
-                reference_bundle=str(diagnosis_report.get("reference_bundle_path") or ""),
                 failure_contract={
                     "handoff_contracts": bundle.get("handoff_contracts") or [],
                     "contract_mode": "adaptive_bundle",
@@ -3869,9 +3281,7 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 },
             )
             if smoke.get("passed") or smoke.get("execution_layer_rerun_required"):
-                smoke_attempts.append(_persist_bundle_smoke_attempt(
-                    run_dir, smoke_attempt + 1, bundle, smoke,
-                ))
+                record_smoke_attempt(smoke_dir, smoke_attempt + 1)
                 break
             repair_contract = bundle_smoke_failure_contract(smoke, bundle)
         else:
@@ -3885,11 +3295,8 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             }
             smoke = {"passed": False, "failure_kind": "candidate_contract",
                      "error": str(validation.get("error") or "bundle assembly invalid")}
-        attempt_artifacts = _persist_bundle_smoke_attempt(
-            run_dir, smoke_attempt + 1, bundle, smoke, repair_contract,
-        )
-        smoke_attempts.append(attempt_artifacts)
-        if smoke_attempt >= smoke_repair_budget:
+        attempt_artifacts = record_smoke_attempt(smoke_dir, smoke_attempt + 1, repair_contract)
+        if not repair_calls_remaining:
             break
         repair_prefix = os.path.join(run_dir, f"bundle_smoke_repair_{smoke_attempt + 1}")
         trace_path = attempt_artifacts["engineering_execution_trace_path"]
@@ -3902,74 +3309,55 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             execution_trace_path=trace_path,
             repair_history=repair_history,
         )
-        repair_prompt = build_bundle_smoke_repair_prompt(
-            repair_contract, edit_files, execution_trace_path=trace_path,
-            candidate_bundle_path=attempt_artifacts["candidate_bundle_path"],
-            repair_history=repair_history,
-            codegen_context=repair_context,
-        )
+        repair_prompt = build_bundle_smoke_repair_prompt(repair_context)
         write_json(repair_prefix + "_contract.json", repair_contract)
         write_json(repair_prefix + "_context.json", repair_context)
         write_text(repair_prefix + "_prompt.txt", repair_prompt)
-        _apply_source_snapshot(os.path.join(run_dir, "source_after"))
+        repaired_source = str(iteration.root)
         repair_result = _run_bundle_codex(
             repair_prompt, run_dir=run_dir, edit_files=edit_files,
+            source_output_dir=repaired_source,
+            source_input_dir=repaired_source,
             codex_cli=resolve_coding_agent_executable(args.codex_cli), timeout=args.timeout,
             settings=args.codex_runtime_settings,
         )
         write_text(repair_prefix + "_stdout.txt", repair_result.get("stdout", ""))
         write_text(repair_prefix + "_stderr.txt", repair_result.get("stderr", ""))
-        repair_accepted = bool(repair_result.get("ok"))
-        if repair_accepted:
-            extraction_error = ""
-            try:
-                repaired_bundle = extract_candidate_bundle(
-                    edit_files=edit_files, originals=originals, diagnosis_report=diagnosis_report,
-                    retained_base_bundle=parent_bundle or None, active_bundle=bundle,
-                )
-            except RuntimeError as exc:
-                repaired_bundle = {}
-                extraction_error = str(exc)
+        repair_calls_remaining -= 1
+        repair_accepted = False
+        output_validation = {}
+        assembly_repairs = []
+        if repair_result.get("ok"):
+            collected = _collect_authored_candidate(
+                result=repair_result, source_dir=repaired_source, prompt=repair_prompt,
+                run_dir=run_dir, edit_files=edit_files,
+                diagnosis_report=diagnosis_report, active_bundle=bundle, retained_base_bundle=bundle,
+                repair_budget=repair_calls_remaining, args=args, attempt_tag=f"smoke_{smoke_attempt + 1}",
+            )
+            repaired_bundle, extraction_error = collected["bundle"], collected["error"]
+            repair_result, repaired_source = collected["result"], collected["source_dir"]
+            assembly_repairs = collected["repairs"]
+            repair_calls_remaining -= len(assembly_repairs)
             if repaired_bundle:
                 bundle = repaired_bundle
-                validation = pre_validate_candidate_bundle(bundle, workspace_dir=workspace_dir)
+                validation = pre_validate_candidate_bundle(bundle)
+                output_validation = validation
+                repair_accepted = True
+                checkpoint_for_smoke()
+                _write_source_diff(
+                    originals, os.path.join(run_dir, "source_diff.patch"), source_dir=repaired_source,
+                )
             else:
-                validation = {
+                output_validation = {
                     "passed": False,
                     "issues": [extraction_error or "repair produced no serializable concrete bundle"],
                     "error": extraction_error or "repair produced no serializable concrete bundle",
                 }
-            if forensic_manifest and bundle:
-                specialization_validation = scan_candidate_source_for_specialization(bundle, forensic_manifest)
-                if not specialization_validation.get("passed"):
-                    validation = dict(validation or {})
-                    validation["passed"] = False
-                    validation["supervised_specialization_validation"] = specialization_validation
-                    validation["error"] = "; ".join(filter(None, [
-                        str(validation.get("error") or ""),
-                        "supervised literal crossed into candidate source",
-                    ]))
-            inherited = _parent_bundle_inheritance_issues(bundle, parent_bundle) if bundle else []
-            if inherited:
-                validation = dict(validation or {})
-                validation["passed"] = False
-                validation["parent_bundle_inheritance_issues"] = inherited
-                validation["error"] = "; ".join(
-                    [str(validation.get("error") or "")] + inherited
-                ).strip("; ")
-            _copy_source_snapshot(edit_files, os.path.join(run_dir, "source_after"))
-            _write_source_diff(originals, os.path.join(run_dir, "source_diff.patch"))
-            if not args.keep_source_edits:
-                _restore_files(workspace_originals)
-        else:
-            # A failed Codex invocation cannot become a hidden source mutation
-            # for the next retry; restore the last accepted candidate source.
-            _apply_source_snapshot(os.path.join(run_dir, "source_after"))
         repair_status = (
             "repair_edit_accepted_pending_runtime_smoke"
             if repair_accepted and validation.get("passed") else
             "repair_edit_unserializable"
-            if repair_accepted else "repair_edit_rejected"
+            if repair_result.get("ok") else "repair_edit_rejected"
         )
         repair_record = {
             "attempt": smoke_attempt + 1,
@@ -3979,7 +3367,9 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             "engineering_execution_trace_path": trace_path,
             "codex": {key: repair_result.get(key) for key in ("ok", "returncode", "elapsed_sec")},
             "repair_evidence_mode": "embedded_no_label_smoke_context",
-            "output_assembly_validation": validation,
+            "output_assembly_validation": output_validation,
+            "source_dir": repaired_source,
+            "source_assembly_repairs": assembly_repairs,
         }
         smoke_repairs.append(repair_record)
         repair_history.append({
@@ -4004,6 +3394,12 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             "codex_feedback_allowed": True,
             "feedback_mode": "engineering_no_label",
         }
+    elif args.skip_probe_verification:
+        validation["probe_skipped"] = True
+        validation["probe_next_action"] = {
+            "action": "probe_skipped", "reason": "Smoke completed; probe was not requested.",
+            "requires_probe_replay": True,
+        }
     write_json(os.path.join(run_dir, "candidate_bundle.json"), bundle)
     write_json(os.path.join(run_dir, "validation.json"), {
         "assembly_validation": validation, "bundle_smoke": smoke,
@@ -4011,6 +3407,10 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
     })
     report["bundle_smoke_repairs"] = smoke_repairs
     report["bundle_smoke_attempts"] = smoke_attempts
+    report.setdefault("stage_results", {})["smoke"] = {"result": smoke_attempts[-1]["smoke_result_path"]}
+    report["candidate_bundle"] = {key: value for key, value in bundle.items() if key != "modules"}
+    report["changed_modules"] = list(bundle["changed_modules"])
+    report["validation"] = validation
     if not smoke.get("passed"):
         final_trace_path = str((smoke_attempts[-1] if smoke_attempts else {}).get(
             "engineering_execution_trace_path", ""
@@ -4032,10 +3432,8 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 }
             ),
         })
-        write_json(os.path.join(run_dir, "sandbox_report.json"), {"bundle_smoke": smoke})
         report["bundle_feedback_lineage_path"] = _write_bundle_lineage(
-            run_dir,
-            str(feedback_parent.get("probe_failed_run") or engineering_feedback.get("engineering_failed_run") or ""),
+            run_dir, lineage_parent,
         )
         finalize_run_record(run_dir, report)
         # The candidate is complete and immutable; a caller may rerun this
@@ -4050,16 +3448,21 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         # Preserve the actual smoke outcome.  ``--skip_probe_verification``
         # only suppresses a later behavioral probe; it does not make the
         # successful injected runtime execution disappear.
-        write_json(os.path.join(run_dir, "sandbox_report.json"), {
-            "bundle_smoke": smoke,
-            "probe_skipped": True,
-            "skip_reason": "--skip_probe_verification",
-        })
         finalize_run_record(run_dir, report)
         return 0
+    finalize_run_record(run_dir, report)
+    probe_dir = str(iteration.reserve("probe"))
+    report["stage_results"]["probe"] = {
+        "plan": os.path.join(probe_dir, "candidate", "probe_plan.json"),
+        "result": os.path.join(probe_dir, "result.json"),
+        "audit": os.path.join(probe_dir, "audit.json"),
+        "execution": os.path.join(probe_dir, "execution.json"),
+        "sandbox_dir": os.path.join(probe_dir, "candidate"),
+    }
+    write_json(os.path.join(run_dir, "run_record.json"), report)
     sandbox = run_bundle_sandbox_verification(
         diagnosis_report, workspace_dir, args.first_n, bundle,
-        os.path.join(run_dir, "sandbox"), concurrency=args.concurrency,
+        os.path.join(probe_dir, "candidate"), concurrency=args.concurrency,
     )
     verification = sandbox.get("verification") or {}
     # Probe feedback compares two real executions in the same fixed task batch.
@@ -4071,43 +3474,27 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
         try:
             replay_report = copy.deepcopy(diagnosis_report)
             replay_report["fixed_probe_task_ids"] = selected_refs
-            candidate_repeat = run_bundle_sandbox_verification(
-                replay_report, workspace_dir, len(selected_refs), bundle,
-                os.path.join(run_dir, "candidate_probe_repeat"), concurrency=args.concurrency,
-            )
-            candidate_repeat_rows = list(candidate_repeat.get("probe_results") or [])
-            candidate_repeat_ids = [str(item.get("task_id") or "") for item in candidate_repeat_rows]
+            replay_report["fixed_probe_plan"] = dict(verification.get("probe_plan") or {})
             replay_bundle = _reference_bundle_for_probe_replay(replay_report)
             replay = run_bundle_sandbox_verification(
                 replay_report, workspace_dir, len(selected_refs), replay_bundle,
-                os.path.join(run_dir, "reference_probe_replay"), concurrency=args.concurrency,
+                os.path.join(probe_dir, "reference"), concurrency=args.concurrency,
             )
             replay_rows = list(replay.get("probe_results") or [])
             replay_ids = [str(item.get("task_id") or "") for item in replay_rows]
             candidate_rows = list(sandbox.get("probe_results") or [])
             candidate_ids = [str(item.get("task_id") or "") for item in candidate_rows]
             expected_ids = set(selected_refs)
-            first_correct = {str(item.get("task_id") or ""): bool(item.get("is_correct")) for item in candidate_rows}
-            repeat_correct = {str(item.get("task_id") or ""): bool(item.get("is_correct")) for item in candidate_repeat_rows}
-            repeatable = (
-                set(candidate_repeat_ids) == expected_ids
-                and len(candidate_repeat_ids) == len(selected_refs)
-                and first_correct == repeat_correct
-            )
             complete = (
                 set(candidate_ids) == expected_ids and len(candidate_ids) == len(selected_refs)
                 and set(replay_ids) == expected_ids and len(replay_ids) == len(selected_refs)
                 and len(expected_ids) == len(selected_refs)
-                and repeatable
             )
             replay_path = _write_replay_jsonl(
-                os.path.join(run_dir, "reference_probe_replay.jsonl"), replay_rows,
+                os.path.join(probe_dir, "reference_results.jsonl"), replay_rows,
             )
             candidate_replay_path = _write_replay_jsonl(
-                os.path.join(run_dir, "candidate_probe_replay.jsonl"), candidate_rows,
-            )
-            candidate_repeat_path = _write_replay_jsonl(
-                os.path.join(run_dir, "candidate_probe_repeat.jsonl"), candidate_repeat_rows,
+                os.path.join(probe_dir, "candidate_results.jsonl"), candidate_rows,
             )
             # The historical full-eval reference is useful for selecting this
             # probe batch, but it is not a valid comparator for a stochastic,
@@ -4117,30 +3504,29 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
                 verification, candidate_rows, replay_rows,
                 candidate_replay_path=candidate_replay_path,
                 reference_replay_path=replay_path,
+                reference_verification=replay.get("verification") or {},
             )
+            if not complete:
+                _invalidate_probe_comparison(live_comparison)
             reference_replay = {
-                "passed": complete,
+                "passed": complete and bool(live_comparison.get("comparison_valid")),
                 "selected_refs": selected_refs,
                 "candidate_replay_path": candidate_replay_path,
-                "candidate_repeat_path": candidate_repeat_path,
                 "reference_replay_path": replay_path,
                 "candidate_sandbox_dir": verification.get("sandbox_dir", ""),
                 "reference_sandbox_dir": (replay.get("verification") or {}).get("sandbox_dir", ""),
                 "candidate_task_ids": candidate_ids,
-                "candidate_repeat_task_ids": candidate_repeat_ids,
                 "reference_task_ids": replay_ids,
-                "repeatability": {
-                    "passed": repeatable,
-                    "first_correct_by_task": first_correct,
-                    "repeat_correct_by_task": repeat_correct,
-                },
                 "live_comparison_path": "probe_verification.live_probe_comparison",
                 "live_comparison_valid": bool(live_comparison.get("comparison_valid")),
             }
             if not complete or not live_comparison.get("comparison_valid"):
-                verification["execution_layer_rerun_required"] = True
+                _invalidate_probe_comparison(verification)
+                if (not verification.get("engineering_invalid")
+                        or (replay.get("verification") or {}).get("execution_layer_rerun_required")):
+                    verification["execution_layer_rerun_required"] = True
                 verification["engineering_invalid"] = True
-                verification["engineering_invalid_reason"] = (
+                verification["engineering_invalid_reason"] = verification.get("engineering_invalid_reason") or (
                     "fixed-batch candidate/reference replay was incomplete, mismatched, "
                     "or could not form a valid live comparison"
                 )
@@ -4153,39 +3539,51 @@ def run_bundle_evolution(args: argparse.Namespace, diagnosis_report: dict,
             verification["execution_layer_rerun_required"] = True
             verification["engineering_invalid"] = True
             verification["engineering_invalid_reason"] = reference_replay["error"]
+            _invalidate_probe_comparison(verification)
     else:
         verification["execution_layer_rerun_required"] = True
         verification["engineering_invalid"] = True
         verification["engineering_invalid_reason"] = "candidate probe omitted fixed selected_refs; reference replay cannot be audited"
+        _invalidate_probe_comparison(verification)
     verification["reference_probe_replay"] = reference_replay
+    sandbox["verification"] = verification
+    from candidate_evaluator import finalize_probe_comparison
+    finalize_probe_comparison(verification, sandbox["conclusion"])
     audit = build_bundle_probe_audit(verification, bundle)
     audit["artifact_type"] = "bundle_probe_audit"
     probe_next_action = classify_probe_next_action(verification, audit)
+    probe_next_action["origin_stage"] = "probe"
+    if probe_next_action["action"] == "codex_engineering_repair":
+        verification["engineering_invalid"] = True
+        verification["engineering_invalid_reason"] = "Probe runtime audit found an interface or evidence-flow failure."
+    elif probe_next_action["action"] == "execution_layer_rerun":
+        verification["execution_layer_rerun_required"] = True
+    finalize_probe_comparison(verification, sandbox["conclusion"])
+    audit["probe_status"] = verification["probe_status"]
     validation["sandbox"] = sandbox
     validation["probe_next_action"] = probe_next_action
     validation["probe_verification"] = verification
     report.update({"sandbox": sandbox, "probe_audit": audit,
                    "probe_next_action": probe_next_action, "status": "completed"})
     write_json(os.path.join(run_dir, "validation.json"), validation)
-    write_json(os.path.join(run_dir, "probe_audit.json"), audit)
-    write_json(os.path.join(run_dir, "probe_verification.json"), verification)
-    write_json(os.path.join(run_dir, "sandbox_report.json"), sandbox)
+    write_json(report["stage_results"]["probe"]["audit"], audit)
+    write_json(report["stage_results"]["probe"]["result"], verification)
+    write_json(report["stage_results"]["probe"]["execution"], sandbox)
     report["bundle_feedback_lineage_path"] = _write_bundle_lineage(
-        run_dir,
-        str(feedback_parent.get("probe_failed_run") or engineering_feedback.get("engineering_failed_run") or ""),
+        run_dir, lineage_parent,
     )
     finalize_run_record(run_dir, report)
     return 0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Author, validate, smoke-test, and probe a MetaVideoAgent bundle."
     )
     parser.add_argument("--diagnosis", required=True, help="Validated diagnosis execution brief.")
     parser.add_argument("--machine-evaluation-contract", default="")
     parser.add_argument("--diagnosis_rollout", default="")
-    parser.add_argument("--workspace", default=os.path.abspath(os.path.join(CURRENT_DIR, DEFAULT_WORKSPACE)))
+    parser.add_argument("--workspace", default=default_workspace())
     parser.add_argument("--distribution-manifest", required=True)
     parser.add_argument("--reference-results", default="")
     parser.add_argument("--reference-report", default="")
@@ -4194,7 +3592,6 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--dry_run", action="store_true", default=True)
     parser.add_argument("--run", dest="dry_run", action="store_false")
-    parser.add_argument("--keep_source_edits", action="store_true")
     parser.add_argument(
         "--codex-cli",
         default="",
@@ -4203,13 +3600,21 @@ def main() -> int:
     parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL)
     parser.add_argument("--codex-reasoning-effort", default=DEFAULT_REASONING_EFFORT)
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--repair-attempts", type=int, default=3)
-    parser.add_argument("--probe-failed-run", default="")
-    parser.add_argument("--engineering-failed-run", default="")
-    parser.add_argument("--probe-feedback-round", type=int, default=1)
-    parser.add_argument("--output-root", default="")
+    parser.add_argument("--repair-attempts", type=int, default=3,
+                        help="Additional source-assembly or smoke repair attempts before probe.")
+    task = parser.add_mutually_exclusive_group()
+    task.add_argument("--probe-failed-run", default="")
+    task.add_argument("--engineering-failed-run", default="")
+    parser.add_argument("--iteration-dir", required=True)
+    parser.add_argument("--candidate-dir", required=True)
+    task.add_argument("--resume-stage", choices=("smoke", "probe"), default="")
+    parser.add_argument("--resume-bundle", default="")
     parser.add_argument("--skip_probe_verification", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     try:
         args.codex_runtime_settings = resolve_codex_runtime_settings(

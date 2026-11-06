@@ -33,7 +33,6 @@ from answer_normalizer import (
     is_answer_parseable,
     judge_answer,
 )
-from combo_contract import require_complete_agent_combo
 from evidence_contract import validate_canonical_structure_record
 from task_identity import (
     attach_task_identity,
@@ -86,7 +85,6 @@ def _runtime_report_path(filename: str = "") -> str:
     relative_runtime = os.path.relpath(runtime_dir(), os.path.dirname(_current_dir))
     relative_runtime = relative_runtime.replace(os.sep, "/")
     return f"{relative_runtime}/{filename}" if filename else relative_runtime
-
 
 
 def _extract_time_reference_bounds(time_reference) -> tuple:
@@ -310,7 +308,6 @@ def _sandbox_file_lock(lock_path: str):
 # =====================================================================
 
 
-
 def _wall_clock_timeout(seconds: float, label: str):
     """Raise TimeoutError if a smoke-only operation exceeds a wall-clock limit."""
     timeout = int(float(seconds or 0))
@@ -334,8 +331,7 @@ def _wall_clock_timeout(seconds: float, label: str):
             signal.alarm(old_remaining)
 
 
-
-def create_module_class(module_dict: dict):
+def create_module_class(module_dict: dict, source_package=None):
     code = module_dict.get("code", "")
     class_name = module_dict.get("name", "UnknownModule")
     import inspect as _inspect
@@ -367,6 +363,10 @@ def create_module_class(module_dict: dict):
         "WorkMemoryBase": WorkMemoryBase,
         "ThinkingBase": ThinkingBase,
     })
+    if source_package is not None:
+        global_ns = source_package.module_globals(module_dict["source_file"], global_ns)
+        if class_name in global_ns:
+            return global_ns[class_name]
     base_imports = (
         "video_structuring_modules", "localization_modules", "perception_modules",
         "memory_modules", "thinking_module",
@@ -385,14 +385,10 @@ def create_module_class(module_dict: dict):
     # In Python exec, top-level assignments (such as DEFAULT_STRUCTURING_CONFIG={...}) enter local_ns,
     # But the name lookup in the class method only checks global_ns. After separation, the class method cannot see the module level variables.
     # Solution: Use global_ns directly and also as locals, so that all definitions enter the same namespace.
-    exec(code, global_ns)
+    exec(compile(code, global_ns.get("__file__", "<agent>"), "exec"), global_ns)
     if class_name in global_ns:
         return global_ns[class_name]
-    for name, obj in global_ns.items():
-        if isinstance(obj, type) and name != "object" and name not in ("json", "re"):
-            return obj
     raise RuntimeError(f"Unable to find class in generated code: {class_name}")
-
 
 
 def _get_module_map_key_for_type(module_type: str) -> str:
@@ -466,16 +462,6 @@ def _redirect_structuring_to_sandbox(structuring, sandbox_dir: str,
     lock_path = os.path.join(sandbox_struct_dir, ".sandbox_structure.lock")
 
     with _sandbox_file_lock(lock_path):
-        resume_structure_build = (
-            os.environ.get("VIDEO_STRUCT_RESUME_BUILD", "").lower()
-            in ("1", "true", "yes")
-        )
-        if reset and resume_structure_build and os.path.exists(sandbox_db_path):
-            reset = False
-            print(
-                "   ↩️ [Sandbox] resume mode: retain the existing isolation structure JSONL,"
-                "Complete missing fragments by library builder"
-            )
         if reset and os.path.exists(sandbox_db_path):
             os.remove(sandbox_db_path)
         if reset and os.path.isdir(sandbox_chroma_path):
@@ -532,7 +518,7 @@ def _allow_isolated_full_structure_rebuild() -> bool:
 # =====================================================================
 
 def _inject_bundle_module(module_dict: dict, module_type: str, module_map_refs: dict,
-                          diagnostics: list | None = None) -> (bool, str, dict):
+                          diagnostics: list | None = None, source_package=None) -> (bool, str, dict):
     """Inject one record while assembling a complete candidate bundle.
     Returns: (success, module_name, custom_config_or_None)
     """
@@ -543,7 +529,7 @@ def _inject_bundle_module(module_dict: dict, module_type: str, module_map_refs: 
     target_map = module_map_refs[map_key]
     module_name = module_dict.get("name", "")
     try:
-        cls = create_module_class(module_dict)
+        cls = create_module_class(module_dict, source_package=source_package)
 
         target_map[module_name] = cls
         print(f"   [Sandbox] Injected {module_type}: {module_name}")
@@ -564,7 +550,7 @@ def _inject_bundle_module(module_dict: dict, module_type: str, module_map_refs: 
 def _bundle_module_records(bundle: dict) -> list[dict]:
     """Return bundle modules in the runtime's list representation.
 
-    Initial code generation writes a list while resumed bundle evolution keeps
+    Initial code generation writes a list while bundle evolution keeps
     modules keyed by type.  Both are storage representations of the same
     five-module manifest; runtime smoke must not treat either representation
     as a source-code error.
@@ -579,7 +565,6 @@ def _bundle_module_records(bundle: dict) -> list[dict]:
             if isinstance(item, dict)
         ]
     return []
-
 
 
 def validate_bundle_assembly(bundle: dict) -> dict:
@@ -625,6 +610,32 @@ def validate_bundle_assembly(bundle: dict) -> dict:
     for name in sorted(set(duplicate_names)):
         issues.append(f"duplicate module name: {name}")
 
+    support = bundle.get("support_files") or {}
+    if not isinstance(support, dict):
+        issues.append("support_files must map relative file paths to their contents")
+        support = {}
+    available_files = set(support) | {
+        item["source_file"] for item in modules
+        if isinstance(item, dict) and isinstance(item.get("source_file"), str)
+    }
+    owned_files = set()
+    from agent_sources import relative_source_path
+    for module_type, module in by_type.items():
+        resources = module.get("resources", [])
+        if not isinstance(resources, list) or not all(isinstance(path, str) for path in resources):
+            issues.append(f"{module_type}.resources must list relative helper/resource paths")
+            continue
+        for path in resources:
+            try:
+                relative_source_path(path)
+            except ValueError as exc:
+                issues.append(str(exc))
+            if path not in available_files:
+                issues.append(f"{module_type} declares missing resource: {path}")
+            owned_files.add(path)
+    if set(support) - owned_files:
+        issues.append(f"Declare consuming modules for support_files in resources: {sorted(set(support) - owned_files)}")
+
     combo = bundle.get("combo") or {}
     if not isinstance(combo, dict):
         combo = {}
@@ -646,7 +657,7 @@ def validate_bundle_assembly(bundle: dict) -> dict:
     return {
         "passed": passed,
         "issues": issues,
-        "validation_mode": "assembly_only_no_source_introspection",
+        "validation_mode": "bundle_assembly",
         "combo": combo,
         "module_names": {
             module_type: (by_type.get(module_type) or {}).get("name", "")
@@ -671,13 +682,21 @@ def inject_module_bundle(bundle: dict, module_map_refs: dict):
         if isinstance(module, dict)
     }
     agent_combo = {}
-    custom_configs = {}
+    custom_configs = dict(bundle.get("custom_configs") or {})
     injected = {}
     injection_diagnostics = []
+    from agent_sources import AgentSourcePackage
+    try:
+        source_package = AgentSourcePackage(bundle)
+    except (ValueError, TypeError, KeyError, OSError) as exc:
+        validation["passed"] = False
+        validation.setdefault("issues", []).append(f"Agent source package could not be loaded: {exc}")
+        return False, {}, {}, validation
     for module_type in BUNDLE_MODULE_ORDER:
         module = by_type[module_type]
         ok, module_name, cc = _inject_bundle_module(
             module, module_type, module_map_refs, diagnostics=injection_diagnostics,
+            source_package=source_package,
         )
         if not ok:
             validation.setdefault("issues", []).append(
@@ -883,46 +902,8 @@ def _time_ranges_in_text(text: str) -> list:
     return ranges
 
 
-def _looks_like_video_evidence(text: str) -> bool:
-    value = str(text or "")
-    low = value.lower()
-    if not value.strip():
-        return False
-    if _time_ranges_in_text(value):
-        return True
-    markers = (
-        "visual", "frame", "video clip", "clip", "narration", "asr",
-        "transcript", "ocr", "subtitle", "audio", "screen text",
-        "timestamp", "start_sec", "end_sec", "modalities",
-    )
-    return len(value) >= 160 and any(marker in low for marker in markers)
-
-
-def _is_errorish_text(text: str) -> bool:
-    low = str(text or "").lower()
-    return any(
-        marker in low
-        for marker in (
-            "execution error", "traceback", "llm error", "api error",
-            "connection error", "error code:", "module not found",
-            "no valid candidate windows", "missing dependency variable",
-            "tool '", "not found.",
-        )
-    )
-
-
 def _is_guess_or_failure_answer(answer: str) -> bool:
-    low = str(answer or "").strip().lower()
-    if not low:
-        return True
-    failure_markers = (
-        "task failed", "error:", "unable to answer", "cannot answer",
-        "insufficient evidence", "no concrete evidence", "forced to make",
-        "educated guess", "generic guess", "we have no", "without any confirmed",
-        "option or statement aligned with", "strongest supported answer is the option",
-        "strongest supported answer is the statement", "based on the verified localized evidence",
-    )
-    return any(marker in low for marker in failure_markers)
+    return str(answer or "").strip() in {"", "Task failed to find answer within step limits."}
 
 
 def _is_uncertain_answer(answer: str) -> bool:
@@ -948,7 +929,7 @@ def _grounded_uncertainty_summary(row: dict, summary: dict) -> str:
         step for step in summary.get("steps", [])
         if step.get("step_type") == "tool_execution"
     ]
-    if not any(step.get("looks_like_video_evidence") and not step.get("errorish") for step in tool_steps):
+    if not any(step.get("has_evidence") and not step.get("execution_failed") for step in tool_steps):
         return ""
     trajectory = row.get("trajectory") if isinstance(row.get("trajectory"), list) else []
     finish_payload = {}
@@ -1061,8 +1042,15 @@ def _summarize_smoke_trajectory(row: dict) -> dict:
                 "observation_preview": _shorten_text(obs, 900),
                 "observation_chars": len(obs),
                 "time_ranges_found": _time_ranges_in_text(obs)[:8],
-                "looks_like_video_evidence": _looks_like_video_evidence(obs),
-                "errorish": _is_errorish_text(obs),
+                "has_evidence": (
+                    step.get("producer_module") in {"localization", "perception"}
+                    and (step.get("module_result") or {}).get("status") == "ok"
+                    and bool((step.get("module_result") or {}).get("evidence")
+                             or (step.get("module_result") or {}).get("structure_records")
+                             or (step.get("module_result") or {}).get("time_ranges"))
+                ),
+                "execution_failed": (str(step.get("execution_status") or "ok") != "ok"
+                             or (step.get("module_result") or {}).get("status") == "error"),
             }
             tool_steps.append(item)
             steps.append(item)
@@ -1117,7 +1105,7 @@ def _summarize_smoke_trajectory(row: dict) -> dict:
         "tool_step_count": len(tool_steps),
         "planning_step_count": len(planning_steps),
         "reasoning_step_count": len(reasoning_steps),
-        "steps": steps[-18:],
+        "steps": steps,
     }
 
 
@@ -1143,65 +1131,6 @@ def _judge_safe_smoke_summary(summary: dict) -> dict:
         return value
 
     return scrub(safe)
-
-
-
-def _detect_smoke_dataflow_issues(summary: dict) -> list:
-    issues = []
-    steps = summary.get("steps") or []
-    seen_video_evidence = False
-    repeated_empty_verification = 0
-    dataflow_break_reported = False
-    for step in steps:
-        if step.get("step_type") == "tool_execution":
-            if step.get("looks_like_video_evidence") and not step.get("errorish"):
-                seen_video_evidence = True
-            obs = str(step.get("observation_preview") or "").lower()
-            if (
-                "no valid candidate windows" in obs
-                or "no candidate windows" in obs
-                or "missing dependency variable" in obs
-            ):
-                repeated_empty_verification += 1
-        elif step.get("step_type") == "planning":
-            for plan in step.get("plan") or []:
-                params = plan.get("params") or {}
-                empty_window_param = any(
-                    (
-                        isinstance(value, list) and len(value) == 0
-                        or value in ("", None)
-                    )
-                    and any(token in str(key).lower() for token in ("window", "range", "candidate", "time"))
-                    for key, value in params.items()
-                )
-                if seen_video_evidence and empty_window_param:
-                    if not dataflow_break_reported:
-                        issues.append({
-                            "issue_type": "smoke_dataflow_break",
-                            "severity": "critical",
-                            "description": (
-                                "A previous tool produced video evidence/candidate timing information, "
-                                "but a later plan passed an empty candidate/time/window parameter."
-                            ),
-                            "repair_hint": (
-                                "Make the thinking module export structured variables from retrieval "
-                                "observations or parse candidate windows directly, then pass non-empty "
-                                "candidate windows to verification/perception tools."
-                            ),
-                        })
-                        dataflow_break_reported = True
-                    break
-    if repeated_empty_verification >= 2:
-        issues.append({
-            "issue_type": "smoke_degenerate_empty_verification_loop",
-            "severity": "critical",
-            "description": "The agent repeatedly called verification with empty/missing candidate evidence.",
-            "repair_hint": (
-                "Stop repeating the same ineffective verification call; either retrieve narrower "
-                "evidence, extract variables, or finish only after grounded evidence is available."
-            ),
-        })
-    return issues
 
 
 def _normalized_window_pairs(value) -> list[tuple[float, float]]:
@@ -1303,9 +1232,9 @@ def _basic_behavior_smoke_assessment(row: dict) -> dict:
     ]
     evidence_steps = [
         step for step in tool_steps
-        if step.get("looks_like_video_evidence") and not step.get("errorish")
+        if step.get("has_evidence") and not step.get("execution_failed")
     ]
-    error_steps = [step for step in tool_steps if step.get("errorish")]
+    error_steps = [step for step in tool_steps if step.get("execution_failed")]
     issues = []
     advisories = []
     if not answer.strip():
@@ -1352,16 +1281,15 @@ def _basic_behavior_smoke_assessment(row: dict) -> dict:
         issues.append({
             "issue_type": "smoke_no_video_grounding",
             "severity": "critical",
-            "description": "No tool observation looked like substantive video evidence.",
+            "description": "No successful localization or perception result contained structured evidence.",
             "repair_hint": "Ensure localization/perception tools return non-empty video, audio, OCR, or timestamped evidence.",
         })
-    issues.extend(_detect_smoke_dataflow_issues(summary))
     issues.extend(_localized_media_scope_issues(row))
     if error_steps and len(error_steps) == len(tool_steps):
         issues.append({
             "issue_type": "smoke_all_tools_error",
             "severity": "critical",
-            "description": "Every tool execution in the smoke trajectory returned an error-like observation.",
+            "description": "Every tool execution in the smoke trajectory reported an execution failure.",
             "repair_hint": "Fix tool names, signatures, parameters, and runtime dependencies before full evaluation.",
         })
     passed = not any(issue.get("severity") in ("critical", "high") for issue in issues)
@@ -1378,7 +1306,7 @@ def _basic_behavior_smoke_assessment(row: dict) -> dict:
     }
 
 
-def behavioral_smoke_assessment(result_rows: list, combo: dict) -> dict:
+def behavioral_smoke_assessment(result_rows: list) -> dict:
     if not result_rows:
         return {
             "passed": False,
@@ -1390,12 +1318,7 @@ def behavioral_smoke_assessment(result_rows: list, combo: dict) -> dict:
         }
     row = result_rows[0]
     deterministic = _basic_behavior_smoke_assessment(row)
-    # Smoke repair is an engineering contract, not a second task-solving
-    # prompt. An LLM judge can turn a valid runtime violation into a
-    # task-specific prescription. Keep the complete no-label trace for Codex
-    # inspection, but route solely on deterministic producer/consumer/event
-    # facts.
-    del combo
+    # Route repair using observed producer/consumer events and interface facts.
     passed = bool(deterministic.get("passed"))
     redacted_summary = _judge_safe_smoke_summary(deterministic.get("summary", {}))
     return {
@@ -2169,7 +2092,6 @@ def single_question_bundle_smoke_test(bundle: dict,
                                       workspace_dir: str,
                                       sandbox_dir: str,
                                       combo_id: str = "",
-                                      llm_model: str = "",
                                       force_rebuild: bool = False,
                                       isolate_structure: bool = True,
                                       runtime_time_reference_only: bool = False,
@@ -2180,9 +2102,6 @@ def single_question_bundle_smoke_test(bundle: dict,
     an accuracy proof and it never writes to baseline trajectories or global
     video_structure when `sandbox_dir` is isolated by the caller.
     """
-    if not llm_model:
-        from capability_registry import resolve_profile
-        llm_model = str(resolve_profile("llm").get("model_id") or "")
     validation = validate_bundle_assembly(bundle)
     if not validation.get("passed"):
         contract = build_smoke_exception_failure_contract(
@@ -2240,9 +2159,6 @@ def single_question_bundle_smoke_test(bundle: dict,
         "perception": module_map.PERCEPTION_MAP,
     }
     backups = {key: dict(value) for key, value in module_map_refs.items()}
-    old_model = os.environ.get("METAVIDEOAGENT_LLM_MODEL")
-    if llm_model:
-        os.environ["METAVIDEOAGENT_LLM_MODEL"] = llm_model
     os.makedirs(sandbox_dir, exist_ok=True)
     result_rows = []
     try:
@@ -2306,7 +2222,7 @@ def single_question_bundle_smoke_test(bundle: dict,
             agent_combo,
         )
         runtime_issues.extend(structure_quality.get("issues") or [])
-        behavior = behavioral_smoke_assessment(result_rows, agent_combo)
+        behavior = behavioral_smoke_assessment(result_rows)
         failure_contract = build_initial_smoke_failure_contract(
             result_rows, bundle, structure_quality=structure_quality,
         )
@@ -2366,78 +2282,8 @@ def single_question_bundle_smoke_test(bundle: dict,
         for key, backup in backups.items():
             module_map_refs[key].clear()
             module_map_refs[key].update(backup)
-        if old_model is None:
-            os.environ.pop("METAVIDEOAGENT_LLM_MODEL", None)
-        else:
-            os.environ["METAVIDEOAGENT_LLM_MODEL"] = old_model
 
 
-def inject_evolved_modules(evolved: dict, module_map_refs: dict):
-    """Inject generated module records into the corresponding runtime maps.
-
-    Args:
-        evolved: {"thinking": [...], "perception": [...], ...}
-        module_map_refs: {
-            "structuring": STRUCTURING_MAP,
-            "thinking": THINKING_MAP,
-            "memory": WORK_MEMORY_MAP,
-            "localization": LOCALIZATION_MAP,
-            "perception": PERCEPTION_MAP,
-        }
-    Returns:
-        custom_configs: {module_name: custom_config_dict}
-    """
-    map_key_map = {
-        "thinking": "thinking",
-        "memory": "memory",
-        "video_structuring": "structuring",
-        "localization": "localization",
-        "perception": "perception",
-    }
-
-    custom_configs = {}
-
-    for module_type, modules in evolved.items():
-        if not modules:
-            continue
-
-        map_key = map_key_map.get(module_type)
-        if not map_key or map_key not in module_map_refs:
-            print(f"[Sandbox] Unknown module type {module_type}; skipping injection")
-            continue
-
-        target_map = module_map_refs[map_key]
-        latest = modules[-1]
-        module_name = latest.get("name", "")
-        try:
-            cls = create_module_class(latest)
-
-            target_map[module_name] = cls
-            print(f"   [Sandbox] Injected {module_type}: {module_name}")
-
-        except Exception as e:
-            print(f"   ⚠️ [Sandbox] Failed to inject {module_name}: {e}")
-
-    return custom_configs
-
-
-
-
-
-
-def map_combo_to_agent_config(combo_cfg: dict) -> dict:
-    mapping = {
-        "video_structuring": "video_structuring", "thinking": "thinking",
-        "memory": "memory",
-        "localization": "localization", "perception": "perception",
-    }
-    agent_combo = {}
-    for src_key, dst_key in mapping.items():
-        val = combo_cfg.get(src_key, "")
-        if not val:
-            continue
-        agent_combo[dst_key] = val
-    return require_complete_agent_combo(agent_combo, "MetaVideoAgent sandbox combo")
 
 
 # =====================================================================
@@ -2647,11 +2493,6 @@ def run_single_question(agent_cls, env_cls, build_fn, workspace_dir, video_id, c
                 reference_structure_dir=reference_structure_dir,
             )
         db_exists = os.path.exists(agent.structuring.db_path) and os.path.getsize(agent.structuring.db_path) > 0
-        resume_structure_build = (
-            isolate_structure
-            and os.environ.get("VIDEO_STRUCT_RESUME_BUILD", "").lower() in ("1", "true", "yes")
-            and os.environ.get("SANDBOX_ALLOW_STRUCTURE_RESUME_BUILD", "").lower() in ("1", "true", "yes")
-        )
         if allow_full_rebuild:
             if db_exists:
                 print(f"   [Sandbox] The isolated structure store will be rebuilt: {agent.structuring.db_path}")
@@ -2677,10 +2518,6 @@ def run_single_question(agent_cls, env_cls, build_fn, workspace_dir, video_id, c
             else:
                 # Rebuild ChromaDB from JSONL (no VLM required, just Embedding API)
                 _rebuild_sandbox_chroma_if_requested(agent.structuring)
-        elif db_exists and resume_structure_build:
-            print(f"   ↩️ [Sandbox] Continuing the isolated structure build: {agent.structuring.db_path}")
-            build_fn(env, agent.structuring)
-            _rebuild_sandbox_chroma_if_requested(agent.structuring)
         elif db_exists:
             print(f"   ⏭️ [Sandbox] Structure store already exists; build skipped: {agent.structuring.db_path}")
             # If ChromaDB is empty (e.g. not rebuilt since last force_rebuild), supplementary rebuild
@@ -3299,14 +3136,13 @@ def is_engineering_invalid_report(report: dict) -> bool:
         return False
     if report.get("engineering_invalid") is True:
         return True
-    if report.get("status") in ("engineering_abort", "preflight_failed"):
+    if report.get("status") == "engineering_abort":
         return True
-    if report.get("verdict") in ("engineering_blocked", "preflight_failed"):
+    if report.get("verdict") == "engineering_blocked":
         return True
     issues = (
         report.get("runtime_engineering_issues")
         or report.get("runtime_issues")
-        or report.get("api_issues")
         or []
     )
     return bool(issues and any(
@@ -3337,7 +3173,6 @@ def build_engineering_invalid_report(report: dict, source_path: str = "") -> dic
     issues = _redact_sensitive(
         report.get("runtime_engineering_issues")
         or report.get("runtime_issues")
-        or report.get("api_issues")
         or []
     )
     issue_types = []
@@ -3494,6 +3329,7 @@ def prebuild_isolated_video_structures(workspace_dir, video_ids, combo,
     unique_video_ids = sorted({str(item or "") for item in video_ids if str(item or "")})
     for index, video_id in enumerate(unique_video_ids, start=1):
         started = time.time()
+        struct_name = str((combo or {}).get("video_structuring") or "")
         try:
             env = VideoQAEnv(workspace_dir=workspace_dir, video_id=video_id)
             effective_configs = dict(custom_configs or {})
@@ -3504,7 +3340,6 @@ def prebuild_isolated_video_structures(workspace_dir, video_ids, combo,
             # generated structuring class may provide a conservative default
             # in its constructor, but it must not silently override this
             # runner-owned concurrency policy after the Agent has assembled.
-            struct_name = str((combo or {}).get("video_structuring") or "")
             requested_physics = (
                 (custom_configs or {}).get(struct_name, {}).get("physics", {})
                 if isinstance((custom_configs or {}).get(struct_name, {}), dict) else {}
@@ -3527,19 +3362,21 @@ def prebuild_isolated_video_structures(workspace_dir, video_ids, combo,
             artifact = str(getattr(agent.structuring, "db_path", "") or "")
             if not os.path.isfile(artifact) or os.path.getsize(artifact) <= 0:
                 raise RuntimeError("prebuild completed without a usable structure JSONL")
-            reports.append({
+            report = {
                 "video_id": video_id,
                 "status": "ok",
                 "structure_path": artifact,
                 "elapsed_sec": round(time.time() - started, 3),
-            })
+            }
+            reports.append(report)
         except Exception as exc:
-            reports.append({
+            report = {
                 "video_id": video_id,
                 "status": "error",
                 "error": str(exc),
                 "elapsed_sec": round(time.time() - started, 3),
-            })
+            }
+            reports.append(report)
             raise RuntimeError(
                 f"full-eval structure prebuild failed for {video_id}: {exc}"
             ) from exc

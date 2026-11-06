@@ -9,8 +9,10 @@ from typing import Any
 
 try:
     from .paths import output_root as resolve_output_root
+    from .paths import run_dir
 except ImportError:
     from paths import output_root as resolve_output_root
+    from paths import run_dir
 
 
 _SENSITIVE_ARG_TERMS = (
@@ -52,8 +54,7 @@ def _safe_error(error: Any, args: Any) -> str:
 def append_operation(*, output_root: str, run_id: str, stage: str, args: Any,
                      started_at: float, status: str, report: dict | None = None,
                      error: str = "") -> str:
-    root = resolve_output_root(output_root)
-    target = os.path.join(root, run_id) if run_id else root
+    target = run_dir(run_id, output_root) if run_id else resolve_output_root(output_root)
     os.makedirs(target, exist_ok=True)
     path = os.path.join(target, "operations.jsonl")
     payload = {

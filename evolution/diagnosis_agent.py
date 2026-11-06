@@ -1,13 +1,10 @@
-"""evolution LLM diagnosis and deterministic brief inputs for MetaVideoAgent evolution.
+"""Evidence-grounded diagnosis for the MetaVideoAgent evolution loop.
 
-Diagnosis consumes already-completed review, current-best trajectories,
-run-scoped memory, and optional probe-rejection evidence. It never launches
-Teacher review, reads mutable question-review caches, or inspects raw media.
-The first LLM selects one target and writes an audited evolution design; the
-second LLM compiles the target-locked implementation brief.
+Diagnosis investigates completed Teacher reviews, training traces, the current
+agent and previous attempts. Research and Codex retain the causal reasoning
+and supporting materials. Diagnosis never reviews raw media or held-out data.
 """
 
-import glob
 import json
 import os
 import re
@@ -15,7 +12,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from copy import deepcopy
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
@@ -30,9 +26,7 @@ from runtime_capability_context import (
 )
 from runtime_paths import (
     default_workspace,
-    metavideoagent_run_dir,
     require_metavideoagent_runtime,
-    runtime_output_root,
     use_runtime_path,
 )
 
@@ -46,58 +40,7 @@ from config import (
 )
 from review_contract import review_is_consumable
 from target_selection import build_target_selection, canonical_task_ref
-from task_identity import (
-    identity_from_entry,
-    make_task_id,
-)
-from task_sanitizer import sanitize_task_for_evolution
 
-TEACHER_ONLY_TOOL_TERMS = {
-    "DIAG_VIDEO_AUDIT": "Video review",
-    "DIAG_DETAIL_VIDEO_AUDIT": "Detailed video review",
-    "AUDIT_VIDEO": "Video review",
-    "AUDIT_DETAIL_VIDEO": "Detailed video review",
-    "AUDIT_ENHANCED_VIDEO": "Enhanced video review",
-    "AUDIT_STRUCTURE": "Structure library review",
-    "AUDIT_TRANSCRIPT": "Subtitle/audio text review",
-    "watch_video": "Video review",
-    "video_review": "Video review",
-    "teacher_video_verification": "Video review",
-    "detailed_watch": "Detailed video review",
-    "detail_video_review": "Detailed video review",
-    "fine_video_review": "Detailed video review",
-    "teacher_detailed_video_verification": "Detailed video review",
-    "enhanced_watch": "Enhanced video review",
-    "enhanced_video_review": "Enhanced video review",
-    "teacher_enhanced_video_verification": "Enhanced video review",
-    "browse_struct_db": "Structure library review",
-    "structure_review": "Structure library review",
-    "teacher_structure_db_audit": "Structure library review",
-    "read_transcript": "Subtitle/audio text review",
-    "transcript_review": "Subtitle/audio text review",
-    "teacher_transcript_audit": "Subtitle/audio text review",
-    "listen_audio": "Subtitle/audio text review",
-}
-
-DISALLOWED_RUNTIME_TOOL_TERMS = {
-    "frame_inspect": "visual perception ability",
-    "single_frame_inspect": "visual perception ability",
-    "inspect_frames": "visual perception ability",
-    "runtime_visual_observation_tool": "visual perception ability",
-    "runtime_visual_observation_capability": "visual perception ability",
-    "clip_search": "Structure retrieval/location capabilities",
-    "frame_clip_search": "Structure retrieval/location capabilities",
-    "search_evidence": "Evidence retrieval/location capabilities",
-    "runtime_localization_or_structure_retrieval_tool": "Structure retrieval/location capabilities",
-    "runtime_localization_or_structure_retrieval_capability": "Structure retrieval/location capabilities",
-    "runtime_evidence_retrieval_capability": "Evidence retrieval/location capabilities",
-    "global_browse": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_tool": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_capability": "Global structure browsing capabilities",
-    "audio_analysis": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_evidence_tool": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_capability": "Audio/subtitle understanding ability",
-}
 
 def _normalize_runtime_capability_needs(needs: object) -> list:
     """Bind diagnosis capability declarations to their registered contracts.
@@ -123,12 +66,10 @@ def _normalize_runtime_capability_needs(needs: object) -> list:
         need = raw_need
         capability = str(need.get("capability") or "")
         if capability == "vlm":
-            need["profile_id"] = DEFAULT_VLM_PROFILE_ID
+            need.setdefault("profile_id", DEFAULT_VLM_PROFILE_ID)
         elif capability == "llm":
-            # The configured diagnosis model is not an execution-combo
-            # capability. Generated thinking code must keep GLM5.2 as the
-            # final decision maker.
-            need["profile_id"] = DEFAULT_EXECUTION_LLM_PROFILE_ID
+            # Diagnosis and execution may use different configured models.
+            need.setdefault("profile_id", DEFAULT_EXECUTION_LLM_PROFILE_ID)
         profile = profiles.get(str(need.get("profile_id") or ""))
         if profile and str(profile.get("capability") or "") == str(need.get("capability") or ""):
             provenance = str(profile.get("input_provenance") or "")
@@ -165,18 +106,56 @@ def _trace_refs_for_targets(ledger: dict, targets: list[str]) -> list:
     return refs
 
 
-def complete_evidence_strategy(design: dict, ledger: dict, *, targets: list[str]) -> dict:
-    """Complete the machine-only evidence contract from the factual ledger.
+def _normalize_evidence_refs(refs, *, field: str) -> list[str]:
+    """Accept task-reference objects as well as strings, keeping first spelling."""
+    if refs is None:
+        return []
+    if not isinstance(refs, list):
+        raise ValueError(f"evidence_strategy.{field} must be a list of task references")
+    result = []
+    seen = set()
+    for item in refs:
+        video_id = ""
+        if isinstance(item, dict):
+            video_id = str(item.get("video_id") or "")
+            item = item.get("task_ref") or item.get("task_id") or item.get("time_reference")
+        if isinstance(item, (list, tuple)):
+            value = canonical_task_ref(item, video_id=video_id)
+        elif isinstance(item, str):
+            value = item.strip()
+        else:
+            value = ""
+        if not value:
+            raise ValueError(f"evidence_strategy.{field} contains an empty task reference")
+        canonical = canonical_task_ref(value)
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append(value)
+    return result
 
-    The LLM selects one or more modules and the causal design. It must not be trusted to
-    reproduce every historical task reference individually, because those
-    refs are evaluation-only and never reach research or Codex prompts. This
-    helper preserves any explanatory text the LLM supplied while deriving exhaustive
-    reference coverage from the already validated ledger.
+
+def _normalize_evidence_strategy(strategy) -> dict:
+    if strategy is None:
+        return {}
+    if not isinstance(strategy, dict):
+        raise ValueError("evidence_strategy must be an object")
+    normalized = dict(strategy)
+    for key in ("target_evidence_refs", "optional_mfp_witness_refs", "preserve_correction_refs",
+                "regression_guard_refs", "unchanged_failure_refs"):
+        if key in normalized:
+            normalized[key] = _normalize_evidence_refs(normalized[key], field=key)
+    return normalized
+
+
+def complete_evidence_strategy(design: dict, ledger: dict, *, targets: list[str]) -> dict:
+    """Supply missing probe references without replacing the model's reasoning.
+
+    Diagnosis owns its causal explanation and cited witnesses. The ledger adds
+    defaults when omitted and ensures comparison guards are not lost downstream.
     """
     completed = dict(design or {})
     ledger = ledger if isinstance(ledger, dict) else {}
-    strategy = dict(completed.get("evidence_strategy") or {})
+    strategy = _normalize_evidence_strategy(completed.get("evidence_strategy"))
     comparisons = [
         (ledger.get("target_comparison") or {}).get(str(target), {})
         for target in targets
@@ -222,15 +201,16 @@ def complete_evidence_strategy(design: dict, ledger: dict, *, targets: list[str]
     unchanged = _ledger_task_refs(ledger, "unchanged_failure_evidence")
     causal = str(completed.get("causal_hypothesis") or completed.get("design_summary") or "").strip()
 
-    # Exact coverage is deterministic; only the LLM's causal explanations are
-    # retained as natural-language content.
-    strategy["target_evidence_refs"] = target_refs
-    strategy["optional_mfp_witness_refs"] = direct_mfp_refs
-    strategy["target_evidence_basis"] = evidence_basis
-    strategy["selection_basis"] = evidence_basis
-    strategy["preserve_correction_refs"] = corrections
-    strategy["regression_guard_refs"] = regressions
-    strategy["unchanged_failure_refs"] = unchanged
+    strategy.setdefault("target_evidence_refs", target_refs)
+    strategy.setdefault("optional_mfp_witness_refs", direct_mfp_refs)
+    strategy.setdefault("target_evidence_basis", evidence_basis)
+    strategy.setdefault("selection_basis", evidence_basis)
+    for key, refs in (
+        ("preserve_correction_refs", corrections),
+        ("regression_guard_refs", regressions),
+        ("unchanged_failure_refs", unchanged),
+    ):
+        strategy[key] = _normalize_evidence_refs([*(strategy.get(key) or []), *refs], field=key)
     strategy.setdefault(
         "repair_hypothesis",
         causal or f"Address current-best failures attributed to: {', '.join(targets)}.",
@@ -241,36 +221,16 @@ def complete_evidence_strategy(design: dict, ledger: dict, *, targets: list[str]
     )
     strategy.setdefault(
         "regression_protection",
-        "Treat every regression reference as a mandatory probe guard; do not accept an improvement that reintroduces one.",
+        "Retain regression references as probe guards and assess their risk alongside corrections and full-train accuracy.",
     )
     strategy.setdefault(
         "unchanged_failure_interpretation",
         "Use unchanged failures as causal evidence of whether the selected mechanism was blocked, untriggered, or ineffective.",
     )
-    strategy["source"] = "deterministic_evidence_ledger_completion"
+    strategy.setdefault("source", "diagnosis_with_ledger_defaults")
     completed["evidence_strategy"] = strategy
     return completed
 
-
-def sanitize_tool_terms_for_evolution(value):
-    """Convert Teacher/previous tool names into capability-level wording."""
-    if isinstance(value, dict):
-        sanitized = {}
-        for k, v in value.items():
-            if k == "react_trace":
-                continue
-            else:
-                sanitized[k] = sanitize_tool_terms_for_evolution(v)
-        return sanitized
-    if isinstance(value, list):
-        return [sanitize_tool_terms_for_evolution(v) for v in value]
-    if not isinstance(value, str):
-        return value
-    text = value
-    replacements = {**TEACHER_ONLY_TOOL_TERMS, **DISALLOWED_RUNTIME_TOOL_TERMS}
-    for old, new in sorted(replacements.items(), key=lambda item: -len(item[0])):
-        text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
-    return text
 
 try:
     from utils import format_json as _runtime_format_json
@@ -294,8 +254,8 @@ def format_json(raw_text: str, max_tokens: int = 4096) -> dict | None:
         return None
 
 # Diagnosis is deliberately independent from Codex codegen. The evolution LLM forms
-# a cross-question, evidence-grounded module-set design; the deterministic brief
-# compiler turns that design into an executable five-module bundle contract.
+# a cross-question causal design. Operational fields are attached to the same
+# report; Research and Codex can still read its complete analysis and evidence.
 # Diagnosis may require a longer context than execution-time answering.  The
 # environment override is intentionally diagnosis-only: it must not alter the
 # formal execution LLM profile used by full evaluation.
@@ -311,7 +271,7 @@ DIAGNOSIS_OUTPUT_MAX_TOKENS = int(
 class DiagnosisAgent:
     """evolution LLM-backed diagnosis agent for MetaVideoAgent evolution."""
 
-    MAX_ROUNDS = 15
+    MAX_ROUNDS = 24
 
     def __init__(self, workspace_dir: str, video_id: str = None,
                  evolution_memory: str = None,
@@ -324,13 +284,15 @@ class DiagnosisAgent:
                  reference_results_path: str = "",
                  reference_label: str = "",
                  iter_context: dict = None,
-                 iter_context_path: str = "",
-                 brief_validation_feedback: list[str] | None = None,
-                 diagnosis_attempt: int = 1):
+                 iter_context_path: str = ""):
         self.workspace_dir = workspace_dir
-        # Iteration path management
-        from workspace_paths import IterationPaths
-        self.iter_paths = IterationPaths(workspace_dir, iteration=iteration)
+        from iteration_workspace import IterationWorkspace
+        iter_context = iter_context or self._load_evolution_review(iter_context_path)
+        root = (iter_context or {}).get("iter_dir")
+        if not root:
+            raise ValueError("Diagnosis requires an explicit iter_context.iter_dir")
+        self.iteration = IterationWorkspace(root)
+        self.iteration_index = int((iter_context or {}).get("iter_index") or iteration or 1)
         self.distribution_manifest = distribution_manifest or (
             (previous_diagnosis or {}).get("distribution_manifest", "")
             if isinstance(previous_diagnosis, dict) else ""
@@ -340,10 +302,7 @@ class DiagnosisAgent:
         self.evolution_memory = evolution_memory or ""
         self.previous_evolution_result = previous_evolution_result
         self.previous_diagnosis = previous_diagnosis  # Last round of diagnostic report (my previous output)
-        self.evolution_review_path = evolution_review_path or (
-            self._find_latest_evolution_review()
-            if previous_evolution_result else ""
-        )
+        self.evolution_review_path = evolution_review_path or ""
         self.evolution_review = self._load_evolution_review(self.evolution_review_path)
         if evolution_review_path and not review_is_consumable(self.evolution_review):
             raise RuntimeError(
@@ -372,11 +331,6 @@ class DiagnosisAgent:
         )
         self.iter_context_path = iter_context_path or ""
         self.iter_context = iter_context or self._load_evolution_review(self.iter_context_path)
-        self.brief_validation_feedback = [
-            str(item).strip() for item in (brief_validation_feedback or [])
-            if str(item).strip()
-        ][:24]
-        self.diagnosis_attempt = max(1, int(diagnosis_attempt or 1))
         if not self.reference_results_path:
             raise RuntimeError(
                 "MetaVideoAgent diagnosis requires explicit reference_results_path; "
@@ -386,21 +340,16 @@ class DiagnosisAgent:
             (previous_diagnosis or {}).get("observed_distribution_profile", {})
             if isinstance(previous_diagnosis, dict) else {}
         )
-        # Compute the cost budget from the explicit current reference.
-        from cost_calculator import (
-            compute_reference_cost,
-            format_cost_budget,
-        )
+        from cost_calculator import compute_reference_cost
         from reference_loader import load_reference_trajectories
-        self._cost_baseline = compute_reference_cost(
+        self._reference_cost = compute_reference_cost(
             load_reference_trajectories(
                 self.reference_results_path,
                 reference_label=self.reference_label,
             )
         )
-        self._cost_budget_text = format_cost_budget(self._cost_baseline)
         from evolution_phase_policy import for_iteration
-        self.evolution_phase_policy = for_iteration(getattr(self.iter_paths, "iteration", None))
+        self.evolution_phase_policy = for_iteration(self.iteration_index)
 
         # Trajectory cache (grouped by time_reference)
         self._trajectories = None      # dict[str, list[dict]]
@@ -432,55 +381,25 @@ class DiagnosisAgent:
     def _format_iter_context_for_prompt(self) -> str:
         if not self.iter_context:
             return ""
-        compact_rejections = []
-        for item in (self.iter_context.get("candidate_rejections") or [])[:3]:
-            if not isinstance(item, dict):
-                continue
-            audit = item.get("probe_audit_summary") or {}
-            compact_rejections.append({
-                "context_type": item.get("context_type", ""),
-                "outcome_status": str((item.get("decision") or {}).get("status") or ""),
-                "probe_metrics": item.get("probe_metrics", {}),
-                "probe_issues": (audit.get("issues") or [])[:6],
-            })
-        selection = self._target_selection or {}
         payload = {
-            "run_id": self.iter_context.get("run_id"),
-            "iter_index": self.iter_context.get("iter_index"),
             "reference_label": self.reference_label,
-            "current_best_preserve_contract": {
-                "base": "current_best",
-                "unselected_modules_remain_current_best_unless_required_by_linked_change": True,
-            },
-            "historical_module_outcomes": selection.get("prior_module_outcomes", {}),
-            "candidate_rejections": compact_rejections,
+            "current_best": self.iter_context.get("current_best", {}),
+            "history": self.iter_context.get("history", {}),
+            "previous_round": self.iter_context.get("previous_round", {}),
+            "candidate_rejections": self.iter_context.get("candidate_rejections", []),
             "diagnosis_requirements": self.iter_context.get("diagnosis_requirements", {}),
+            "previous_diagnosis": self.previous_diagnosis,
             "evolution_phase_policy": self.evolution_phase_policy,
         }
         return (
-            "## Per-iteration evolution context\n"
-            "This is audit/outcome/guard context only. Do not infer or reuse an earlier "
-            "target set, candidate name, implementation hint, or historical combo as "
-            "the next direction. The deterministic evidence ledger is the sole target-selection "
-            "evidence. The current best is the only execution baseline.\n"
-            "If candidate_rejections are present, treat them as failed runnable "
-            "candidate outcome/guard evidence, not as a target recommendation.\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)[:14000]}"
+            "## Iteration history and open work\n"
+            "The current best is the only execution baseline. Use previous reasoning, "
+            "outcomes and unresolved questions to avoid restarting the investigation. "
+            "Distinguish full-evaluation evidence, probe evidence and engineering failures. "
+            "A previous target is neither a required next target nor a ban on that module. "
+            "Read the named materials when the supporting trace or implementation matters.\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
         )
-
-    def _external_history_meta(self) -> dict:
-        formal_output_root = os.path.abspath(runtime_output_root())
-        paths = []
-        for path in (self.reference_results_path, self.evolution_review_path):
-            if not path:
-                continue
-            abs_path = os.path.abspath(path)
-            if not abs_path.startswith(formal_output_root + os.sep):
-                paths.append(abs_path)
-        return {
-            "external_history_input": bool(paths),
-            "external_history_paths": paths,
-        }
 
     def _build_target_selection(self) -> dict:
         """Build the machine-only evidence ledger before LLM diagnosis."""
@@ -492,157 +411,26 @@ class DiagnosisAgent:
         return self._target_selection
 
     def _format_target_selection_for_prompt(self) -> str:
-        """Render a model-safe summary, never the machine-only ledger itself."""
-        selection = self._target_selection or {}
-        if not selection:
-            return ""
-        comparison = selection.get("target_comparison", {}) or {}
-        modules = {}
-        for module in ("video_structuring", "localization", "perception", "memory", "thinking"):
-            facts = comparison.get(module, {}) or {}
-            repair = facts.get("direct_repair", {}) or {}
-            regression = facts.get("direct_regression_stabilization", {}) or {}
-            correction = facts.get("candidate_correction_preservation", {}) or {}
-            blocked = facts.get("blocked_upstream", {}) or {}
-            mfp_coverage = facts.get("validated_mfp_coverage", {}) or {}
-            weak = facts.get("weak_failure_distribution", {}) or {}
-            modules[module] = {
-                "direct_repair_count": int(repair.get("count") or 0),
-                "direct_repair_cause_kinds": list(repair.get("cause_kinds") or []),
-                "candidate_regression_guard_count": int(regression.get("count") or 0),
-                "candidate_correction_preserve_count": int(correction.get("count") or 0),
-                "blocked_or_untriggered_count": int(blocked.get("count") or 0),
-                "validated_mfp_mechanism_clusters": int(mfp_coverage.get("cluster_count") or 0),
-                "validated_mfp_failure_kinds": list(mfp_coverage.get("failure_kinds") or []),
-                "validated_mfp_video_coverage": int(mfp_coverage.get("video_count") or 0),
-                "weak_failure_cluster_count": int(weak.get("cluster_count") or 0),
-                "weak_failure_stages": list(weak.get("failure_stages") or []),
-                "weak_evidence_qualities": list(weak.get("evidence_qualities") or []),
-                "weak_capability_signatures": list(weak.get("capability_signatures") or []),
-                "weak_consumer_states": list(weak.get("consumer_states") or []),
-                "weak_semantic_categories": list(weak.get("semantic_categories") or []),
-                "history_outcome": str(facts.get("history_outcome") or ""),
-            }
-        mechanism_index = selection.get("mfp_mechanism_cluster_index", {}) or {}
-        mfp_mechanisms = []
-        for item in mechanism_index.get("clusters", []) or []:
-            if not isinstance(item, dict):
-                continue
-            mfp_mechanisms.append({
-                "root_module": str(item.get("root_module") or ""),
-                "failure_kind": str(item.get("failure_kind") or ""),
-                "consumer_signature": str(item.get("consumer_signature") or ""),
-                "capability_needs": list(item.get("capability_needs") or []),
-                "task_coverage": len(item.get("refs") or []),
-                "video_coverage": len(item.get("video_ids") or []),
-            })
-        repair_mechanisms = []
-        for item in ((selection.get("validated_review_repair_mechanisms") or {}).get("clusters") or []):
-            if not isinstance(item, dict):
-                continue
-            repair_mechanisms.append({
-                "modules": list(item.get("modules") or []),
-                "repair_mechanism": str(item.get("repair_mechanism") or ""),
-                "handoff_or_state_to_repair": str(item.get("handoff_or_state_to_repair") or ""),
-                "falsifiable_runtime_signals": list(item.get("falsifiable_runtime_signals") or []),
-                "generalization_scopes": list(item.get("generalization_scopes") or []),
-                "task_coverage": len(item.get("refs") or []),
-                "video_coverage": len(item.get("video_ids") or []),
-            })
-        weak_distribution = selection.get("weak_failure_distribution", {}) or {}
-        weak_mechanisms = []
-        for item in weak_distribution.get("clusters", []) or []:
-            if not isinstance(item, dict):
-                continue
-            weak_mechanisms.append({
-                "suggested_module": str(item.get("suggested_module") or "unattributed"),
-                "trace_cause_kind": str(item.get("trace_cause_kind") or ""),
-                "failure_stage": str(item.get("failure_stage") or ""),
-                "evidence_quality": str(item.get("evidence_quality") or ""),
-                "capability_signature": str(item.get("capability_signature") or ""),
-                "consumer_state": str(item.get("consumer_state") or ""),
-                "semantic_category": str(item.get("semantic_category") or ""),
-                "effect_verdict": str(item.get("effect_verdict") or ""),
-                "task_coverage": len(item.get("refs") or []),
-                "video_coverage": len(item.get("video_ids") or []),
-            })
-        contract = {
-            "modules": modules,
-            "reviewed_candidate_targets": list(selection.get("reviewed_candidate_targets") or []),
-            "validated_mfp_mechanism_distribution": mfp_mechanisms,
-            "validated_review_repair_mechanisms": repair_mechanisms,
-            "all_wrong_trace_distribution": {
-                "total_task_coverage": int(weak_distribution.get("total_wrong_task_refs") or 0),
-                "mechanism_clusters": weak_mechanisms,
-            },
-            "macro_module_hypotheses": [
-                {
-                    "module": str(module),
-                    "level": str((details or {}).get("level") or ""),
-                    # Reasons and refs remain audit-only because they can carry
-                    # task-specific text. This is an aggregate hypothesis, not
-                    # direct repair evidence.
-                    "has_review_rationale": bool((details or {}).get("reason")),
-                }
-                for module, details in (
-                    ((getattr(self, "evolution_review", {}).get("macro_review") or {}).get("module_responsibility") or {}).items()
-                    if isinstance(getattr(self, "evolution_review", {}), dict) else []
-                )
-                if str(module) in {"video_structuring", "localization", "perception", "memory", "thinking"}
-                and isinstance(details, dict)
-            ],
-            "policy": {
-                "corrections_are_preserve_evidence": True,
-                "regressions_are_guards_not_repair_claims": True,
-            "history_is_a_guard_not_a_module_ban": True,
-            "trace_distribution_selects_mechanism_not_direct_claim": True,
-            "validated_mfp_is_optional_probe_witness": True,
-            "validated_review_repair_mechanisms_are_design_evidence_not_target_votes": True,
-                "all_model_evidence_is_task_free": True,
-            },
-        }
+        """Expose linked evidence, not just counts with the rationale removed."""
         return (
-            "## Model-safe evidence summary\n"
-            "This summary is derived from a machine-only ledger; task references, paths, and detailed "
-            "trajectories are intentionally excluded. It records facts but does not choose target_modules. Do not reuse a previous "
-            "candidate target set as a default. Compare every module in target_comparison and select one "
-            "linked causal mechanism yourself. Explain why the selected module set is preferable to the concrete "
-            "alternatives. Select the target from the complete trace distribution and macro hypotheses, not from the "
-            "number of validated MFPs. MFP mechanisms are optional high-resolution probe witnesses only; they must "
-            "not veto a broadly supported target and they must not be relabelled as global proof. Set "
-            "evolution_design.evidence_strategy.selection_basis to exactly one of distribution_mechanism, "
-            "narrow_mfp_repair, regression_stabilization, or bounded_exploration. Candidate corrections identify behavior worth "
-            "preserving. Regression stabilization is valid only for the reviewed candidate's changed "
-            "module set, and regressions remain probe guards, never repair claims. Unchanged failures must "
-            "explain whether the previous mechanism was not triggered, had no effect, or was blocked "
-            "upstream/downstream. Prior module outcomes are guards, never a ban on evolving that module "
-            "again. If the selected module set has broad trace support, label it distribution_mechanism and give a concrete, "
-            "bounded, falsifiable mechanism hypothesis. If it has neither broad trace nor regression support, label it "
-            "bounded_exploration and give a concrete, bounded, falsifiable exploration "
-            "rationale. In evidence_strategy.selection_rationale, explicitly state why this target is "
-            "preferred over the direct-repair, stabilization, or exploration alternatives shown in the "
-            "comparison table. LLM risk hypotheses are not direct evidence and must be labelled as hypotheses. "
-            "evolution_design must also include "
-            "audit-only evidence_strategy: target_evidence_refs, preserve_correction_refs, "
-            "regression_guard_refs, unchanged_failure_refs, repair_hypothesis, correction_preservation, "
-            "regression_protection, unchanged_failure_interpretation, and exploration_rationale when "
-            "there is no direct repair support. Keep the final JSON concise: do not enumerate task refs, "
-            "full fault lists, or per-question diagnoses. Set the four evidence-reference arrays to [] because "
-            "the deterministic completion layer fills them exactly. Keep each natural-language field focused "
-            "on the causal design rather than repeating review text.\n"
-            "Use the complete mechanism distribution, not a single sample. Validated per-question repair mechanisms "
-            "are trace-grounded design evidence: use their stated handoff and falsifiable signal when forming a causal "
-            "direction, but do not turn their module labels into an automatic target vote. Validated MFP mechanisms are optional "
-            "probe witnesses; the trace distribution provides broad mechanism coverage but is not a direct per-question "
-            "repair claim. Include mechanism_scope in evolution_design: runtime applicability, covered "
-            "failure kinds, expected producer/consumer handoff, direct-support scope, and a distinct "
-            "generalization scope for probe. Include 1-3 diagnosis-owned probe_hypotheses: each states an "
-            "information gap, proposed module-set intervention, expected observable evidence, preserved "
-            "consumer, falsifiable success condition, and optional failure_kinds. A hypothesis may use a "
-            "complementary capability rather than the capability observed in a failing trajectory, but must "
-            "state the causal bridge. The design must be triggered by generic runtime state, never "
-            "by a question, video, timestamp, answer, or transcript phrase.\n"
-            f"{json.dumps(contract, ensure_ascii=False, indent=2)}"
+            "## Training evidence index\n"
+            "This ledger indexes evidence; it does not choose the target. Compare plausible "
+            "module-level explanations against the actual review and traces. Broad trace "
+            "patterns support a distribution mechanism; validated minimal failure points "
+            "are optional high-resolution witnesses, not module votes or global proof. "
+            "Candidate corrections are behavior to preserve. Regressions remain guards, "
+            "not relabelled repair claims. Explain whether unchanged failures were blocked, "
+            "untriggered or unaffected. History is evidence, not a module blacklist.\n"
+            "Record the evidence references you actually used and your selection rationale "
+            "in evolution_design.evidence_strategy. Label unsupported causal links as "
+            "hypotheses and explain bounded exploration when direct support is absent. "
+            "Describe mechanism_scope: runtime applicability, covered failure kinds, "
+            "producer/consumer handoff, direct-support scope and generalization scope. "
+            "Supply 1-3 falsifiable probe hypotheses covering information gaps, interventions, "
+            "observable runtime signals, consumer behavior and fallbacks. A complementary "
+            "capability is allowed when its causal bridge is explained. Examples may support "
+            "analysis; implementation triggers must generalize beyond task IDs or answers.\n"
+            + json.dumps(self._target_selection or {}, ensure_ascii=False, indent=2)
         )
 
     def _apply_target_selection(self, report: dict) -> dict:
@@ -714,7 +502,7 @@ class DiagnosisAgent:
             if preserved else
             " Preserve unaffected behavior across the complete bundle."
         )
-        algo["evolution_hint"] = (
+        algo["evolution_hint"] = algo.get("evolution_hint") or (
             "Canonical next-round direction: evolve "
             f"`{target_text}` from the retained current-best bundle."
             + preservation
@@ -748,9 +536,8 @@ class DiagnosisAgent:
         The LLM may describe a desired probe, but it cannot decide whether a
         candidate correction is a repair or whether a regression is a guard.
         Those roles are fixed by the paired review ledger and must be refreshed
-        after `_apply_target_selection` replaces LLM diagnoses with facts.
+        after `_apply_target_selection` adds the training evidence ledger.
         """
-        algo = report.setdefault("algorithmic_evolution", {})
         decision = report.setdefault("evolution_decision", {})
         strategy = (report.get("evolution_design", {}) or {}).get("evidence_strategy", {}) or {}
         target_refs = list(strategy.get("target_evidence_refs") or [])
@@ -851,9 +638,9 @@ class DiagnosisAgent:
         report["probe_plan"] = decision["probe_plan"]
         report["has_prior_candidate_review"] = self._has_prior_candidate_review()
         report["validation_policy"] = self._build_validation_policy(report, constraints)
-        self._attach_review_cost_contract(report, constraints)
+        self._attach_review_cost_contract(report)
 
-    def _attach_review_cost_contract(self, report: dict, constraints: dict) -> None:
+    def _attach_review_cost_contract(self, report: dict) -> None:
         """Make a completed review's cost requirement executable and auditable.
 
         Cost findings are aggregate review evidence, not a reason to suppress
@@ -906,6 +693,13 @@ class DiagnosisAgent:
 
     def run(self) -> dict:
         """Run diagnostics and return a structured diagnostic report."""
+        self._attempt_dir = self.iteration.reserve("diagnosis")
+        self.diagnosis_attempt = int(self._attempt_dir.name.removeprefix("attempt_")) + 1
+        (self._attempt_dir / "request.json").write_text(json.dumps({
+            "context": self.iteration.context("diagnosis"),
+            "reference_results": self.reference_results_path,
+            "review": self.evolution_review_path,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         print("=" * 70)
         entry_mode = self._diagnosis_entry_mode()
         if entry_mode == "post_full_eval_review":
@@ -919,7 +713,7 @@ class DiagnosisAgent:
         else:
             mode = "first diagnosis"
 
-        print(f"Diagnostic Agent startup [{mode}] (direct diagnosis)")
+        print(f"Diagnosis startup [{mode}] (evidence investigation)")
         print("=" * 70)
         print(f"   Workspace: {self.workspace_dir}")
         print(f"   Videos: {', '.join(self.video_ids) if self.video_ids else self.video_id}")
@@ -951,26 +745,30 @@ class DiagnosisAgent:
             f"regression={len(selection.get('regression_guards') or [])}"
         )
 
-        # Diagnosis is one bounded evolution LLM design pass, not an exploratory
-        # tool-using agent. All admissible evidence was loaded above.
-        raw_output = self._run_direct_diagnosis()
-
-        # Save the direct LLM exchange for audit only.
-        self._save_rollout()
+        # Investigate the supplied evidence without launching new review work.
+        try:
+            raw_output = self._run_direct_diagnosis()
+        except Exception as exc:
+            failure_path = self._attempt_dir / "failure.json"
+            failure_path.write_text(json.dumps({"error": str(exc), "next_task": {
+                "stage": "diagnosis", "task": "Continue the evidence investigation recorded in rollout.json.",
+            }}, indent=2), encoding="utf-8")
+            self.iteration.record("diagnosis", failure_path, status="pending",
+                                  next_task={"stage": "diagnosis", "error": str(exc)})
+            raise
+        finally:
+            # Failed investigations also contain useful evidence and open work.
+            self._save_rollout()
 
         # Extract diagnostic reports from LLM output
-        report = getattr(
-            self,
-            "_accepted_diagnosis_report",
-            self._parse_report(raw_output, allow_llm_repair=False),
-        )
+        report = (getattr(self, "_accepted_diagnosis_report", None)
+                  or self._parse_report(raw_output, allow_llm_repair=False))
         report = self._apply_target_selection(report)
 
         # Complete the timestamp and save it
         report.setdefault("timestamp", int(time.time()))
         report["diagnosis_attempt"] = self.diagnosis_attempt
-        if self.brief_validation_feedback:
-            report["prior_brief_validation_feedback"] = list(self.brief_validation_feedback)
+        report["diagnosis_rollout_path"] = getattr(self, "_rollout_path", "")
         report["diagnosis_entry_mode"] = entry_mode
         if self.observed_distribution_profile:
             report.setdefault(
@@ -987,6 +785,8 @@ class DiagnosisAgent:
         if self.iter_context:
             report["iter_context_path"] = os.path.abspath(self.iter_context_path) if self.iter_context_path else self.iter_context.get("path", "")
             report["iter_context"] = {
+                "iter_dir": str(self.iteration.root),
+                "stage_context": self.iteration.context("diagnosis"),
                 "run_id": self.iter_context.get("run_id"),
                 "iter_index": self.iter_context.get("iter_index"),
                 "reference": self.iter_context.get("reference", {}),
@@ -996,7 +796,6 @@ class DiagnosisAgent:
                 "candidate_rejections": self.iter_context.get("candidate_rejections", [])[:3],
                 "diagnosis_requirements": self.iter_context.get("diagnosis_requirements", {}),
             }
-        report["history_input_policy"] = self._external_history_meta()
         report["reference_label"] = self.reference_label
         report["reference_policy"] = (
             "Teacher/Diagnosis trajectory tools read the explicit reference combo "
@@ -1007,15 +806,14 @@ class DiagnosisAgent:
         return report
 
     def _save_rollout(self):
-        """Persist the direct diagnosis LLM exchange for audit."""
+        """Preserve the investigation and evidence reads, including failed attempts."""
         if not hasattr(self, "_rollout_trace") or not self._rollout_trace:
             return
-        import time as _time
-        ts = int(_time.time())
+        ts = int(time.time())
         diag_dir = self._diagnosis_dir()
         os.makedirs(diag_dir, exist_ok=True)
-        suffix = f"_attempt{self.diagnosis_attempt}" if self.diagnosis_attempt > 1 else ""
-        rollout_path = os.path.join(diag_dir, f"diagnosis_rollout_{ts}{suffix}.json")
+        rollout_path = os.path.join(diag_dir, "rollout.json")
+        self._rollout_path = rollout_path
         with open(rollout_path, "w", encoding="utf-8") as f:
             json.dump({
                 "timestamp": ts,
@@ -1093,238 +891,175 @@ class DiagnosisAgent:
         return str(raw_content or "")
 
     def _adaptive_execution_contract_issues(self, report: dict) -> list[str]:
-        """Fail closed before accepting a bundle design from diagnosis.
-
-        Diagnosis is an upstream specification for code generation, so a
-        syntactically valid model response is not sufficient.  In particular,
-        its thinking fallback must preserve uncertainty as metadata while
-        still requiring the execution LLM to select a concrete, parseable
-        answer from the question's options.  Reuse the deterministic brief
-        compiler here rather than relying on a prompt instruction that a
-        model may overlook.
-        """
+        """Require an actionable diagnosis, not an early implementation schema."""
+        from bundle_contract import normalize_modules, validate_handoff_contracts
         if not isinstance(report, dict):
             return ["diagnosis response is not a JSON object"]
-        modules = (
-            (report.get("evolution_design") or {}).get("target_modules")
-            or (report.get("algorithmic_evolution") or {}).get("target_modules")
-            or []
-        )
-        if not isinstance(modules, list) or not modules:
-            return ["response lacks a non-empty target_modules list"]
-        try:
-            from diagnosis_execution_brief import (
-                build_bundle_execution_brief,
-                validate_bundle_execution_brief,
-            )
-            brief = build_bundle_execution_brief(
-                report,
-                diagnosis_path="<in_memory_diagnosis>",
-                review=self.evolution_review,
-                review_path=self.evolution_review_path,
-            )
-            return list(validate_bundle_execution_brief(brief))
-        except Exception as exc:
-            return [f"bundle execution contract rejected diagnosis: {exc}"]
-
-    def _enforce_thinking_final_answer_contract(self, report: dict) -> dict:
-        """Normalize only an invalid terminal-thinking fallback.
-
-        The diagnosis model owns the mechanism, but it cannot alter the
-        execution protocol: an evaluated task always ends in one concrete
-        answer chosen by the execution LLM. If a model emits a generic
-        abstention token as the terminal fallback, replace that one fallback
-        with the canonical protocol and retain an auditable normalization
-        record. Evidence uncertainty and bounded replanning remain part of
-        the design as metadata and control flow.
-        """
-        if not isinstance(report, dict):
-            return report
         design = report.get("evolution_design") or {}
-        responsibilities = design.get("module_responsibilities") or {}
-        thinking = responsibilities.get("thinking") or {}
-        fallback = str(thinking.get("fallback") or "")
-        output_invariant = str(thinking.get("output_invariant") or "")
+        if not isinstance(design, dict):
+            return ["evolution_design must be an object"]
         try:
-            from diagnosis_execution_brief import _FORBIDDEN_THINKING_FINAL_FALLBACK_RE
-            forbidden = bool(_FORBIDDEN_THINKING_FINAL_FALLBACK_RE.search(fallback)) or bool(
-                _FORBIDDEN_THINKING_FINAL_FALLBACK_RE.search(output_invariant)
+            modules = normalize_modules(design.get("target_modules"))
+        except ValueError as exc:
+            return [str(exc)]
+        issues = []
+        for field in ("design_summary", "failure_chain", "evolution_mechanism"):
+            if not str(design.get(field) or "").strip():
+                issues.append(f"evolution_design.{field} must explain the causal direction")
+        issues.extend(validate_handoff_contracts(design.get("handoff_contracts"), changed_modules=modules))
+        try:
+            design["evidence_strategy"] = _normalize_evidence_strategy(design.get("evidence_strategy"))
+            ledger = getattr(self, "_target_selection", {}) or {}
+            if ledger.get("target_comparison"):
+                report["evolution_design"] = complete_evidence_strategy(design, ledger, targets=modules)
+        except (TypeError, ValueError) as exc:
+            issues.append(str(exc))
+        return issues
+
+
+    def _diagnosis_materials(self) -> dict:
+        from evolution.working_materials import material_paths
+        materials = material_paths(self.iter_context or {})
+        if self.evolution_review_path:
+            materials["review"] = self.evolution_review_path
+        # Use the manifest-filtered trajectory loader instead of unfiltered files.
+        materials.pop("current_results", None)
+        return materials
+
+    def _read_diagnosis_material(self, request: dict) -> dict:
+        from evolution.working_materials import read_material
+        name = str(request.get("material") or "")
+        if name != "trajectories":
+            return read_material(
+                self._diagnosis_materials(), name,
+                offset=request.get("offset", 0), limit=request.get("limit", 160),
+                module=str(request.get("module") or ""),
             )
-        except Exception:
-            forbidden = bool(re.search(
-                r"uncertain|unanswerable|evidence[_ -]?insufficient|insufficient evidence|unanswerable|uncertain",
-                fallback + "\n" + output_invariant,
-                flags=re.IGNORECASE,
-            ))
-        probe_hypotheses = design.get("probe_hypotheses") or []
-        terminal_abstention_hypotheses = [
-            hypothesis for hypothesis in probe_hypotheses
-            if isinstance(hypothesis, dict)
-            and any(
-                re.search(r"unanswerable|unable to answer", str(hypothesis.get(field) or ""), re.I)
-                for field in ("expected_observable", "success_condition", "fallback")
-            )
-        ]
-        if not forbidden and not terminal_abstention_hypotheses:
-            return report
-        normalized = deepcopy(report)
-        if forbidden:
-            normalized_thinking = (
-                ((normalized.setdefault("evolution_design", {}))
-                 .setdefault("module_responsibilities", {}))
-                 .setdefault("thinking", {})
-            )
-            normalized_thinking["fallback"] = (
-                "After the bounded replan cap, the thinking LLM uses the retained "
-                "evidence/context, original question, and answer options to select one "
-                "concrete parseable final answer. It records low confidence, unresolved "
-                "evidence gaps, and replan history as metadata without replacing the answer."
-            )
-            normalized_thinking["output_invariant"] = (
-                "When the sufficiency gate passes, finish with a concrete parseable answer; "
-                "when it fails, issue a bounded replan, and when that budget is exhausted, "
-                "have the LLM select one concrete parseable answer from the supplied options "
-                "with low-confidence and evidence-gap metadata."
-            )
-            for key in ("cost_guardrails", "cost_guards"):
-                values = (normalized.get("evolution_design") or {}).get(key)
-                if not isinstance(values, list):
-                    continue
-                normalized["evolution_design"][key] = [
-                    (
-                        "When the bounded replan budget is exhausted, force LLM selection "
-                        "of one concrete parseable answer and record uncertainty only as metadata."
-                        if re.search(r"uncertain(?:ty)?|unanswerable|evidence[_ -]?insufficient", str(value), re.I)
-                        else value
-                    )
-                    for value in values
-                ]
-            for need in (normalized.get("evolution_design") or {}).get("runtime_capability_needs") or []:
-                if not isinstance(need, dict) or str(need.get("capability") or "") != "llm":
-                    continue
-                fallback_text = str(need.get("fallback") or "")
-                if re.search(r"never output specific option|uncertain(?:ty)?|unanswerable|evidence[_ -]?insufficient", fallback_text, re.I):
-                    need["fallback"] = (
-                        "Replan conservatively while budget remains; once exhausted, the LLM selects "
-                        "one concrete parseable answer from the retained evidence, question, and options, "
-                        "and records limitations as metadata."
-                    )
-        normalized_hypotheses = (normalized.get("evolution_design") or {}).get("probe_hypotheses") or []
-        for hypothesis in normalized_hypotheses:
-            if not isinstance(hypothesis, dict):
-                continue
-            for field in ("expected_observable", "success_condition", "fallback"):
-                text = str(hypothesis.get(field) or "")
-                if re.search(r"unanswerable|unable to answer", text, re.I):
-                    hypothesis[field] = (
-                        "After bounded replanning, the thinking LLM selects one concrete "
-                        "parseable final answer from the supplied options and records low confidence "
-                        "and unresolved evidence gaps only as metadata."
-                    )
-        normalized.setdefault("diagnosis_contract_normalizations", []).append({
-            "rule": "thinking_final_answer_must_be_concrete_parseable",
-            "field": "evolution_design.module_responsibilities.thinking.fallback_and_probe_hypotheses",
-            "original_fallback": fallback,
-            "original_output_invariant": output_invariant,
-            "normalized_reason": (
-                "Generic abstention cannot terminate an evaluated task; uncertainty is "
-                "preserved as metadata while the LLM selects from the supplied options."
-            ),
-        })
-        return normalized
+        trajectories = self._load_trajectories()
+        task_id = str(request.get("task_id") or "")
+        if task_id:
+            if task_id not in trajectories:
+                raise ValueError("Unknown task_id; read the trajectory index first")
+            payload = {task_id: trajectories[task_id]}
+        else:
+            payload = {"task_ids": list(trajectories)}
+        lines = json.dumps(payload, ensure_ascii=False, indent=2).splitlines()
+        start = max(0, int(request.get("offset", 0)))
+        end = min(len(lines), start + max(1, min(400, int(request.get("limit", 160)))))
+        return {
+            "material": name, "task_id": task_id, "content": "\n".join(lines[start:end]),
+            "next_offset": end if end < len(lines) else None, "total_lines": len(lines),
+        }
 
     def _run_direct_diagnosis(self) -> str:
-        """Produce one diagnosis JSON from already-loaded run evidence.
+        """Investigate training materials, then produce a causal design.
 
-        No diagnosis tools, video inspection, Teacher calls, or review prefetches
-        are available on this path.  This keeps later-round diagnosis aligned
-        with the run contract: review + current-best + memory in,
-        diagnosis/design out.
+        Read actions use ordinary JSON messages, so providers need not implement
+        a particular tool-calling API. Transport retries do not consume read steps.
         """
         from openai import OpenAI
 
         self._rollout_trace = []
-        client = OpenAI(
-            api_key=EVOLUTION_LLM_API_KEY,
-            base_url=EVOLUTION_LLM_BASE_URL,
-            timeout=API_TIMEOUT_SEC,
-        )
-        system_content = self._adaptive_diagnosis_prompt()
+        client = OpenAI(api_key=EVOLUTION_LLM_API_KEY,
+                        base_url=EVOLUTION_LLM_BASE_URL, timeout=API_TIMEOUT_SEC)
         messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": "Return the final diagnosis JSON now."},
+            {"role": "system", "content": self._adaptive_diagnosis_prompt()},
+            {"role": "user", "content": (
+                "Investigate the evidence and current implementation as needed. "
+                "Then return the final diagnosis with analysis, open_questions and next_task."
+            )},
         ]
         last_error = ""
-        for attempt in range(1, LLM_MAX_RETRIES + 1):
+        for step in range(1, self.MAX_ROUNDS + 1):
+            for attempt in range(LLM_MAX_RETRIES):
+                try:
+                    content = self._call_diagnosis_llm_content(client, messages).strip()
+                    break
+                except Exception:
+                    if attempt + 1 == LLM_MAX_RETRIES:
+                        raise
+            self._rollout_trace.append({"round": step, "response": content})
+            messages.append({"role": "assistant", "content": content})
             try:
-                content = self._call_diagnosis_llm_content(client, messages).strip()
-            except Exception as exc:
-                last_error = str(exc)
+                raw = content.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                action = json.loads(raw)
+            except (ValueError, IndexError):
+                action = {}
+            if isinstance(action, dict) and action.get("action") == "read":
+                try:
+                    result = self._read_diagnosis_material(action)
+                except (OSError, ValueError, TypeError) as exc:
+                    result = {
+                        "error": str(exc),
+                        "available_materials": list(self._diagnosis_materials()) + ["trajectories"],
+                    }
+                self._rollout_trace[-1]["material_result"] = result
+                messages.append({"role": "user", "content": json.dumps(result, ensure_ascii=False)})
                 continue
-            report = self._enforce_thinking_final_answer_contract(
-                self._parse_report(content, allow_llm_repair=False)
-            )
-            modules = ((report.get("evolution_design") or {}).get("target_modules") or
-                       (report.get("algorithmic_evolution") or {}).get("target_modules") or [])
-            contract_issues = self._adaptive_execution_contract_issues(report)
-            if isinstance(modules, list) and modules and not contract_issues:
-                self._rollout_trace.append({
-                    "round": attempt,
-                    "type": "evolution_llm_adaptive_diagnosis",
-                    "response_chars": len(content),
-                    "brief_validation_feedback": list(self.brief_validation_feedback),
+            raw_report = action.get("report") if isinstance(action, dict) and action.get("action") == "final" else None
+            try:
+                report = (self._normalize_report(raw_report) if isinstance(raw_report, dict)
+                          else self._parse_report(content, allow_llm_repair=False))
+                issues = self._adaptive_execution_contract_issues(report)
+            except (TypeError, ValueError, AttributeError) as exc:
+                issues = [f"diagnosis fields cannot be used: {exc}"]
+            if not issues:
+                report["working_materials"] = self._diagnosis_materials()
+                report.setdefault("next_task", {
+                    "stage": "research",
+                    "objective": (report.get("evolution_design") or {}).get("design_summary", ""),
+                    "questions": (report.get("evolution_design") or {}).get("research_questions", []),
                 })
                 self._accepted_diagnosis_report = report
                 return content
-            last_error = "; ".join(contract_issues) or (
-                "response lacks a non-empty target_modules list"
-            )
-            messages.append({"role": "assistant", "content": content})
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Return valid JSON for the five-module bundle schema. evolution_design.target_modules "
-                    "must contain 1-5 supported modules selected by the diagnosed mechanism. It must provide responsibilities "
-                    "for the selected modules plus concrete boundary contracts; the deterministic compiler supplies canonical "
-                    "responsibilities for untouched modules. A one-module target is valid and does not require "
-                    "changing its neighboring module; its contract should still state the preserved input/output boundary. "
-                    "The prior response failed this deterministic "
-                    "execution contract: " + last_error + " Fix the stated fields. In particular, after the bounded "
-                    "replan budget is exhausted, thinking must use the retained context, original question and its "
-                    "options to have the LLM return one concrete parseable final answer. Record low confidence and "
-                    "evidence gaps only as metadata; never make uncertain, unanswerable, or evidence-insufficient "
-                    "the final answer."
-                ),
-            })
-        raise RuntimeError(f"direct diagnosis failed after {LLM_MAX_RETRIES} attempts: {last_error}")
+            last_error = "; ".join(issues)
+            self._rollout_trace[-1]["feedback"] = last_error
+            messages.append({"role": "user", "content": (
+                "The diagnosis is not actionable yet: " + last_error
+                + ". Continue from the evidence already read; correct the causal design, "
+                "not unrelated fields. Return the final diagnosis JSON when ready."
+            )})
+        raise RuntimeError(
+            f"diagnosis exceeded {self.MAX_ROUNDS} investigation steps: "
+            + (last_error or "no final diagnosis")
+        )
 
     def _adaptive_diagnosis_prompt(self) -> str:
         """Build the sole model prompt for the evolution LLM diagnosis design pass."""
+        with open(os.path.join(_CURRENT_DIR, "agent_docs", "diagnosis_prompt.md"), encoding="utf-8") as handle:
+            diagnosis_instructions = handle.read()
         return f"""You are the diagnosis stage of a five-module MetaVideoAgent evolution run.
-Return exactly one JSON object; do not edit files, call tools, inspect videos, or propose task-specific rules.
+{diagnosis_instructions}
 
-Use the supplied model-safe review, deterministic evidence distribution, current-best context and history.
-Choose an initial direction containing 1-5 modules. Select one module when the failure mechanism is local; select multiple modules only when the evidence supports a joint change. This is an OUTER-ROUND direction, not an edit whitelist: later Codex probe feedback may change related modules inside the five-module bundle when an observed interface dependency requires it.
+Return one JSON object per turn. Do not edit files, inspect raw media, or propose task-specific runtime rules.
+You may investigate supplied artifacts with {{"action":"read","material":"name","offset":0,"limit":160}}.
+The response includes next_offset for continuing long materials. Available named materials:
+{json.dumps(self._diagnosis_materials(), ensure_ascii=False)}
+For an agent bundle, include "module":"thinking" (or another module) to read that source directly.
+Use material="trajectories" for the task index, then include task_id to read a full training trace.
+When ready, return the final diagnosis JSON in the shape below, or {{"action":"final","report":{{...}}}}.
+Distinguish observed failures, plausible explanations and implementation questions still needing research.
 
-Every selected module role and boundary must be supported by a real failure-chain pattern. Do not claim all modules are at fault merely because an answer is wrong. For a module-local direction, describe its preserved input/output boundary without adding a neighboring module to target_modules unless that neighbor also needs code changes. Keep task refs, video IDs, timestamps, answers and transcript literals out of prose. Do not include example objects, colors, brands, quoted question wording, counts, or literal video events: express every trigger and intervention as a reusable runtime-state condition.
-
-Thinking may request bounded replanning when evidence is weak. Once the bounded replan budget is exhausted, it must use the retained evidence/context, the original question, and its answer options to have the LLM select one concrete, parseable final answer. Low confidence, unresolved evidence gaps, and the replan history belong in metadata only. Do not prescribe `uncertain`, `unanswerable`, `evidence_insufficient`, or an equivalent generic failure token as the final answer.
-
-Runtime capability inventory (exhaustive):
+Runtime capability inventory:
 {json.dumps(build_runtime_capability_context(), ensure_ascii=False)}
 
-Deterministic evidence distribution:
+Training evidence index:
 {self._format_target_selection_for_prompt()}
 
-Completed review:
+Review findings:
 {self._format_evolution_review_for_prompt()}
 
-Historical context:
+Previous iteration findings:
 {self._format_iter_context_for_prompt()}
 
 Required JSON shape:
 {{
   "summary": "...",
+  "analysis": "Evidence inspected, competing explanations, causal conclusion and limitations",
+  "open_questions": ["Unresolved implementation or evidence questions"],
+  "next_task": {{"stage": "research", "objective": "...", "questions": ["..."]}},
   "algorithmic_evolution": {{"target_modules": ["localization"], "evolution_hint": "..."}},
   "evolution_decision": {{"combo_base": "current_best", "base_combo_policy": "keep_current_best", "target_modules": ["localization"], "rationale": "..."}},
   "evolution_design": {{
@@ -1338,17 +1073,6 @@ Required JSON shape:
   }}
 }}"""
 
-    def _find_latest_evolution_review(self) -> str:
-        """Find latest teacher_evolution_review.json if present."""
-        # New path: evolution/ directory of the previous iteration
-        prev = self.iter_paths.previous()
-        if prev:
-            candidates = glob.glob(os.path.join(prev.evolution, "**/teacher_evolution_review.json"), recursive=True)
-            if candidates:
-                candidates.sort(key=os.path.getmtime, reverse=True)
-                return candidates[0]
-        return ""
-
     def _load_evolution_review(self, path: str) -> dict:
         if not path or not os.path.exists(path):
             return {}
@@ -1358,20 +1082,13 @@ Required JSON shape:
         except Exception:
             return {}
 
-    def _shorten(self, value, limit: int = 220) -> str:
-        text = str(value or "").replace("\n", " ").strip()
-        return text[:limit]
-
     def _has_prior_candidate_review(self) -> bool:
         """Return whether this diagnosis follows a real evolved candidate."""
         previous = getattr(self, "previous_evolution_result", None)
         if isinstance(previous, dict) and previous:
             return True
         review = getattr(self, "evolution_review", {}) or {}
-        # Staged MetaVideoAgent reviews record accepted/rejected candidate lineage
-        # under retention_review instead of the previous candidate_lineage key.
-        # Treat that paired outcome as prior-candidate evidence so corrections
-        # and regressions remain preservation/guard rows in review→diagnosis.
+        # A paired retention outcome supplies correction/regression evidence.
         retention = review.get("retention_review", {}) or {}
         post_status = str(
             retention.get("post_evolution_status")
@@ -1487,7 +1204,6 @@ Required JSON shape:
         }
 
 
-
     def _evolution_review_constraints(self) -> dict:
         metrics = self.evolution_review.get("metrics", {})
         macro = self.evolution_review.get("macro_review", {})
@@ -1541,158 +1257,30 @@ Required JSON shape:
         }
         return constraints
 
-    @staticmethod
-    def _model_safe_mechanism_summary(summary: dict) -> dict:
-        """Keep outer-round diagnosis aggregate and task-free.
-
-        The review artifact is intentionally rich so it can later support
-        supervised probe/Codex self-debug.  Diagnosis has a different job: it
-        chooses a cross-question mechanism, not a per-question patch.  Build
-        a whitelisted aggregate instead of passing the rich artifact through
-        and relying on prompt prose to stop task-specific leakage.
-        """
-        summary = summary if isinstance(summary, dict) else {}
-
-        def text(value: object) -> str:
-            value = str(value or "")
-            # Remove task/video identifiers, concrete temporal windows and
-            # evidence-event IDs if a future macro template embeds them in a
-            # natural-language field.
-            value = re.sub(r"\b(?:BV|B1)[A-Za-z0-9]+(?:\s*::\s*\[\[.*?\]\])?(?:\s*::\s*[0-9a-f]{6,})?", "[task]", value)
-            value = re.sub(r"\[\[?\s*\d+(?:\.\d+)?\s*(?:,|-|–)\s*\d+(?:\.\d+)?\s*\]?\]", "[window]", value)
-            value = re.sub(r"\bev_\d+\b", "[event]", value)
-            return value.strip()
-
-        outcome = summary.get("outcome") or {}
-        current = summary.get("current_best_failure_summary") or {}
-        safe = {
-            "review_semantics": str(summary.get("review_semantics") or ""),
-            "outcome": {
-                "net_delta": outcome.get("net_delta"),
-                "overall_verdict": text(outcome.get("overall_verdict")),
-                "verdict_reason": text(outcome.get("verdict_reason")),
-            },
-            "current_best_failure_summary": {
-                "scope": str(current.get("scope") or ""),
-                "overall_failure_chain": [text(item) for item in (current.get("overall_failure_chain") or []) if text(item)],
-                "dominant_observed_defects": [text(item) for item in (current.get("dominant_observed_defects") or []) if text(item)],
-            },
-            "bundle_level_improvement_opportunities": [],
-            "module_signals": {},
-            "macro_validation": {
-                "valid": bool((summary.get("macro_validation") or {}).get("valid")),
-                "issues": [text(item) for item in ((summary.get("macro_validation") or {}).get("issues") or []) if text(item)],
-            },
-        }
-        for item in summary.get("bundle_level_improvement_opportunities") or []:
-            if not isinstance(item, dict):
-                continue
-            safe["bundle_level_improvement_opportunities"].append({
-                "modules": [str(module) for module in (item.get("modules") or [])],
-                "observed_pattern": text(item.get("observed_pattern")),
-                "handoff_or_state_to_repair": text(item.get("handoff_or_state_to_repair")),
-                "generic_repair_direction": text(item.get("generic_repair_direction")),
-            })
-        for module, signal in (summary.get("module_signals") or {}).items():
-            if isinstance(signal, dict):
-                safe["module_signals"][str(module)] = {
-                    "level": str(signal.get("level") or ""),
-                    "reason": text(signal.get("reason")),
-                }
-        return safe
-
     def _format_evolution_review_for_prompt(self) -> str:
-        """Inject only task-free macro conclusions into outer diagnosis."""
+        """Keep Teacher conclusions and their supporting references connected."""
         if not self.evolution_review:
             return ""
-        review_digest = self._model_safe_mechanism_summary(
-            self.evolution_review.get("mechanism_summary", {}) or {}
-        )
-        # Coverage is audit metadata, not target evidence.  Make omissions
-        # visible so the model neither overstates review support nor treats a
-        # sparse MFP subset as the full failure distribution.
-        causal = self.evolution_review.get("causal_effect_coverage") or {}
-        mfp = self.evolution_review.get("minimal_failure_point_coverage") or {}
-        def invalid_count(payload: dict) -> int:
-            invalid = payload.get("invalid", 0)
-            return len(invalid) if isinstance(invalid, list) else int(invalid or 0)
-
-        review_digest["audit_coverage"] = {
-            "causal_effect_records": {
-                "required": int(causal.get("required") or 0),
-                "valid": int(causal.get("valid") or 0),
-                "invalid": invalid_count(causal),
-            },
-            "minimal_failure_points": {
-                "required": int(mfp.get("required") or 0),
-                "valid": int(mfp.get("valid") or 0),
-                "invalid": invalid_count(mfp),
-            },
-            "rule": (
-                "Only validated causal/MFP records may support a stated mechanism or probe witness. "
-                "Invalid or missing records are audit omissions, not negative evidence and not repair targets."
-            ),
+        review = self.evolution_review
+        overview = {
+            "mechanism_summary": review.get("mechanism_summary", {}),
+            "macro_review": review.get("macro_review", {}),
+            "causal_effect_coverage": review.get("causal_effect_coverage", {}),
+            "minimal_failure_point_coverage": review.get("minimal_failure_point_coverage", {}),
+            "review_material": self.evolution_review_path,
         }
-        macro = self.evolution_review.get("macro_review", {}) or {}
-        cost_assessment = macro.get("cost_and_efficiency_assessment", {}) or {}
-        cost_issues = []
-        for item in macro.get("cost_audit_issues", []) or []:
-            if not isinstance(item, dict):
-                continue
-            cost_issues.append({
-                "code": str(item.get("code") or ""),
-                "severity": str(item.get("severity") or ""),
-                "repair_goal": sanitize_tool_terms_for_evolution(
-                    self._shorten(item.get("repair_goal"), 300)
-                ),
-            })
-        if cost_assessment or cost_issues:
-            review_digest["cost_constraints"] = {
-                "enforced": any(item.get("code") == "cost_explosion" for item in cost_issues),
-                "review_target": str(cost_assessment.get("next_round_cost_target") or ""),
-                "avoid_repeating": [
-                    sanitize_tool_terms_for_evolution(self._shorten(value, 300))
-                    for value in (macro.get("avoid_repeating") or [])
-                    if value
-                ],
-                "issues": cost_issues,
-                "rule": (
-                    "When enforced, preserve accuracy repairs and regression guards while adding "
-                    "bounded, evidence-triggered escalation and duplicate-work prevention to "
-                    "evolution_design.cost_guardrails."
-                ),
-            }
-        validation_feedback = list(getattr(self, "brief_validation_feedback", []) or [])
-        feedback_text = ""
-        if validation_feedback:
-            feedback_text = (
-                "\n## Previous brief compiler feedback\n"
-                "The prior diagnosis was structurally insufficient for the deterministic five-module brief. "
-                "Correct these contract facts in the JSON below; do not add task-specific rules:\n- "
-                + "\n- ".join(validation_feedback)
-                + "\n"
-            )
         return (
-            "## TeacherAgent Full review after evolution \\n"
-            "The following is a mechanism-level conclusion based on all topic-by-topic micro-reviews. It gives the specific cross-topic defects of the current best,"
-            "Module handover status and provable improvement opportunities; it is not implementation code, nor is it a module whitelist from the inner Codex. \\n"
-            "Hard constraint: target_questions should come from current-best repair/unchanged failure evidence;"
-            "All regressions must enter probe_plan.regression_guard instead of pretending to be problems to be fixed;"
-            "All corrections must be interpreted as retention or reuse mechanisms;"
-            "evolution_decision must keep the accepted current best as the execution base and "
-            "name the same non-empty target_modules set as evolution_design."
-            "macro_review is review evidence, not an evolutionary plan;"
-            "Every selected module must have a causal role in the mechanism rather than a task-specific patch."
-            "The only initial current best review does not include pre- and post-candidate differences: no fake fixes, regressions, or last-round candidates are allowed."
-            "These comparison terms should only be used when there are real candidate controls."
-            "The next round must be generated independently based on the mechanism summary and the fact constraints of the local evidence ledger."
-            "programmable_evolution or algorithmic_evolution field."
-            "If cost_constraints.enforced of review is true, evolution_design.cost_guardrails must also"
-            "Includes: compact evidence prioritization, deduplication retrieval/replanning, and justified and capped scoped awareness upgrades; may not be used as"
-            "Reduce correctness or skip LLM final inference to save calls."
-            "\n"
-            f"{json.dumps(review_digest, ensure_ascii=False, indent=2)}"
-            f"{feedback_text}"
+            "## Completed Teacher review\n"
+            "Use these conclusions as evidence, not an implementation plan or module "
+            "whitelist. Read material=review for full per-question records and use "
+            "material=trajectories with task_id for the corresponding runtime trace. "
+            "Teacher tools are review-only; names in a trace do not make them runtime "
+            "capabilities. Keep original identifiers intact so claims can be checked.\n"
+            "Use corrections/regressions only when a real candidate comparison exists. "
+            "For the initial agent there is no previous-candidate improvement claim. "
+            "Cost findings should lead to bounded escalation, evidence prioritization and "
+            "duplicate-work prevention, not skipped reasoning or reduced correctness.\n"
+            + json.dumps(overview, ensure_ascii=False, indent=2)
         )
 
     def _load_trajectories(self) -> dict:
@@ -1707,8 +1295,7 @@ Required JSON shape:
                 reference_label=self.reference_label,
             )
         else:
-            trajectory_dir = self.iter_paths.trajectories
-            trajs = self._load_trajectories_from_dir(trajectory_dir)
+            raise ValueError("Diagnosis requires the selected reference_results_path")
         if self.distribution_manifest:
             allowed = set(self._load_dataset().keys())
             trajs = {
@@ -1719,31 +1306,6 @@ Required JSON shape:
         return trajs
 
 
-    def _load_trajectories_from_dir(self, trajectory_dir: str) -> dict:
-        """Load trajectories from the trajectory directory, grouped by task_id, with the latest record first."""
-        pattern = os.path.join(trajectory_dir, "*_trajectory.jsonl")
-        files = glob.glob(pattern)
-
-        trajs = {}
-        for fp in files:
-            with open(fp, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ident = identity_from_entry(entry)
-                    if not ident["task_id"]:
-                        continue
-                    trajs.setdefault(ident["task_id"], []).append(entry)
-
-        for entries in trajs.values():
-            entries.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
-        return trajs
-
     def _load_dataset(self) -> dict:
         """Load the dataset, indexed by task_id."""
         if self._dataset is not None:
@@ -1752,7 +1314,6 @@ Required JSON shape:
         if self.distribution_manifest:
             from question_set_loader import questions_by_ref
             by_ref, _question_to_ref, _ids, _spec = questions_by_ref(
-                self.workspace_dir,
                 video_id="ALL",
                 distribution_manifest=self.distribution_manifest,
                 preferred_splits=("train",),
@@ -1760,34 +1321,7 @@ Required JSON shape:
             self._dataset = by_ref
             return self._dataset
 
-        ds_dir = os.path.join(self.workspace_dir, "datasets")
-        if not os.path.isdir(ds_dir):
-            # Try to go up a level
-            ds_dir = os.path.join(os.path.dirname(self.workspace_dir), "datasets")
-
-        self._dataset = {}
-        if os.path.isdir(ds_dir):
-            for fp in glob.glob(os.path.join(ds_dir, "*.jsonl")):
-                video_id = os.path.splitext(os.path.basename(fp))[0]
-                with open(fp, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = sanitize_task_for_evolution(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-                        entry.setdefault("video_id", video_id)
-                        task_id = make_task_id(
-                            video_id,
-                            entry.get("time_reference", ""),
-                            entry.get("question", ""),
-                        )
-                        entry.setdefault("task_id", task_id)
-                        self._dataset[task_id] = entry
-
-        return self._dataset
+        raise ValueError("Diagnosis requires a distribution_manifest for its selected train tasks")
 
     # ==================================================================
     # Output parsing
@@ -1823,7 +1357,6 @@ Required JSON shape:
         if not allow_llm_repair:
             return self._fallback_report(raw_text)
 
-            print("   Local JSON parsing failed; requesting structured JSON repair...")
 
         # Only pass the json block content to format_json, not the entire text
         json_only = ""
@@ -1839,7 +1372,6 @@ Required JSON shape:
             print("⚠️ Unable to extract JSON chunks from text")
             return self._fallback_report(raw_text)
 
-            print(f"   Extracted JSON candidate ({len(json_only)} chars); preview: {json_only[:200]}")
         repaired = format_json(json_only, max_tokens=DIAGNOSIS_OUTPUT_MAX_TOKENS)
         if repaired and isinstance(repaired, dict):
             return self._normalize_report(repaired)
@@ -1910,7 +1442,6 @@ Required JSON shape:
         report.setdefault("correct", 0)
         report.setdefault("incorrect", 0)
         report.setdefault("fault_distribution", {})
-        report.setdefault("engineering_fixes", [])
         if self.distribution_manifest:
             report.setdefault("distribution_manifest", self.distribution_manifest)
 
@@ -1943,19 +1474,14 @@ Required JSON shape:
 
         report["base_combo_policy"] = "keep_current_best"
         report["probe_plan"] = decision.get("probe_plan") or {}
-        report = sanitize_tool_terms_for_evolution(report)
 
-        if "error" not in self._cost_baseline:
-            cost_reference = {
-                "per_question_avg": self._cost_baseline["per_question_avg"],
-                "cost_score": self._cost_baseline["cost_score_avg"],
-                "cost_budget": self._cost_baseline["cost_budget"],
-                "max_cost_ratio": self._cost_baseline["max_cost_ratio"],
+        if "error" not in self._reference_cost:
+            report["cost_reference"] = {
+                "per_question_avg": self._reference_cost["per_question_avg"],
+                "cost_score": self._reference_cost["cost_score_avg"],
                 "reference_label": self.reference_label,
                 "reference_results_path": self.reference_results_path,
             }
-            report["cost_reference"] = cost_reference
-            report["cost_baseline"] = cost_reference
         report["evolution_phase_policy"] = dict(self.evolution_phase_policy)
         return report
 
@@ -1968,7 +1494,6 @@ Required JSON shape:
             "correct": 0,
             "incorrect": 0,
             "fault_distribution": {},
-            "engineering_fixes": [],
             "algorithmic_evolution": {
                 "target_modules": [],
                 "evolution_hint": "",
@@ -1996,7 +1521,6 @@ Required JSON shape:
             try:
                 from question_set_loader import questions_by_ref
                 _by_ref, _q_to_ref, ids, _spec = questions_by_ref(
-                    self.workspace_dir,
                     video_id="ALL",
                     distribution_manifest=self.distribution_manifest,
                     preferred_splits=("train",),
@@ -2005,60 +1529,32 @@ Required JSON shape:
                     return ids
             except Exception:
                 pass
-        # Prioritize inference from trajectories of the current iteration
-        ids = self.iter_paths.detect_video_ids()
-        if ids:
-            return ids
-        # Direct workspace mode uses the canonical trajectory directory.
-        trajectory_dir = os.path.join(self.workspace_dir, "trajectories")
-        if os.path.isdir(trajectory_dir):
-            ids = [f.replace("_trajectory.jsonl", "") for f in sorted(os.listdir(trajectory_dir))
-                   if f.endswith("_trajectory.jsonl")]
-        if ids:
-            return ids
-        # Inferred from datasets directory
-        ds_dir = os.path.join(self.workspace_dir, "datasets")
-        if not os.path.isdir(ds_dir):
-            ds_dir = os.path.join(os.path.dirname(self.workspace_dir), "datasets")
-        if os.path.isdir(ds_dir):
-            for f in sorted(os.listdir(ds_dir)):
-                if f.endswith(".jsonl"):
-                    ids.append(os.path.splitext(f)[0])
-        return ids
+        return []
 
 
     def _diagnosis_dir(self) -> str:
-        run_id = os.environ.get("METAVIDEOAGENT_RUN_ID", "")
-        iteration = os.environ.get("METAVIDEOAGENT_ITERATION_INDEX", "")
-        try:
-            iteration_index = int(iteration)
-        except (TypeError, ValueError):
-            iteration_index = 0
-        if iteration_index > 0:
-            return os.path.join(
-                metavideoagent_run_dir(run_id),
-                f"iter_{iteration_index}",
-                "diagnosis",
-            )
-        return os.path.join(metavideoagent_run_dir(run_id), "diagnosis")
+        return str(self._attempt_dir)
 
     def _save_report(self, report: dict):
         """Save diagnostic reports to the diagnosis/ directory of the current iteration."""
         diag_dir = self._diagnosis_dir()
         os.makedirs(diag_dir, exist_ok=True)
-        ts = report.get("timestamp", int(time.time()))
-        suffix = f"_attempt{self.diagnosis_attempt}" if self.diagnosis_attempt > 1 else ""
-        path = os.path.join(diag_dir, f"diagnosis_{ts}{suffix}.json")
+        attempt = self._attempt_dir
+        path = str(attempt / "result.json")
         report["report_path"] = path
         capsules = report.get("diagnosis_failure_capsules") or []
         capsule_path = ""
         if capsules:
-            capsule_path = os.path.join(diag_dir, f"diagnosis_failure_capsules_{ts}{suffix}.json")
+            capsule_path = str(attempt / "failure_capsules.json")
             report["diagnosis_failure_capsules_path"] = capsule_path
         # Remove internal fields that do not need to be persisted
         save_report = {k: v for k, v in report.items() if not k.startswith("_")}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(save_report, f, ensure_ascii=False, indent=2)
+        notes = attempt / "analysis.md"
+        notes.write_text(str(report.get("analysis") or report.get("summary") or ""), encoding="utf-8")
+        self.iteration.record("diagnosis", path, status="complete", notes_path=notes,
+                              next_task=report.get("next_task") or {})
         if capsules:
             with open(capsule_path, "w", encoding="utf-8") as f:
                 json.dump({
@@ -2084,37 +1580,26 @@ if __name__ == "__main__":
     parser.add_argument("--workspace", type=str,
                         default=default_workspace())
     parser.add_argument("--iteration", type=int, default=None,
-                        help="Current iteration number (automatically detects the latest by default)")
+                        help="Current iteration number; defaults to the explicit iteration context.")
     parser.add_argument("--previous-evolution-result", type=str, default="",
                         help="The last round of evolution conclusion JSON, used to enter evaluation mode")
     parser.add_argument("--previous-diagnosis", type=str, default="",
                         help="Last round diagnostic report JSON for evaluating schema context")
     parser.add_argument("--evolution-review", type=str, default="",
                         help="Candidate review artifact produced by the review stage")
-    parser.add_argument("--distribution-profile", type=str, default="",
+    parser.add_argument("--distribution-profile", type=str, required=True,
                         help="label-blind observed_distribution_profile.json; artificial type descriptions will not be read")
-    parser.add_argument("--distribution-manifest", type=str, default="",
+    parser.add_argument("--distribution-manifest", type=str, required=True,
                         help="Distribution manifest used to limit the split and question set; semantic labels remain hidden from prompts")
-    parser.add_argument("--reference-results", type=str, default="",
+    parser.add_argument("--reference-results", type=str, required=True,
                         help="Explicit reference/current-best results JSONL or sandbox directory; must be passed under MetaVideoAgent or inferred from reference report")
     parser.add_argument("--reference-label", type=str, default="",
                         help="reference tag, such as initial_combo/current_best")
-    parser.add_argument("--iter-context", type=str, default="",
+    parser.add_argument("--iter-context", type=str, required=True,
                         help="iter_context.json produced by MetaVideoAgent orchestrator")
-    parser.add_argument("--diagnosis-attempt", type=int, default=1,
-                        help="The diagnosis attempt number is used for auditing; when it is greater than 1, the product is appended with the attempt suffix")
     args = parser.parse_args()
     if args.distribution_manifest:
         require_metavideoagent_runtime("diagnosis_agent --distribution-manifest")
-
-    # Automatically load evolutionary memory. MetaVideoAgent manifest runs use run-scoped
-    # iter_context/current-best ledgers instead of shared workspace history, so
-    # unrelated runs cannot leak into diagnosis.
-    memory_str = ""
-    if not args.distribution_manifest:
-        from workspace_paths import IterationPaths
-        iter_paths = IterationPaths(args.workspace, iteration=args.iteration)
-        memory_str = iter_paths.get_all_evolution_conclusions()
 
     def _load_optional_json(path: str) -> dict:
         if not path:
@@ -2125,31 +1610,8 @@ if __name__ == "__main__":
     previous_evolution_result = _load_optional_json(args.previous_evolution_result)
     previous_diagnosis = _load_optional_json(args.previous_diagnosis)
     observed_distribution_profile = _load_optional_json(args.distribution_profile)
-    if args.distribution_manifest and not observed_distribution_profile:
-        try:
-            from distribution_profiler import build_observed_distribution_profile
-            from distribution_spec import load_distribution_spec
-            spec = load_distribution_spec(args.distribution_manifest)
-            out_dir = os.path.join(
-                metavideoagent_run_dir(os.environ.get("METAVIDEOAGENT_RUN_ID", "")),
-                "profiles",
-            )
-            out_path = os.path.join(
-                out_dir, f"observed_distribution_profile_{int(time.time())}.json"
-            )
-            observed_distribution_profile = build_observed_distribution_profile(
-                args.workspace,
-                distribution_spec=spec,
-                output_path=out_path,
-                include_execution_artifacts=False,
-            )
-            print(f"Observed distribution profile generated: {out_path}")
-        except Exception as e:
-            print(f"⚠️ Could not generate the observed distribution profile; continuing without it: {e}")
-
     agent = DiagnosisAgent(
         args.workspace,
-        evolution_memory=memory_str,
         previous_evolution_result=previous_evolution_result or None,
         previous_diagnosis=previous_diagnosis or None,
         evolution_review_path=args.evolution_review or None,
@@ -2159,7 +1621,6 @@ if __name__ == "__main__":
         reference_results_path=args.reference_results,
         reference_label=args.reference_label,
         iter_context_path=args.iter_context,
-        diagnosis_attempt=args.diagnosis_attempt,
     )
     report = agent.run()
     print("\n" + "=" * 70)
@@ -2168,5 +1629,4 @@ if __name__ == "__main__":
         + ", ".join(report.get("algorithmic_evolution", {}).get("target_modules") or [])
     )
     print(f"Evolution direction: {report['algorithmic_evolution']['evolution_hint']}")
-    print(f"Engineering fixes: {len(report['engineering_fixes'])} item(s)")
     print(f"Targeted questions: {report['target_questions']}")

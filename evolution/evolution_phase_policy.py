@@ -9,13 +9,10 @@ def for_iteration(iteration: int | None) -> dict:
     return {
         "phase": "initial_design" if index == 0 else "iterative_evolution",
         "iteration_index": index,
-        "evolution_round": index + 1,
         "primary_objective": "training_evidence_improvement",
-        "cost_policy": "record_only",
-        "allow_expensive_capabilities": True,
-        "current_best_selection": "evolution_split_performance_and_trajectory_review",
+        "cost_policy": "non_increasing_cost_for_equal_accuracy",
+        "current_best_selection": "train_accuracy_with_cost_tiebreak",
         "selection_split": "train",
-        "efficiency_constraints": {"enforced": False},
         "instructions": [
             "Use evolution-split trajectories for review, diagnosis, and candidate design.",
             "Treat held-out evaluation as read-only reporting evidence.",

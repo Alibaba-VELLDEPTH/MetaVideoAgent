@@ -7,13 +7,11 @@ are handled by the outer workflow.
 """
 
 import glob
-import hashlib
 import json
 import os
 import re
 import sys
 import time
-from typing import Optional
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
@@ -25,10 +23,11 @@ from runtime_paths import use_runtime_path
 
 _RUNTIME_DIR = use_runtime_path()
 
+from agent_sources import module_records, module_resource_inputs
 from answer_normalizer import extract_gold_answer
 from bundle_contract import normalize_modules
-from combo_contract import require_complete_evolution_combo
-from config import EVOLUTION_LLM_PROFILE_ID
+from combo_contract import require_complete_agent_combo
+from iteration_workspace import write_json
 from question_set_loader import load_questions as load_question_set
 from reference_loader import combo_from_reference
 from structure_artifacts import reference_structure_artifact_dir
@@ -38,6 +37,52 @@ from task_identity import make_task_id
 # =====================================================================
 # Candidate evaluator
 # =====================================================================
+
+def finalize_probe_comparison(verification: dict, conclusion: dict) -> None:
+    """Publish one probe verdict from the latest paired execution evidence."""
+    corrections = verification.get("corrections") or []
+    regressions = verification.get("regressions") or []
+    invalid = (
+        verification.get("engineering_invalid")
+        or verification.get("execution_layer_rerun_required")
+        or not verification.get("comparison_valid", False)
+        or verification.get("evaluation_complete") is not True
+    )
+    status = "invalid" if invalid else CandidateEvaluator._classify_probe_status(
+        len(corrections), len(regressions),
+    )
+    verification["probe_status"] = status
+    verification["status"] = "promising_unverified" if status == "promising" else status
+    verification["accepted"] = False
+    verification["full_verification"] = {
+        "status": "deferred", "reason": "formal full evaluation is owned by full_eval_runner",
+    }
+    verification["final_success_criteria"] = {
+        "passed": False, "requires_full_eval": True,
+        "reason": "Probe feedback does not promote a candidate; full train evaluation is required.",
+    }
+    mechanism = verification.get("mechanism_generalization") or {}
+    corrected = {str(row.get("task_id") or "") for row in corrections}
+    witnesses = set(mechanism.get("diagnosis_hypothesis_selected") or [])
+    generalization = set(mechanism.get("generalization_selected") or [])
+    mechanism.update({
+        "diagnosis_hypothesis_corrected": sorted(witnesses & corrected),
+        "generalization_corrected": sorted(generalization & corrected),
+        "status": "not_configured" if not witnesses else (
+            "hypothesis_and_generalization_improved" if generalization & corrected else
+            "hypothesis_observation_improved" if witnesses & corrected else "hypothesis_not_observed_improved"
+        ),
+    })
+    verification["mechanism_generalization"] = mechanism
+    verdicts = {
+        "promising": ("probe_promising_pending_full_eval", "The paired probe improved; full train evaluation is pending."),
+        "risk_detected": ("risk_detected", "The paired probe contains regressions; inspect the complete trajectories."),
+        "inconclusive_stable": ("inconclusive_stable", "The paired probe demonstrated no correction or regression."),
+        "invalid": ("engineering_blocked", "The paired probe is incomplete or has an execution failure."),
+    }
+    conclusion["verification"] = verification
+    conclusion["verdict"], conclusion["verdict_reason"] = verdicts[status]
+
 
 class CandidateEvaluator:
     """Execute and compare a candidate produced by the automatic workflow."""
@@ -54,55 +99,51 @@ class CandidateEvaluator:
         self._last_probe_results = []
 
         # Extract key information from diagnostic reports
-        self.engineering_fixes = self.report.get("engineering_fixes", [])
-        self.is_execution_brief = self.report.get("artifact_type") == "diagnosis_execution_brief"
-        if not self.is_execution_brief:
+        if self.report.get("artifact_type") != "diagnosis_execution_brief":
             raise ValueError("CandidateEvaluator requires a diagnosis_execution_brief artifact")
-        # A same-direction supervised repair must be measured on exactly the
-        # batch that produced its forensic evidence.  Outer rounds may select
-        # a fresh representative batch, but an inner Codex feedback iteration
-        # never silently rotates questions through selection heuristics.
+        # Candidate continuation reuses its recorded batch and selection groups.
+        # New outer iterations can select a fresh representative batch.
         self.fixed_probe_task_ids = list(self.report.get("fixed_probe_task_ids", []) or [])
-        if self.is_execution_brief:
-            task = self.report.get("implementation_task", {}) or {}
-            evaluation = self.report.get("_machine_evaluation_contract", {}) or {}
-            if not evaluation:
-                raise RuntimeError(
-                    "execution brief requires an explicit machine_evaluation_contract sidecar; "
-                    "do not embed probe evidence in the model brief"
-                )
-            policy = self.report.get("execution_policy", {}) or {}
-            try:
-                bundle_targets = normalize_modules(policy.get("target_modules", []) or [])
-            except ValueError as exc:
-                raise RuntimeError(f"CandidateEvaluator received invalid target_modules: {exc}") from exc
-            probe_plan = evaluation.get("probe_plan", {}) or {}
-            target_questions = evaluation.get("target_question_refs", []) or []
-            if not target_questions and isinstance(probe_plan, dict):
-                for group in ("repair_probe", "representative_rows", "held_out_generalization", "regression_guard"):
-                    for ref in probe_plan.get(group, []) or []:
-                        if ref and ref not in target_questions:
-                            target_questions.append(ref)
-            self.algo_evo = {
-                "target_modules": bundle_targets,
-                "target_questions": target_questions,
-                "error_diagnoses": evaluation.get("error_diagnoses", []) or [],
-                "evolution_hint": (
-                    task.get("evolution_mechanism") or task.get("goal")
-                    or task.get("codex_task", "")
-                ),
-            }
-            self.target_modules = self.algo_evo["target_modules"]
-            self.evolution_decision = policy
-            self.target_questions = self.algo_evo["target_questions"]
-            self.error_diagnoses = self.algo_evo["error_diagnoses"]
-            self.evolution_hint = self.algo_evo["evolution_hint"]
-            self.evaluation_policy = evaluation.get("validation_policy", {}) or {}
-            self.target_probe_context = evaluation.get("target_probe_context", {}) or {}
-            self.machine_probe_plan = evaluation.get("probe_plan", {}) or {}
-            self.probe_feedback_excluded_refs = list(
-                evaluation.get("probe_feedback_excluded_refs", []) or []
+        self.fixed_probe_plan = dict(self.report.get("fixed_probe_plan") or {})
+        task = self.report.get("implementation_task", {}) or {}
+        evaluation = self.report.get("_machine_evaluation_contract", {}) or {}
+        if not evaluation:
+            raise RuntimeError(
+                "execution brief requires an explicit machine_evaluation_contract sidecar; "
+                "do not embed probe evidence in the model brief"
             )
+        policy = self.report.get("execution_policy", {}) or {}
+        try:
+            bundle_targets = normalize_modules(policy.get("target_modules", []) or [])
+        except ValueError as exc:
+            raise RuntimeError(f"CandidateEvaluator received invalid target_modules: {exc}") from exc
+        probe_plan = evaluation.get("probe_plan", {}) or {}
+        target_questions = evaluation.get("target_question_refs", []) or []
+        if not target_questions and isinstance(probe_plan, dict):
+            for group in ("repair_probe", "representative_rows", "held_out_generalization", "regression_guard"):
+                for ref in probe_plan.get(group, []) or []:
+                    if ref and ref not in target_questions:
+                        target_questions.append(ref)
+        self.algo_evo = {
+            "target_modules": bundle_targets,
+            "target_questions": target_questions,
+            "error_diagnoses": evaluation.get("error_diagnoses", []) or [],
+            "evolution_hint": (
+                task.get("evolution_mechanism") or task.get("goal")
+                or task.get("codex_task", "")
+            ),
+        }
+        self.target_modules = self.algo_evo["target_modules"]
+        self.evolution_decision = policy
+        self.target_questions = self.algo_evo["target_questions"]
+        self.error_diagnoses = self.algo_evo["error_diagnoses"]
+        self.evolution_hint = self.algo_evo["evolution_hint"]
+        self.evaluation_policy = evaluation.get("validation_policy", {}) or {}
+        self.target_probe_context = evaluation.get("target_probe_context", {}) or {}
+        self.machine_probe_plan = evaluation.get("probe_plan", {}) or {}
+        self.probe_feedback_excluded_refs = list(
+            evaluation.get("probe_feedback_excluded_refs", []) or []
+        )
         self.observed_distribution_profile = (
             self.report.get("observed_distribution_profile", {}) or {}
         )
@@ -135,55 +176,20 @@ class CandidateEvaluator:
             )
 
         # Evolutionary results
-        self.eng_fix_results = []
         self.evolved_bundle = None
         self.verification_report = None
 
         # Runtime monitoring status
         self._runtime_issues = []
 
-    def _baseline_combo_config(self, strict: Optional[bool] = None) -> dict:
-        if strict is None:
-            strict = True
-        source = (
-            self.evolution_decision.get("base_combo")
-            or self.evolution_decision.get("combo_base_config")
-            or self.evolution_decision.get("current_best_combo")
-            or self.report.get("reference_combo")
-            or self.report.get("base_combo")
-            or {}
-        )
+    def _baseline_combo_config(self) -> dict:
+        source = self.report.get("reference_combo") or {}
         if not source and self.reference_results_path:
             resolved = self._resolve_result_path(
                 self.reference_results_path, self.workspace_dir, os.getcwd()
             )
             source = combo_from_reference(resolved)
-        if not isinstance(source, dict):
-            source = {}
-        key_map = {
-            "video_structuring": "video_structuring",
-            "thinking": "thinking",
-            "memory": "memory",
-            "localization": "localization",
-            "perception": "perception",
-        }
-        combo = {}
-        for key, value in source.items():
-            mapped = key_map.get(key)
-            if mapped and value:
-                combo[mapped] = value
-        if strict:
-            return require_complete_evolution_combo(combo, "CandidateEvaluator reference combo")
-        default = {
-            "video_structuring": "",
-            "thinking": "",
-            "memory": "",
-            "localization": "",
-            "perception": "",
-        }
-        for key, value in default.items():
-            combo.setdefault(key, value)
-        return combo
+        return require_complete_agent_combo(source, "CandidateEvaluator reference combo")
 
 
     def _read_json_optional(self, path: str) -> dict:
@@ -197,19 +203,14 @@ class CandidateEvaluator:
             return {}
 
     def _reference_bundle_candidate_paths(self) -> list:
-        """Return explicit bundle paths for the current reference/current-best.
-
-        MetaVideoAgent probe/full verification must run the same reference combo as
-        full evaluation.  It is not allowed to infer Initial* names through
-        builtin aliases; the reference bundle code must be injected first.
-        """
+        """Resolve the current-best source bundle used by paired evaluation."""
         paths = []
         report_path = self._resolve_result_path(
             self.reference_report_path, self.workspace_dir, os.getcwd()
         )
         report = self._read_json_optional(report_path)
 
-        for container in (self.report, self.evolution_decision, report):
+        for container in (self.report, report):
             if not isinstance(container, dict):
                 continue
             for key in (
@@ -283,67 +284,26 @@ class CandidateEvaluator:
             ],
         }
 
-    def _inject_reference_and_evolved(self, evolved_combo_config: dict,
-                                      evolved: dict, module_map_refs: dict) -> tuple:
-        """Inject the reference bundle first, then candidate/preserved modules."""
-        from sandbox_evaluator import (
-            inject_evolved_modules,
-            inject_module_bundle,
-        )
+    def _inject_candidate(self, module_map_refs: dict) -> tuple:
+        """Load candidate code once; retain reference metadata for comparison."""
+        from sandbox_evaluator import inject_module_bundle
 
-        custom_configs = {}
-        reference_combo_config = self._baseline_combo_config(
-            strict=True
+        reference_bundle, bundle_path, reference_validation = self._load_reference_bundle_for_combo(
+            self._baseline_combo_config(),
         )
-        reference_bundle, bundle_path, bundle_validation = (
-            self._load_reference_bundle_for_combo(reference_combo_config)
-        )
-        if reference_bundle:
-            ok, agent_combo, bundle_configs, validation = inject_module_bundle(
-                reference_bundle,
-                module_map_refs,
-            )
-            if not ok:
-                raise RuntimeError(f"Reference bundle injection failed: {validation}")
-            custom_configs.update(bundle_configs)
-        else:
-            raise RuntimeError(
-                "MetaVideoAgent verification requires an injectable reference bundle. "
-                f"reference_combo={evolved_combo_config}, validation={bundle_validation}"
-            )
-
-        evolved_configs = inject_evolved_modules(
-            evolved,
-            module_map_refs,
-        )
-        custom_configs.update(evolved_configs)
-        for module_type, modules in (evolved or {}).items():
-            if not modules:
-                continue
-            module_name = modules[-1].get("name", "")
-            combo_key = {
-                "video_structuring": "video_structuring",
-                "thinking": "thinking",
-                "memory": "memory",
-                "localization": "localization",
-                "perception": "perception",
-            }.get(module_type)
-            if combo_key and module_name:
-                agent_combo[combo_key] = module_name
-        return agent_combo, custom_configs, {
+        if not reference_bundle:
+            raise RuntimeError(f"Verification requires a complete reference bundle: {reference_validation}")
+        ok, combo, configs, validation = inject_module_bundle(self.evolved_bundle, module_map_refs)
+        if not ok:
+            raise RuntimeError(f"Candidate bundle injection failed: {validation}")
+        return combo, configs, {
             "reference_bundle_path": bundle_path,
-            "reference_bundle_validation": bundle_validation,
+            "reference_bundle_validation": reference_validation,
             "reference_bundle": reference_bundle,
         }
 
-    @staticmethod
-    def _code_sha256(module: dict) -> str:
-        code = module.get("code", "") if isinstance(module, dict) else ""
-        return hashlib.sha256(str(code).encode("utf-8")).hexdigest() if code else ""
-
     def _structure_reuse_decision(self, reference_injection: dict,
-                                  candidate_combo: dict,
-                                  evolved: dict) -> dict:
+                                  candidate_combo: dict) -> dict:
         """Decide structure reuse from the actual reference/candidate bundles.
 
         A complete combo always has a struct slot, so target module names and
@@ -355,13 +315,10 @@ class CandidateEvaluator:
         reference_combo = reference_bundle.get("combo") or {}
         reference_struct = reference_combo.get("video_structuring", "")
         candidate_struct = (candidate_combo or {}).get("video_structuring", "")
-        # Candidate bundles store modules as a module-type-to-record mapping.
-        reference_modules = reference_bundle.get("modules") or {}
-        reference_module = dict(reference_modules.get("video_structuring") or {})
-        candidate_modules = (evolved or {}).get("video_structuring") or []
-        candidate_module = candidate_modules[-1] if candidate_modules else {}
-        reference_code_sha = self._code_sha256(reference_module)
-        candidate_code_sha = self._code_sha256(candidate_module)
+        reference_module = module_records(reference_bundle).get("video_structuring") or {}
+        candidate_module = module_records(self.evolved_bundle).get("video_structuring") or {}
+        reference_code = reference_module.get("code", "")
+        candidate_code = candidate_module.get("code", "")
 
         if not reference_struct or not candidate_struct:
             raise RuntimeError(
@@ -372,12 +329,17 @@ class CandidateEvaluator:
         if candidate_struct != reference_struct:
             reason = "struct_module_name_changed"
             rebuild = True
-        elif candidate_module and candidate_code_sha and reference_code_sha and candidate_code_sha != reference_code_sha:
+        elif self.evolved_bundle and (
+            module_resource_inputs(self.evolved_bundle, "video_structuring")
+            != module_resource_inputs(reference_bundle, "video_structuring")
+        ):
+            reason, rebuild = "struct_resources_or_config_changed", True
+        elif candidate_module.get("source_file") != reference_module.get("source_file"):
+            reason, rebuild = "struct_source_location_changed", True
+        elif candidate_code and reference_code and candidate_code != reference_code:
             reason = "struct_module_code_changed"
             rebuild = True
-        elif candidate_module and candidate_code_sha and not reference_code_sha:
-            # A generated struct candidate cannot be proven equivalent when the
-            # reference bundle lacks source text; rebuild conservatively.
+        elif candidate_code and not reference_code:
             reason = "reference_struct_code_unavailable"
             rebuild = True
         else:
@@ -388,20 +350,11 @@ class CandidateEvaluator:
             "reason": reason,
             "reference_struct": reference_struct,
             "candidate_struct": candidate_struct,
-            "reference_struct_code_sha256": reference_code_sha,
-            "candidate_struct_code_sha256": candidate_code_sha,
             "reference_bundle_path": (reference_injection or {}).get("reference_bundle_path", ""),
         }
 
     def _reference_structure_artifact_dir(self) -> str:
-        """Return the immutable current-best structure artifact directory.
-
-        Probe runs for localization/perception/thinking/memory candidates keep
-        storage isolated, but their source data must be the same artifact used
-        by the current-best full evaluation.  A workspace-local DB may belong
-        to another run and is therefore not an acceptable fallback in
-        MetaVideoAgent mode.
-        """
+        """Resolve the reference report's structure artifact for isolated probe use."""
         report_paths = [self.reference_report_path, self.report.get("reference_report_path", "")]
         for raw_path in report_paths:
             report_path = self._resolve_result_path(raw_path, self.workspace_dir, os.getcwd())
@@ -413,40 +366,6 @@ class CandidateEvaluator:
             if resolved:
                 return resolved
         return ""
-
-    def _effective_evolved_modules(self) -> dict:
-        """Return the five module records from the current candidate bundle."""
-        if not isinstance(self.evolved_bundle, dict):
-            raise ValueError("candidate verification requires evolved_bundle")
-        bundle_modules = self.evolved_bundle.get("modules") or {}
-        return {
-            module_type: [module]
-            for module_type, module in bundle_modules.items()
-            if module_type in {"video_structuring", "localization", "perception", "memory", "thinking"}
-            and isinstance(module, dict)
-        }
-
-    def _resolve_evolved_combo(self, all_evolved: dict) -> tuple:
-        """Build the executable combo from the current candidate bundle."""
-        combo = self._baseline_combo_config()
-        if isinstance(self.evolved_bundle, dict):
-            runtime_combo = self.evolved_bundle.get("combo") or {}
-            module_combo = {
-                "video_structuring": runtime_combo.get("video_structuring"),
-                "localization": runtime_combo.get("localization"),
-                "perception": runtime_combo.get("perception"),
-                "memory": runtime_combo.get("memory"),
-                "thinking": runtime_combo.get("thinking"),
-            }
-            combo.update({key: value for key, value in module_combo.items() if value})
-            selected = {
-                module: [record] for module, record in (self.evolved_bundle.get("modules") or {}).items()
-                if isinstance(record, dict)
-            }
-            return combo, selected
-        raise ValueError("candidate verification requires a self-contained evolved_bundle")
-
-    @staticmethod
 
     def _read_result_rows(self, path: str) -> list:
         rows = []
@@ -499,145 +418,6 @@ class CandidateEvaluator:
             rows, reference_label=self.reference_label
         ), self.reference_label, source
 
-    def _preflight_api_check(self) -> list:
-        """Test required provider capabilities before sandbox execution.
-
-        Test items:
-          1. LLM (evolution LLM via evolution LLM API) — severity=critical
-          2. Embedding through the selected profile — severity=high
-
-        Returns:
-            List of failed APIs (empty = all passed)
-        """
-        requirements = self._preflight_requirements()
-        print(f"\nProvider preflight: {', '.join(sorted(requirements)) or 'none'}")
-        issues = []
-
-        try:
-            import utils
-        except ImportError:
-            print("      ⚠️ Unable to import utils, skipping pre-flight check")
-            return issues
-
-        if "llm" in requirements:
-            try:
-                result = utils.call_llm(
-                    [{"role": "user", "content": "Say OK"}],
-                    max_tokens=10,
-                    profile_id=EVOLUTION_LLM_PROFILE_ID,
-                )
-                if result and len(result.strip()) > 0:
-                    print("✅ LLM (evolution LLM): Available")
-                else:
-                    issues.append({
-                        "issue_type": "llm_api_failure",
-                        "severity": "critical",
-                        "description": "The configured LLM returned an empty response",
-                        "fix_hint": (
-                            "The configured evolution LLM returned an empty result. "
-                            "Check the selected profile, credentials, endpoint, and network."
-                        ),
-                        "affected_file": f"{_RUNTIME_DIR}/utils.py",
-                        "affected_questions": 0,
-                    })
-                    print("      ❌ LLM: provider returned an empty response")
-            except Exception as e:
-                issues.append({
-                    "issue_type": "llm_api_failure",
-                    "severity": "critical",
-                    "description": f"LLM provider connection failed: {str(e)[:100]}",
-                    "fix_hint": f"LLM call failed: {str(e)[:200]}. Check the profile, credentials, endpoint, and network.",
-                    "affected_file": f"{_RUNTIME_DIR}/utils.py",
-                    "affected_questions": 0,
-                })
-                print(f"      ❌ LLM: {str(e)[:80]}")
-
-        if "embedding" in requirements:
-            try:
-                result = utils.call_embedding("preflight test query")
-                if result and any(float(value) != 0.0 for value in result):
-                    print("      ✅ Embedding profile: available")
-                else:
-                    issues.append({
-                        "issue_type": "embedding_api_failure",
-                        "severity": "high",
-                        "description": "The selected embedding profile returns a zero vector and is unavailable",
-                        "fix_hint": ("The embedding profile returns a zero vector. "
-                                     "Check its credentials, endpoint, and network connection."),
-                        "affected_file": f"{_RUNTIME_DIR}/utils.py",
-                        "affected_questions": 0,
-                    })
-                    print("      ❌ Embedding: Returns a zero vector (API not available)")
-            except Exception as e:
-                issues.append({
-                    "issue_type": "embedding_api_failure",
-                    "severity": "high",
-                    "description": f"Embedding provider call failed: {str(e)[:100]}",
-                    "fix_hint": f"Embedding call failed: {str(e)[:200]}",
-                    "affected_file": f"{_RUNTIME_DIR}/utils.py",
-                    "affected_questions": 0,
-                })
-                print(f"      ❌ Embedding: {str(e)[:80]}")
-
-        if not issues:
-            print("      ✅ All API checks passed")
-        else:
-            print(f"      ⚠️ {len(issues)} API issues pending")
-
-        return issues
-
-    def _preflight_requirements(self) -> set:
-        """Return API checks required by the candidate/reference combo."""
-        requirements = {"llm"}
-        combo = self._baseline_combo_config()
-        if isinstance(self.evolved_bundle, dict):
-            combo.update(self.evolved_bundle.get("combo") or {})
-        struct_name = combo.get("video_structuring", "")
-        if self._candidate_or_combo_requires_embedding(struct_name):
-            requirements.add("embedding")
-        for module in (self.evolved_bundle or {}).get("modules", {}).values():
-            code = str((module or {}).get("code") or "").lower()
-            if "call_embedding" in code or "chroma" in code or "retrieve" in code:
-                requirements.add("embedding")
-        return requirements
-
-    def _candidate_or_combo_requires_embedding(self, struct_name: str) -> bool:
-        """Return True only when the selected struct likely needs embeddings."""
-        structuring = ((self.evolved_bundle or {}).get("modules") or {}).get("video_structuring") or {}
-        code = str(structuring.get("code") or "")
-        lowered_code = code.lower()
-        if "video_structuring" in self.target_modules:
-            if any(token in lowered_code for token in (
-                "requires_vector_db=true", "call_embedding", "chromadb",
-                "collection.query", "rebuild_chroma",
-            )):
-                return True
-            if any(token in lowered_code for token in (
-                "requires_vector_db=false", "requires_vector_db = false",
-            )):
-                return False
-        if not struct_name or struct_name == "none":
-            return False
-        try:
-            import inspect
-
-            import module_map
-            cls = module_map.STRUCTURING_MAP.get(struct_name)
-            if cls is None:
-                return False
-            source = inspect.getsource(cls).lower()
-            return any(token in source for token in (
-                "requires_vector_db=true", "call_embedding", "chromadb",
-                "collection.query", "rebuild_chroma",
-            ))
-        except Exception:
-            return "video_structuring" in self.target_modules
-
-    def _fix_api_issues(self, api_issues: list) -> int:
-        """Record provider failures for the outer authoring loop; never edit code here."""
-        self._runtime_issues = list(api_issues or [])
-        return 0
-
 
     def _runtime_monitor_callback(self, question_idx: int, result: dict,
                                    all_results: list) -> bool:
@@ -677,7 +457,7 @@ class CandidateEvaluator:
         return True  # CONTINUE
 
     def _step4_verify(self):
-        """Run preflight checks, monitored probes, and reference comparison."""
+        """Execute the candidate, monitor runtime events and compare with current best."""
         print(f"\n{'─' * 60}")
         print("Step 4: Candidate verification")
         print(f"{'─' * 60}")
@@ -692,38 +472,12 @@ class CandidateEvaluator:
             evaluate_combo_multi_video,
         )
 
-        # ─── Phase A: Pre-flight inspection ──────────────────────────────
-        preflight_issues = self._preflight_api_check()
-        if preflight_issues:
-            self._fix_api_issues(preflight_issues)
-            critical_remaining = [
-                issue for issue in preflight_issues if issue["severity"] == "critical"
-            ]
-
-            if critical_remaining:
-                print(f"\n   ❌ {len(critical_remaining)} required provider capability check(s) failed; verification aborted")
-                self.verification_report = {
-                    "status": "preflight_failed",
-                    "api_issues": [{"issue_type": i["issue_type"],
-                                    "description": i["description"]}
-                                   for i in critical_remaining],
-                    "accepted": False,
-                    "abort_reason": "Preflight failed because a required provider capability is unavailable",
-                }
-                return
-            print(
-                f"   ⚠️ {len(preflight_issues)} non-critical provider issue(s) recorded; "
-                "probe results may be affected"
-            )
-
         # ─── Loading infrastructure ───────────────────────────────────
         reference_lookup, reference_label, reference_source = self._reference_lookup()
         print(f"   Reference: {reference_label} ({reference_source})")
 
-        # Load the training split declared by the MetaVideoAgent manifest.
-        # Avoid scanning other benchmarks in the warehouse into the probe.
+        # Load the training split declared by the distribution manifest.
         all_questions, question_video_ids, _split_spec = load_question_set(
-            self.workspace_dir,
             video_id="ALL",
             distribution_manifest=self.distribution_manifest,
             preferred_splits=("train",),
@@ -745,6 +499,7 @@ class CandidateEvaluator:
               "window. This keeps probe as a lightweight runnable-candidate "
               "screen instead of a full-video localization benchmark."
         ).strip()
+        write_json(os.path.join(self.sandbox_dir, "probe_plan.json"), probe_plan)
 
         print(f"   Targeted verification: {len(targeted)} question(s)")
         print(f"      mode: {probe_plan.get('mode')}")
@@ -755,47 +510,38 @@ class CandidateEvaluator:
             print("   ❌ No questions to verify")
             return
 
-        # ─── Phase B: Monitored sandbox execution (including project repair retry) ───────
-        MAX_SANDBOX_RETRY = 2
+        # ─── Monitored sandbox execution ───────────────────────────
         results = None
 
-        for attempt in range(MAX_SANDBOX_RETRY):
-            self._runtime_issues = []  # Reset runtime monitoring status
+        self._runtime_issues = []  # Reset runtime monitoring status
 
-            all_evolved = self._effective_evolved_modules()
-            evolved_combo_config, evolved = self._resolve_evolved_combo(all_evolved)
-            combo_id = f"Evolved_bundle_{int(time.time())}"
-            isolate_structure = True
+        combo_id = f"Evolved_bundle_{int(time.time())}"
+        isolate_structure = True
 
-            _ensure_runtime_path_for_workspace(self.workspace_dir)
-            import module_map
-            original_maps = {
-                "structuring": dict(module_map.STRUCTURING_MAP),
-                "thinking": dict(module_map.THINKING_MAP),
-                "memory": dict(module_map.WORK_MEMORY_MAP),
-                "localization": dict(module_map.LOCALIZATION_MAP),
-                "perception": dict(module_map.PERCEPTION_MAP),
-            }
-            module_map_refs = {
-                "structuring": module_map.STRUCTURING_MAP,
-                "thinking": module_map.THINKING_MAP,
-                "memory": module_map.WORK_MEMORY_MAP,
-                "localization": module_map.LOCALIZATION_MAP,
-                "perception": module_map.PERCEPTION_MAP,
-            }
-            agent_combo, custom_configs, reference_injection = self._inject_reference_and_evolved(
-                evolved_combo_config,
-                evolved,
-                module_map_refs,
-            )
+        _ensure_runtime_path_for_workspace(self.workspace_dir)
+        import module_map
+        original_maps = {
+            "structuring": dict(module_map.STRUCTURING_MAP),
+            "thinking": dict(module_map.THINKING_MAP),
+            "memory": dict(module_map.WORK_MEMORY_MAP),
+            "localization": dict(module_map.LOCALIZATION_MAP),
+            "perception": dict(module_map.PERCEPTION_MAP),
+        }
+        module_map_refs = {
+            "structuring": module_map.STRUCTURING_MAP,
+            "thinking": module_map.THINKING_MAP,
+            "memory": module_map.WORK_MEMORY_MAP,
+            "localization": module_map.LOCALIZATION_MAP,
+            "perception": module_map.PERCEPTION_MAP,
+        }
+        try:
+            agent_combo, custom_configs, reference_injection = self._inject_candidate(module_map_refs)
             structure_reuse_decision = self._structure_reuse_decision(
-                reference_injection, agent_combo, evolved,
+                reference_injection, agent_combo,
             )
             evolved_uses_structuring = structure_reuse_decision["rebuild_structure"]
-            # Probe is deliberately an oracle-style, time-reference-only
-            # runnable-candidate screen for every target module.  Structuring
-            # candidates build only that slice; all other candidates receive a
-            # filtered current-best artifact for the same slice.
+            # Structuring candidates build the selected slice; other candidates
+            # receive the current-best structure artifact filtered to that slice.
             time_reference_bounded_probe = (
                 os.environ.get("SANDBOX_TIME_REFERENCE_BOUNDED_PROBE", "1").lower()
                 in ("1", "true", "yes")
@@ -805,148 +551,108 @@ class CandidateEvaluator:
                 reference_structure_dir = self._reference_structure_artifact_dir()
                 if not reference_structure_dir:
                     raise RuntimeError(
-                        "Candidate struct matches current best but its structure_artifact "
-                        "directory is unavailable; refusing workspace fallback."
+                        "Current-best structure_artifact directory is required "
+                        "when the candidate reuses its structuring implementation."
                     )
             if isolate_structure:
-                struct_name = agent_combo.get("video_structuring") or evolved_combo_config.get("video_structuring")
+                struct_name = agent_combo["video_structuring"]
                 if struct_name:
                     struct_cfg = custom_configs.setdefault(struct_name, {})
                     physics = struct_cfg.setdefault("physics", {})
                     workers = int(os.environ.get("VIDEO_STRUCT_REBUILD_WORKERS", "8") or "8")
                     physics.setdefault("parallel_workers", workers)
-                    physics.setdefault("parallel_workers_full_coverage", workers)
-                    physics.setdefault("parallel_workers_interval_entity_ocr", workers)
                     physics.setdefault("parallel_batch_delay", 0.2)
                     api_tools = struct_cfg.setdefault("api_tools", {})
-                    # Do not inject an api_tools[struct_name] override here:
-                    # generated structuring modules often use the class name key
-                    # for their full prompt schema, and a model-only override
-                    # would erase prompt_template during custom_config merge.
+                    # Preserve generated class-specific prompt schemas while
+                    # applying the configured VLM profile to the generic builder.
                     api_cfg = api_tools.setdefault("segment_text", {})
                     from capability_registry import resolve_profile
                     vlm_model = str(resolve_profile("vlm").get("model_id") or "")
                     api_cfg["active_model"] = vlm_model
                     api_cfg["model"] = vlm_model
-                    api_cfg["dense_active_model"] = vlm_model
-                    api_cfg["interval_entity_ocr_active_model"] = vlm_model
 
-            sandbox_dir = (
-                self.sandbox_dir
-                if attempt == 0
-                else f"{self.sandbox_dir}_retry{attempt + 1}"
-            )
+            sandbox_dir = self.sandbox_dir
+            print(f"\nRunning targeted verification: {combo_id} ({len(targeted)} question(s))")
+            if reference_injection.get("reference_bundle_path"):
+                print(f"      reference_bundle: {reference_injection['reference_bundle_path']}")
 
-            try:
-                if attempt > 0:
-                    print(f"\nRetrying targeted verification ({attempt + 1}/{MAX_SANDBOX_RETRY})")
-                print(f"\nRunning targeted verification: {combo_id} ({len(targeted)} question(s))")
-                if reference_injection.get("reference_bundle_path"):
-                    print(f"      reference_bundle: {reference_injection['reference_bundle_path']}")
-
-                old_env = {}
-                if evolved_uses_structuring:
-                    sandbox_env = {
-                        "SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD": "1",
-                        "SANDBOX_DISABLE_FULL_STRUCTURE_BUILD": "0",
-                    }
-                    if time_reference_bounded_probe:
-                        sandbox_env.update({
-                            "SANDBOX_STRUCTURE_TIME_REF_ONLY": "1",
-                            "SANDBOX_STRUCTURE_TIME_REF_PADDING": os.environ.get(
-                                "SANDBOX_STRUCTURE_TIME_REF_PADDING", "0"
-                            ),
-                            # Exact scoped structures are still rebuilt per
-                            # question, but their window is now carried by a
-                            # task-local ContextVar.  Keep this previous
-                            # process-global switch off so the evaluator can
-                            # safely schedule independent probe questions in
-                            # parallel.
-                            "SANDBOX_PER_QUESTION_STRUCTURE_REBUILD": "0",
-                            "SANDBOX_MERGE_TIME_REF_WINDOWS": "0",
-                            "SANDBOX_QUESTION_MAX_RETRIES": "1",
-                        })
-                else:
-                    sandbox_env = {
-                        "SANDBOX_REFERENCE_STRUCTURE_DIR": reference_structure_dir,
-                        "SANDBOX_DISABLE_FULL_STRUCTURE_BUILD": "1",
-                    }
-                # Apply both branches. Previously the structuring branch only
-                # constructed this mapping, leaving its declared probe policy
-                # inactive at runtime.
-                for key, value in sandbox_env.items():
-                    old_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-                try:
-                    results = evaluate_combo_multi_video(
-                        self.workspace_dir, targeted, agent_combo, combo_id,
-                        sandbox_dir, custom_configs=custom_configs,
-                        on_question_done=self._runtime_monitor_callback,
-                        force_rebuild=evolved_uses_structuring,
-                        isolate_structure=isolate_structure,
-                        concurrency=self.concurrency,
-                        # Non-structuring candidates must receive the immutable
-                        # current-best artifact explicitly, not only through a
-                        # process-global environment variable.
-                        reference_structure_dir=reference_structure_dir,
-                        runtime_time_reference_only=time_reference_bounded_probe,
-                        # Probe questions are independent, each with its own
-                        # task-local media scope and isolated structure path.
-                        # Use the global scheduler so the requested budget is
-                        # actual question concurrency rather than per-video
-                        # batching followed by an idle tail.
-                        global_question_scheduler=True,
-                    )
-                finally:
-                    for key, value in old_env.items():
-                        if value is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = value
-            finally:
-                # Restore MAP
-                for key, orig in original_maps.items():
-                    map_ref = module_map_refs[key]
-                    map_ref.clear()
-                    map_ref.update(orig)
-
-            # Runtime failures are evidence for the outer authoring workflow.
-            # This evaluator never edits code or retries a modified candidate.
-            if self._runtime_issues:
-                self.verification_report = {
-                    "status": "engineering_abort",
-                    "engineering_invalid": True,
-                    "engineering_invalid_reason": "Systemic engineering/API issues were detected at runtime, and the verification results cannot be used to judge evolutionary validity.",
-                    "runtime_issues": [
-                        {"issue_type": i["issue_type"],
-                         "description": i["description"],
-                         "fix_hint": i.get("fix_hint", ""),
-                         "severity": i.get("severity", ""),
-                         "occurrences": i.get("total_occurrences", 0),
-                         "affected_questions": i.get("affected_questions", 0)}
-                        for i in self._runtime_issues
-                    ],
-                    "partial_results": len(results) if results else 0,
-                    "total_questions": len(targeted),
-                    "accepted": False,
-                    "abort_reason": (
-                        "Systemic runtime/provider issue detected: "
-                        f"{', '.join(i['issue_type'] for i in self._runtime_issues)}"
-                    ),
+            old_env = {}
+            if evolved_uses_structuring:
+                sandbox_env = {
+                    "SANDBOX_ALLOW_FULL_STRUCTURE_REBUILD": "1",
+                    "SANDBOX_DISABLE_FULL_STRUCTURE_BUILD": "0",
                 }
-
-                # Abort reports are not saved separately (managed centrally by EvolutionMemory)
-                print("   ⚠️ Runtime issues recorded for the outer authoring workflow.")
-                return
+                if time_reference_bounded_probe:
+                    sandbox_env.update({
+                        "SANDBOX_STRUCTURE_TIME_REF_ONLY": "1",
+                        "SANDBOX_STRUCTURE_TIME_REF_PADDING": os.environ.get(
+                            "SANDBOX_STRUCTURE_TIME_REF_PADDING", "0"
+                        ),
+                        # A task-local media scope permits independent
+                        # per-question structure builds in parallel.
+                        "SANDBOX_PER_QUESTION_STRUCTURE_REBUILD": "0",
+                        "SANDBOX_MERGE_TIME_REF_WINDOWS": "0",
+                        "SANDBOX_QUESTION_MAX_RETRIES": "1",
+                    })
             else:
-                # No engineering issues → Exit the retry loop normally
-                break
+                sandbox_env = {
+                    "SANDBOX_REFERENCE_STRUCTURE_DIR": reference_structure_dir,
+                    "SANDBOX_DISABLE_FULL_STRUCTURE_BUILD": "1",
+                }
+            # Apply the selected structure policy for this evaluation.
+            for key, value in sandbox_env.items():
+                old_env[key] = os.environ.get(key)
+                os.environ[key] = value
+            try:
+                results = evaluate_combo_multi_video(
+                    self.workspace_dir, targeted, agent_combo, combo_id,
+                    sandbox_dir, custom_configs=custom_configs,
+                    on_question_done=self._runtime_monitor_callback,
+                    force_rebuild=evolved_uses_structuring,
+                    isolate_structure=isolate_structure,
+                    concurrency=self.concurrency,
+                    # Non-structuring candidates must receive the immutable
+                    # current-best artifact explicitly, not only through a
+                    # process-global environment variable.
+                    reference_structure_dir=reference_structure_dir,
+                    runtime_time_reference_only=time_reference_bounded_probe,
+                    # Probe questions are independent, each with its own
+                    # task-local media scope and isolated structure path.
+                    # Use the global scheduler so the requested budget is
+                    # actual question concurrency rather than per-video
+                    # batching followed by an idle tail.
+                    global_question_scheduler=True,
+                )
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+        finally:
+            # Restore MAP
+            for key, orig in original_maps.items():
+                map_ref = module_map_refs[key]
+                map_ref.clear()
+                map_ref.update(orig)
+
+        # Runtime failures are evidence for the outer authoring workflow.
+        # This evaluator never edits code or retries a modified candidate.
+        self._last_probe_results = list(results or [])
+        execution_metadata = {
+            "sandbox_dir": sandbox_dir, "probe_plan": probe_plan,
+            "combo_id": combo_id, "runtime_issues": list(self._runtime_issues),
+            "target_modules": list(self.target_modules),
+        }
 
         # ─── Phase C: Normal path — comparison results ───────────────────
         if not results:
             self.verification_report = {
+                **execution_metadata,
                 "status": "no_results",
                 "probe_status": "invalid",
+                "engineering_invalid": True,
+                "execution_layer_rerun_required": True,
                 "accepted": False,
             }
             return
@@ -957,6 +663,7 @@ class CandidateEvaluator:
             reference_label=reference_label,
             reference_source=reference_source,
         )
+        self.verification_report.update(execution_metadata)
         from sandbox_evaluator import detect_runtime_engineering_issues
         probe_runtime_issues = detect_runtime_engineering_issues(results)
         if probe_runtime_issues:
@@ -990,13 +697,12 @@ class CandidateEvaluator:
                 self.verification_report["execution_error_code"] = (
                     "runtime_provider_or_asset_failure"
                 )
-        self._last_probe_results = list(results)
         self.verification_report["combo_id"] = combo_id
         self.verification_report["target_modules"] = list(self.target_modules)
         self.verification_report["reference_label"] = reference_label
         self.verification_report["reference_source"] = reference_source
         self.verification_report["evolution_decision"] = self.evolution_decision
-        self.verification_report["evolved_combo_config"] = evolved_combo_config
+        self.verification_report["evolved_combo_config"] = agent_combo
         self.verification_report["structure_reuse_decision"] = structure_reuse_decision
         self.verification_report["sandbox_dir"] = sandbox_dir
         self.verification_report["probe_plan"] = probe_plan
@@ -1036,7 +742,9 @@ class CandidateEvaluator:
         })
         if not probe_execution_complete:
             self.verification_report["comparison_valid"] = False
-            self.verification_report["execution_layer_rerun_required"] = True
+            if not self.verification_report.get("engineering_invalid"):
+                self.verification_report["execution_layer_rerun_required"] = True
+            self.verification_report["engineering_invalid"] = True
             self.verification_report["execution_error_code"] = "incomplete_or_misaligned_probe_results"
 
         corrections = len(self.verification_report.get("corrections", []))
@@ -1121,7 +829,7 @@ class CandidateEvaluator:
         If the diagnosis provides target_questions, prioritize them.  A
         target ref can name a concrete task_id or a video time_reference; time
         refs intentionally expand to every dataset question in that interval.
-        `first_n` is a hard probe budget.
+        `first_n` limits a new batch; a saved batch keeps its task IDs.
         """
         id_to_q = {q.get("task_id", ""): q for q in all_questions}
         fixed_refs = [
@@ -1131,29 +839,24 @@ class CandidateEvaluator:
             missing = [ref for ref in fixed_refs if ref not in id_to_q]
             if missing:
                 raise RuntimeError(
-                    "fixed supervised probe batch no longer matches the active train manifest; "
+                    "saved probe batch no longer matches the active train manifest; "
                     f"missing task_ids={missing}"
                 )
             # Preserve the original order and duplicates check here instead of
             # deduplicating through the normal targeting heuristics.  A broken
             # fixed batch is an artifact error, not permission to replace it.
             if len(set(fixed_refs)) != len(fixed_refs):
-                raise RuntimeError("fixed supervised probe batch contains duplicate task IDs")
+                raise RuntimeError("saved probe batch contains duplicate task IDs")
             targeted = [id_to_q[ref] for ref in fixed_refs]
-            signature = hashlib.sha256(
-                "\n".join(fixed_refs).encode("utf-8")
-            ).hexdigest()
             return targeted, {
-                "mode": "fixed_supervised_feedback_batch",
+                **getattr(self, "fixed_probe_plan", {}),
+                "mode": "fixed_probe_batch",
                 "requested_budget": len(fixed_refs),
                 "effective_budget": len(fixed_refs),
                 "selected_refs": fixed_refs,
                 "fixed_probe_task_ids": fixed_refs,
-                "fixed_probe_signature": signature,
                 "selection_note": (
-                    "This is an immutable same-direction supervised feedback batch. "
-                    "It is intentionally reused after Codex self-debug; no diagnosis "
-                    "or target-selection heuristic may rotate its questions."
+                    "Reuse the saved task IDs in their original order for this candidate continuation."
                 ),
             }
         ref_to_ids = {}
@@ -1255,25 +958,14 @@ class CandidateEvaluator:
             if ref in id_to_q
         ])
         guard_refs = [ref for ref in guard_refs if ref not in excluded_feedback_refs]
-        distribution_refs = [
-            ref for ref in self._distribution_probe_refs(all_questions, id_to_q)
-            if ref not in excluded_feedback_refs
-        ]
         requested_budget = self.first_n if self.first_n and self.first_n > 0 else None
         baseline_guard_refs = self._regression_guard_candidates(
             all_questions, reference_lookup, selected_refs
         )
         guard_pool = self._ordered_unique_refs(guard_refs + baseline_guard_refs)
         guard_pool = [ref for ref in guard_pool if ref not in excluded_feedback_refs]
-        # Diagnosis chooses hypotheses; the machine contract only selects
-        # representative rows to test them.  Previous MFP clusters are accepted
-        # for audit replay, but no longer define what the new candidate must
-        # implement.
-        hypothesis_mode = bool(self.machine_probe_plan.get("diagnosis_hypothesis_witnesses"))
-        machine_clusters = (
-            self.machine_probe_plan.get("diagnosis_hypothesis_witnesses", [])
-            if hypothesis_mode else self.machine_probe_plan.get("optional_mfp_witness_clusters", [])
-        ) or []
+        # Select representative rows for the diagnosed hypotheses.
+        machine_clusters = self.machine_probe_plan.get("diagnosis_hypothesis_witnesses") or []
         witness_clusters = []
         witness_refs = []
         for cluster in machine_clusters:
@@ -1292,8 +984,8 @@ class CandidateEvaluator:
                 continue
             seed = refs[0]
             witness_clusters.append({
-                "hypothesis_id": str(cluster.get("hypothesis_id") or cluster.get("cluster_id") or ""),
-                "failure_kinds": list(cluster.get("failure_kinds") or ([cluster.get("failure_kind")] if cluster.get("failure_kind") else [])),
+                "hypothesis_id": str(cluster.get("hypothesis_id") or ""),
+                "failure_kinds": list(cluster.get("failure_kinds") or []),
                 "selected_ref": seed,
                 "available_refs": refs,
             })
@@ -1323,14 +1015,14 @@ class CandidateEvaluator:
                 machine_generalization_refs + [
                     ref for ref in reference_incorrect_refs
                     if ref not in set(direct_target_refs) and ref not in set(witness_refs)
-                ] + distribution_refs
+                ]
             )
             for ref in generalization_pool:
                 if len(selected_refs) >= max(0, budget - reserved_guard):
                     break
                 if ref not in selected_refs:
                     selected_refs.append(ref)
-            for ref in direct_target_refs + guard_pool + distribution_refs:
+            for ref in direct_target_refs + guard_pool:
                 if len(selected_refs) >= budget:
                     break
                 if ref not in selected_refs:
@@ -1350,13 +1042,13 @@ class CandidateEvaluator:
                     selected_refs = self._ordered_unique_refs(selected_refs)
                 elif len(selected_refs) < requested_budget:
                     selected_refs.append(first_guard)
-            for ref in guard_pool + distribution_refs:
+            for ref in guard_pool:
                 if len(selected_refs) >= requested_budget:
                     break
                 if ref not in selected_refs:
                     selected_refs.append(ref)
         else:
-            for ref in guard_pool + distribution_refs:
+            for ref in guard_pool:
                 if ref not in selected_refs:
                     selected_refs.append(ref)
         if not selected_refs:
@@ -1365,11 +1057,7 @@ class CandidateEvaluator:
 
         targeted = [id_to_q[ref] for ref in selected_refs if ref in id_to_q]
         probe_plan = {
-            "mode": (
-                "distribution_aware_repair_guard"
-                if self.observed_distribution_profile else
-                ("all_target_questions" if target_refs else "fallback_first_n")
-            ),
+            "mode": "all_target_questions" if target_refs else "fallback_first_n",
             "requested_budget": self.first_n,
             "effective_budget": len(selected_refs),
             "repair_probe_refs": direct_target_refs if witness_clusters else target_refs,
@@ -1401,7 +1089,6 @@ class CandidateEvaluator:
                 ref for ref in selected_refs if ref in reference_incorrect_refs
             ],
             "selected_guard_refs": [ref for ref in selected_refs if ref in guard_pool],
-            "selected_distribution_refs": [ref for ref in selected_refs if ref in distribution_refs],
             "regression_guard_refs": guard_refs,
             "reference_correct_guard_refs": baseline_guard_refs,
             "failure_cluster_refs": failure_clusters,
@@ -1418,11 +1105,6 @@ class CandidateEvaluator:
                 and ref not in set(witness_refs)
             ],
             "probe_feedback_excluded_refs": sorted(excluded_feedback_refs),
-            "distribution_probe_refs": distribution_refs,
-            "observed_distribution_channels": (
-                (self.observed_distribution_profile.get("observed_information_channels", {}) or {})
-                .get("dominant_channels", [])
-            ),
             "previous_candidate_corrections": validation_policy.get(
                 "previous_candidate_corrections", []),
             "previous_candidate_regressions": validation_policy.get(
@@ -1527,42 +1209,6 @@ class CandidateEvaluator:
             if refs:
                 cluster_seed_refs.append(refs[0])
         return self._ordered_unique_refs(cluster_seed_refs), clusters
-
-    def _distribution_probe_refs(self, all_questions: list, id_to_q: dict) -> list:
-        """Pick deterministic probe refs matching observed information channels."""
-        profile = self.observed_distribution_profile or {}
-        channels = (
-            (profile.get("observed_information_channels", {}) or {})
-            .get("dominant_channels", [])
-        )
-        if not channels:
-            return []
-        refs_by_channel = []
-        raw_profile = profile.get("raw_video_signal_profile", {}) or {}
-        per_video = raw_profile.get("per_video", []) or []
-        representative_video_ids = []
-        for predicate in (
-            lambda row: row.get("has_audio_stream") is True,
-            lambda row: row.get("low_visual_motion") is True,
-            lambda row: row.get("avg_frame_delta", 0) >= 0.08,
-        ):
-            for row in per_video:
-                if not isinstance(row, dict) or not row.get("video_id"):
-                    continue
-                try:
-                    matched = bool(predicate(row))
-                except Exception:
-                    matched = False
-                if matched and row["video_id"] not in representative_video_ids:
-                    representative_video_ids.append(row["video_id"])
-                    break
-        for video_id in representative_video_ids:
-            for q in all_questions:
-                ref = q.get("task_id", "")
-                if ref and ref in id_to_q and q.get("video_id") == video_id:
-                    refs_by_channel.append(ref)
-                    break
-        return self._ordered_unique_refs(refs_by_channel)
 
     def _normalize_probe_refs(self, refs, id_to_q: dict, ref_to_ids: dict) -> list:
         normalized = []
@@ -1717,7 +1363,8 @@ class CandidateEvaluator:
                 refs.append(ref)
         return self._ordered_unique_refs(refs)
 
-    def _classify_probe_status(self, corrections: int, regressions: int) -> str:
+    @staticmethod
+    def _classify_probe_status(corrections: int, regressions: int) -> str:
         if corrections >= 1 and corrections > regressions:
             return "promising"
         if regressions >= 1:
@@ -1737,7 +1384,7 @@ class CandidateEvaluator:
             or 0
         )
         scope = self.verification_report.get("verification_scope", "")
-        require_complete = scope in ("full", "full_18", "full_multi_video")
+        require_complete = scope == "full"
         apply_effectiveness_policy(
             self.verification_report,
             expected_total_questions=expected,
@@ -1755,14 +1402,8 @@ class CandidateEvaluator:
             "timestamp": int(time.time()),
             "target_modules": list(self.target_modules),
             "observed_distribution_profile": self.observed_distribution_profile,
-            "engineering_fixes": {
-                "total": len(self.eng_fix_results),
-                "fixed": sum(1 for r in self.eng_fix_results if r.get("fixed")),
-                "details": self.eng_fix_results,
-            },
             "candidate_evolution": {
                 "success": self.evolved_bundle is not None,
-                "bundle_fingerprint": (self.evolved_bundle or {}).get("bundle_fingerprint", ""),
                 "changed_modules": list((self.evolved_bundle or {}).get("changed_modules") or []),
             },
             "verification": self.verification_report or {"status": "not_run"},
@@ -1770,7 +1411,6 @@ class CandidateEvaluator:
             # Feedback information: for closed-loop reuse of diagnostic module
             "feedback": {
                 "evolution_hint_used": self.evolution_hint,
-                "strategies_tried": getattr(self, '_strategies_tried', []),
                 "verification_trajectories": self._collect_verification_trajectories(),
             },
         }
@@ -1788,16 +1428,7 @@ class CandidateEvaluator:
             runtime_issues = v.get("runtime_issues", [])
             issue_names = ", ".join(i.get("issue_type", "?") for i in runtime_issues)
             conclusion["verdict_reason"] = (
-                f"Runtime issues blocked verification: {issue_names}. "
-                "The automated recovery attempt did not resolve them."
-            )
-
-        elif v_status == "preflight_failed":
-            conclusion["verdict"] = "preflight_failed"
-            api_issues = v.get("api_issues", [])
-            issue_names = ", ".join(i.get("issue_type", "?") for i in api_issues)
-            conclusion["verdict_reason"] = (
-                f"Provider preflight failed for required capability checks: {issue_names}."
+                f"Runtime issues blocked verification: {issue_names}."
             )
 
         elif self.evolved_bundle and not self.verification_report:

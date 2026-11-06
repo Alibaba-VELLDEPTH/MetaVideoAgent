@@ -86,33 +86,33 @@ def _iter_jsonl(path: str) -> Iterable[dict]:
                 yield row
 
 
+def _row_video_id(row: dict) -> str:
+    return str(row.get("video_id") or row.get("video_uid") or row.get("video")
+               or row.get("video_name") or "").strip()
+
+
 def train_video_queries_from_manifest(manifest_path: str) -> tuple[List[str], Dict[str, List[dict]]]:
+    """Select training videos and attach their questions from the question split."""
     spec = load_distribution_spec(manifest_path)
-    train_path = (
-        (spec.get("video_splits", {}) or {}).get("train")
-        or (spec.get("splits", {}) or {}).get("train")
-    )
+    train_path = (spec.get("splits") or {}).get("train")
     if not train_path:
-        return []
+        raise ValueError("distribution manifest must define a train question split")
+    video_path = (spec.get("video_splits") or {}).get("train") or train_path
     ids = []
     seen = set()
+    for split_file in dataset_files_from_path(video_path):
+        for row in _iter_jsonl(split_file):
+            video_id = _row_video_id(row)
+            if video_id and video_id not in seen:
+                seen.add(video_id)
+                ids.append(video_id)
+
     queries: Dict[str, List[dict]] = defaultdict(list)
     for split_file in dataset_files_from_path(train_path):
         for row in _iter_jsonl(split_file):
-            video_id = (
-                row.get("video_id")
-                or row.get("video_uid")
-                or row.get("video")
-                or row.get("video_name")
-                or ""
-            )
-            video_id = str(video_id).strip()
-            if not video_id or video_id in seen:
-                if not video_id:
-                    continue
-            else:
-                seen.add(video_id)
-                ids.append(video_id)
+            video_id = _row_video_id(row)
+            if video_id not in seen:
+                continue
             question = str(row.get("question") or row.get("query") or row.get("prompt") or "").strip()
             choices = row.get("choices")
             if choices in (None, "", [], {}):
@@ -274,10 +274,8 @@ Associated questions and answer options (no labels):
 """ + json.dumps(queries or [], ensure_ascii=False)[:12000]
 
 
-def observe_overview_with_model(row: Dict[str, Any], runtime_dir: str,
-                                vlm_model: str = "") -> Dict[str, Any]:
+def observe_overview_with_model(row: Dict[str, Any], runtime_dir: str) -> Dict[str, Any]:
     """Observe one five-frame overview through the auditable VLM adapter."""
-    del vlm_model  # formal profiles, not caller model strings, select transports
     runtime_dir = os.path.abspath(runtime_dir)
     if runtime_dir and runtime_dir not in sys.path:
         sys.path.insert(0, runtime_dir)
@@ -315,7 +313,8 @@ def observe_overview_with_model(row: Dict[str, Any], runtime_dir: str,
         )
         frame_texts = [
             str(item.get("text") or "")
-            for item in (visual.get("frames") or []) if isinstance(item, dict)
+            for item in (visual.get("frames") or [])
+            if isinstance(item, dict) and item.get("status") == "ok"
         ]
         # The five overview frames are sent in one ordered VLM batch. Parse the
         # response as one per-video distribution record.
@@ -326,6 +325,9 @@ def observe_overview_with_model(row: Dict[str, Any], runtime_dir: str,
     finally:
         runtime_evidence.reset_evidence_run(token)
     return {
+        "status": "observed" if visual.get("status") == "ok" and vlm_text.strip() else "failed",
+        "inference_status": visual.get("status", "unavailable"),
+        "runtime_observation": visual,
         "vlm_raw": vlm_text,
         "vlm_json": parsed,
         "vlm_frame_json": parsed_frames,
@@ -341,10 +343,18 @@ def _level_to_score(value: str) -> float:
 
 def aggregate_observations(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     channel_counts = Counter()
+    inference_statuses = Counter()
     scalar = defaultdict(float)
     usable = 0
     for row in rows:
         obs = row.get("model_observation", {}) or {}
+        inference_statuses.update(
+            event.get("status", "unknown") for event in obs.get("capability_events") or []
+            if event.get("capability") == "vlm" and event.get("event") == "inference"
+        )
+        if not observation_is_usable(obs):
+            continue
+        usable += 1
         parsed = obs.get("vlm_json", {}) if isinstance(obs.get("vlm_json"), dict) else {}
         channel = (
             parsed.get("dominant_information_channel")
@@ -355,7 +365,6 @@ def aggregate_observations(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             channel = "mixed"
         channel_counts[channel] += 1
         if parsed:
-            usable += 1
             scalar["subtitle_text"] += _level_to_score(parsed.get("subtitle_presence"))
             scalar["screen_text"] += _level_to_score(parsed.get("screen_text_presence"))
             scalar["visual_action"] += _level_to_score(parsed.get("visual_motion"))
@@ -363,13 +372,13 @@ def aggregate_observations(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 _level_to_score(parsed.get("screen_text_presence")),
                 _level_to_score(parsed.get("visual_motion")) * 0.5,
             )
-    denom = max(1, len(rows))
+    denom = max(1, usable)
     channel_mix = {key: round(channel_counts.get(key, 0) / denom, 3) for key in CHANNELS}
     semantic_density = {
         key: round(value / max(1, usable), 3)
         for key, value in scalar.items()
     }
-    primary = max(channel_mix.items(), key=lambda item: item[1])[0] if rows else "unknown"
+    primary = max(channel_mix.items(), key=lambda item: item[1])[0] if usable else "unknown"
     top = sorted(channel_mix.values(), reverse=True)
     confidence = round(max(0.0, top[0] - (top[1] if len(top) > 1 else 0.0)), 3) if top else 0.0
     if primary == "unknown":
@@ -377,6 +386,7 @@ def aggregate_observations(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "sampled_video_records": len(rows),
         "usable_model_observations": usable,
+        "model_inference_status_counts": dict(inference_statuses),
         "channel_mix": channel_mix,
         "semantic_density": semantic_density,
         "dominant_information_channel": primary,
@@ -389,6 +399,18 @@ def aggregate_observations(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def observation_is_usable(observation: Dict[str, Any]) -> bool:
+    """Count model content only when the visual inference actually succeeded."""
+    succeeded = any(
+        event.get("capability") == "vlm" and event.get("event") == "inference"
+        and event.get("status") == "ok"
+        for event in observation.get("capability_events") or []
+    )
+    return observation.get("status") == "observed" and succeeded and bool(
+        observation.get("vlm_json") or str(observation.get("vlm_raw") or "").strip()
+    )
+
+
 def run_observer(*,
                  workspace: str,
                  distribution_manifest: str,
@@ -396,7 +418,6 @@ def run_observer(*,
                  mode: str = "plan",
                  video_budget: int = 0,
                  runtime_dir: str = "",
-                 vlm_model: str = "",
                  observe_workers: int = 1) -> Dict[str, Any]:
     if mode not in {"plan", "observe"}:
         raise ValueError("mode must be plan or observe")
@@ -451,10 +472,11 @@ def run_observer(*,
                 observation = observe_overview_with_model(
                     row,
                     runtime_dir=runtime_dir,
-                    vlm_model=vlm_model,
                 )
             except Exception as exc:
                 observation = {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
                     "vlm_raw": f"VLM_ERROR: {exc}",
                     "vlm_json": {},
                     "dominant_information_channel": "unknown",
@@ -479,6 +501,11 @@ def run_observer(*,
         "schema_version": 1,
         "generated_at": int(time.time()),
         "mode": mode,
+        "status": (
+            "planned" if mode == "plan" else
+            "observed" if rows and summary["usable_model_observations"] == len(rows) else
+            "partially_observed" if summary["usable_model_observations"] else "failed"
+        ),
         "profile_source": "five_frame_query_aware_observer",
         "leakage_policy": (
             "Five uniformly sampled frames, non-answer video metadata, and associated "
@@ -548,7 +575,6 @@ def main() -> int:
     parser.add_argument("--mode", choices=("plan", "observe"), default="plan")
     parser.add_argument("--video-budget", type=int, default=0)
     parser.add_argument("--runtime-dir", default="")
-    parser.add_argument("--vlm-model", default="")
     parser.add_argument("--observe-workers", type=int, default=1)
     args = parser.parse_args()
     output_dir = args.output_dir
@@ -564,7 +590,6 @@ def main() -> int:
         mode=args.mode,
         video_budget=args.video_budget,
         runtime_dir=args.runtime_dir,
-        vlm_model=args.vlm_model,
         observe_workers=args.observe_workers,
     )
     print("VIDEO_DISTRIBUTION_OBSERVER_DONE")

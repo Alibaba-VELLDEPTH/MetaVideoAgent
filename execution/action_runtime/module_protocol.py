@@ -8,6 +8,7 @@ memory, or how to answer a question; those remain generated bundle behavior.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -47,7 +48,7 @@ def normalize_time_range(value: Any) -> dict | None:
         start_f, end_f = float(start), float(end)
     except (TypeError, ValueError):
         return None
-    if end_f <= start_f:
+    if not math.isfinite(start_f) or not math.isfinite(end_f) or start_f < 0 or end_f <= start_f:
         return None
     result = {"start_sec": start_f, "end_sec": end_f}
     if isinstance(value, dict):
@@ -193,6 +194,11 @@ def normalize_tool_result(value: Any, *, producer_module: str, tool_name: str,
     evidence = payload.get("evidence") if payload else None
     if not isinstance(evidence, dict):
         evidence = {}
+    else:
+        # Do not insert raw_output into the original payload's own evidence:
+        # that would create payload -> evidence -> payload and break memory
+        # serialization for otherwise valid generated observations.
+        evidence = dict(evidence)
     if value not in (None, "", {}, []):
         evidence.setdefault("raw_output", value if isinstance(value, str) else payload)
     return {

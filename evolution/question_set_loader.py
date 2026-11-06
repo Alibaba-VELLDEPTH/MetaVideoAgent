@@ -1,9 +1,7 @@
 """Question-set loading helpers for isolated MetaVideoAgent runs.
 
-The evolution layer must not implicitly sweep every dataset in the repository
-when a MetaVideoAgent or split manifest is provided. This module centralizes the
-safe operational fields from distribution manifests and returns sanitized tasks
-with stable task_id values.
+Load the manifest-selected split files, normalize task fields and assign stable
+task identifiers for evaluation and evolution.
 """
 
 from __future__ import annotations
@@ -84,10 +82,6 @@ def require_evolution_task_contract(tasks: Sequence[dict], *, require_evidence: 
         )
 
 
-def _default_dataset_dir(workspace: str) -> str:
-    return os.path.join(workspace, "..", "datasets")
-
-
 def _read_jsonl(path: str) -> Iterable[dict]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -149,42 +143,24 @@ def dataset_files_from_path(path: str) -> List[str]:
 def resolve_manifest_split_paths(distribution_manifest: str,
                                  preferred_splits: Sequence[str]) -> Tuple[List[str], dict]:
     if not distribution_manifest:
-        return [], {}
+        raise ValueError("question loading requires a distribution manifest")
     spec = load_distribution_spec(distribution_manifest)
     splits = spec.get("splits", {}) or {}
     for name in preferred_splits:
         split_path = splits.get(name)
         if split_path:
-            return dataset_files_from_path(split_path), spec
-    return [], spec
+            files = dataset_files_from_path(split_path)
+            if not files:
+                raise ValueError(f"question split {name!r} contains no dataset files: {split_path}")
+            return files, spec
+    raise ValueError(
+        f"distribution manifest has none of the requested question splits: {', '.join(preferred_splits)}"
+    )
 
 
-def discover_dataset_files(workspace: str, video_id: str = "ALL",
-                           distribution_manifest: str = "",
-                           preferred_splits: Sequence[str] = ("test", "validation", "val", "train")) -> Tuple[List[str], dict]:
-    files, spec = resolve_manifest_split_paths(distribution_manifest, preferred_splits)
-    if files:
-        return files, spec
-
-    dataset_dir = _default_dataset_dir(workspace)
-    if video_id not in ALL_VIDEO_ALIASES:
-        files = [
-            os.path.join(dataset_dir, f"{vid.strip()}.jsonl")
-            for vid in str(video_id).split(",")
-            if vid.strip()
-        ]
-    else:
-        files = _dataset_files_from_dir(dataset_dir)
-    missing = [path for path in files if not os.path.exists(path)]
-    if missing:
-        raise FileNotFoundError(f"missing dataset files: {missing}")
-    return files, spec
-
-
-def load_questions(workspace: str, video_id: str = "ALL",
-                   distribution_manifest: str = "",
+def load_questions(distribution_manifest: str, video_id: str = "ALL",
                    preferred_splits: Sequence[str] = ("test", "validation", "val", "train")) -> Tuple[List[dict], List[str], dict]:
-    files, spec = discover_dataset_files(workspace, video_id, distribution_manifest, preferred_splits)
+    files, spec = resolve_manifest_split_paths(distribution_manifest, preferred_splits)
     requested_video_ids = {
         vid.strip()
         for vid in str(video_id or "").split(",")
@@ -226,7 +202,7 @@ def load_questions(workspace: str, video_id: str = "ALL",
 
 
 def select_questions_streaming(
-        workspace: str, *, video_id: str = "ALL", distribution_manifest: str = "",
+        distribution_manifest: str, *, video_id: str = "ALL",
         preferred_splits: Sequence[str] = ("test", "validation", "val", "train"),
         max_questions: int = 1,
         selection_key: Callable[[dict], tuple] | None = None,
@@ -241,9 +217,7 @@ def select_questions_streaming(
     runnable trajectory, not answer correctness.
     """
     limit = max(1, int(max_questions or 1))
-    files, spec = discover_dataset_files(
-        workspace, video_id, distribution_manifest, preferred_splits,
-    )
+    files, spec = resolve_manifest_split_paths(distribution_manifest, preferred_splits)
     requested_video_ids = {
         vid.strip()
         for vid in str(video_id or "").split(",")
@@ -297,11 +271,9 @@ def select_questions_streaming(
     return selected, seen_video_ids, spec
 
 
-def questions_by_ref(workspace: str, video_id: str = "ALL",
-                     distribution_manifest: str = "",
+def questions_by_ref(distribution_manifest: str, video_id: str = "ALL",
                      preferred_splits: Sequence[str] = ("test", "validation", "val", "train")) -> Tuple[Dict[str, dict], Dict[str, str], List[str], dict]:
     questions, video_ids, spec = load_questions(
-        workspace,
         video_id=video_id,
         distribution_manifest=distribution_manifest,
         preferred_splits=preferred_splits,

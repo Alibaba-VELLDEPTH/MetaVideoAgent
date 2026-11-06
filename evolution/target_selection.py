@@ -295,7 +295,7 @@ def _consumer_signature(point: Dict[str, Any], *, events: Iterable[Any] = ()) ->
         source_ids = {str(item) for item in (event.get("source_event_ids") or []) if str(item)}
         if point_event_ids and not point_event_ids.intersection(source_ids):
             continue
-        consumer = str(event.get("consumer_module") or "").strip()
+        consumer = str(event.get("consumer") or "").strip()
         if consumer in MODULES:
             return consumer
     text = str(point.get("downstream_effect") or "").lower()

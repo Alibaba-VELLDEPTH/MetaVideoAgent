@@ -9,7 +9,6 @@ bounded summaries so prompts do not depend on path guessing.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -39,16 +38,6 @@ def write_json(path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
-def file_digest(path: str) -> str:
-    if not path or not os.path.exists(path) or os.path.isdir(path):
-        return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _path_meta(path: str) -> Dict[str, Any]:
     if not path:
         return {"path": "", "exists": False}
@@ -57,7 +46,6 @@ def _path_meta(path: str) -> Dict[str, Any]:
     return {
         "path": abs_path,
         "exists": exists,
-        "sha256": file_digest(abs_path) if exists and os.path.isfile(abs_path) else "",
     }
 
 
@@ -90,6 +78,7 @@ def _bundle_from_report(report: Dict[str, Any], report_path: str) -> str:
         or report.get("candidate_full_eval_bundle_path")
         or ((report.get("combo_policy") or {}).get("current_best_bundle_path", ""))
         or ((report.get("combo_policy") or {}).get("effective_bundle_path", ""))
+        or report.get("effective_initial_baseline_bundle")
         or report.get("initial_baseline_bundle")
         or report.get("bundle_path")
         or ((report.get("combo_policy") or {}).get("base_bundle_path", ""))
@@ -101,16 +90,6 @@ def _bundle_from_report(report: Dict[str, Any], report_path: str) -> str:
         joined = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(report_path)), path))
         if os.path.exists(joined):
             return joined
-    if report_path:
-        candidate = os.path.join(os.path.dirname(os.path.abspath(report_path)), "initial_baseline_bundle.json")
-        if os.path.exists(candidate):
-            return candidate
-    for source in report.get("sources", []) or []:
-        if not isinstance(source, str):
-            continue
-        candidate = os.path.join(os.path.dirname(os.path.abspath(source)), "initial_baseline_bundle.json")
-        if os.path.exists(candidate):
-            return candidate
     return ""
 
 
@@ -232,8 +211,7 @@ def _metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "regressions": len(report.get("regressions", []) or []),
         "passed": criteria.get("passed"),
         "verdict": report.get("verdict") or report.get("status"),
-        "cost_reference": report.get("cost_reference") or report.get("cost_baseline") or {},
-        "cost_summary": report.get("cost_summary") or report.get("cost_reference") or report.get("cost_baseline") or {},
+        "cost_reference": report.get("cost_reference") or {},
         **behavior,
     }
 
@@ -331,7 +309,6 @@ def build_iter_context(
     deep_research_summary: str = "",
     extra_artifacts: Iterable[str] = (),
     check_only: bool = False,
-    attempt_tag: str = "",
 ) -> Dict[str, Any]:
     """Create a bounded context object for an iteration.
 
@@ -343,11 +320,6 @@ def build_iter_context(
         base_dir,
         "checks", f"iter_{iter_index}"
     ) if check_only else os.path.join(base_dir, f"iter_{iter_index}")
-    if attempt_tag:
-        safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(attempt_tag)).strip("._")
-        if not safe_tag:
-            raise ValueError("attempt_tag must contain at least one safe filename character")
-        iter_dir = os.path.join(iter_dir, safe_tag)
     os.makedirs(iter_dir, exist_ok=True)
 
     reference = _compact_combo_report(reference_report_path, label=reference_label)
@@ -389,7 +361,6 @@ def build_iter_context(
         "run_id": run_id,
         "iter_index": iter_index,
         "stage": stage,
-        "attempt_tag": attempt_tag,
         "check_only": bool(check_only),
         "workspace": os.path.abspath(workspace),
         "distribution_manifest": os.path.abspath(distribution_manifest) if distribution_manifest else "",
@@ -449,6 +420,11 @@ def build_iter_context(
         },
     }
     context_path = os.path.join(iter_dir, "iter_context.json")
+    from evolution.iteration_workspace import IterationWorkspace
+    from evolution.working_materials import material_paths
+
+    context["stage_context"] = IterationWorkspace(iter_dir).context("codegen")
+    context["working_materials"] = material_paths(context)
     context["path"] = context_path
     write_json(context_path, context)
     return context
@@ -460,9 +436,11 @@ def inject_iter_context(report: Dict[str, Any], context: Dict[str, Any]) -> Dict
         return report
     report["iter_context_path"] = context.get("path", "")
     report["iter_context"] = {
+        "iter_dir": context.get("iter_dir", ""),
         "run_id": context.get("run_id"),
         "iter_index": context.get("iter_index"),
         "stage": context.get("stage"),
+        "stage_context": context.get("stage_context") or {},
         "reference": context.get("reference", {}),
         "current_best": context.get("current_best", {}),
         "evolution_memory": {
@@ -474,5 +452,6 @@ def inject_iter_context(report: Dict[str, Any], context: Dict[str, Any]) -> Dict
         "candidate_rejections": context.get("candidate_rejections", [])[:5],
         "observed_distribution_profile": context.get("observed_distribution_profile", {}),
         "diagnosis_requirements": context.get("diagnosis_requirements", {}),
+        "working_materials": context.get("working_materials", {}),
     }
     return report

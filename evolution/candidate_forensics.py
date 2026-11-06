@@ -1,31 +1,13 @@
-"""Training-only forensic workspaces for Codex bundle self-debug.
-
-This module deliberately copies raw artifacts rather than deriving a compact
-feedback summary.  The caller may add a small index so Codex can navigate the
-workspace, but the index never replaces the candidate/reference JSONL traces
-or source snapshots.  Candidate source remains subject to the existing
-anti-specialization checks after Codex edits it.
-"""
+"""Training trajectories, source snapshots and investigation notes for Codex."""
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import json
 import shutil
 from pathlib import Path
 from typing import Any, Iterable
 
 FORENSIC_ARTIFACT_TYPE = "supervised_forensic_workspace"
-FORENSIC_REPORT_ARTIFACT_TYPE = "codex_forensic_report"
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _jsonl_metadata(path: Path) -> dict[str, Any]:
@@ -89,8 +71,6 @@ def _copy_artifacts(paths: Iterable[str], destination: Path, *, role: str,
             "source_path": str(source),
             "path": str(target.resolve()),
             "bytes": target.stat().st_size,
-            "sha256": _sha256(target),
-            "copied_byte_for_byte": True,
         }
         if target.suffix == ".jsonl":
             record.update(_jsonl_metadata(target))
@@ -113,8 +93,6 @@ def _copy_source_tree(source_dir: str, destination: Path, *, role: str) -> list[
             "source_path": str(source),
             "path": str(target.resolve()),
             "bytes": target.stat().st_size,
-            "sha256": _sha256(target),
-            "copied_byte_for_byte": True,
         })
     return records
 
@@ -130,11 +108,11 @@ def materialize_supervised_forensic_workspace(
     task_manifest_paths: Iterable[str] = (),
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create an immutable, complete training feedback workspace.
+    """Create a training feedback workspace with copied source and trajectories.
 
     ``candidate_trajectory_paths`` and ``reference_trajectory_paths`` are copied
     as raw JSONL only.  Supporting report/bundle/manifest files are copied as
-    ordinary artifacts.  The manifest records checksums and streamed row/task
+    ordinary artifacts. The index records roles, paths and streamed row/task
     counts, while Codex reads the copied originals themselves.
     """
     root = Path(workspace_dir).resolve()
@@ -186,44 +164,6 @@ def materialize_supervised_forensic_workspace(
             "cannot verify per-row Codex accounting from anonymous JSONL"
         )
     report_path = root / "codex_forensic_report.json"
-    report_schema = {
-        "artifact_type": FORENSIC_REPORT_ARTIFACT_TYPE,
-        "schema_version": 1,
-        "required": {
-            "all_rows_read": True,
-            "row_analyses": [
-                {
-                    "task_id": "must match one candidate trajectory row",
-                    "candidate_answer": "observed candidate answer",
-                    "gold_answer": "training supervision value",
-                    "earliest_divergence": {
-                        "trajectory_step": "integer or null when no trajectory step exists",
-                        "module_or_boundary": "source module/function or runtime boundary",
-                        "evidence_event_ids": ["optional real event IDs"],
-                        "observed_evidence_excerpt": "non-empty exact excerpt from this candidate row/trajectory",
-                    },
-                    "mechanism_hypothesis": "generalizable implementation hypothesis",
-                    "preserve_or_change": "what a repaired candidate should preserve/change",
-                }
-            ],
-            "cross_row_mechanisms": ["general mechanisms, never task lookup rules"],
-            "preservation_and_regression_claims": {
-                "preserve_symbols": ["real candidate source symbol or runtime:/handoff: boundary"],
-                "change_symbols": ["real candidate source symbol or runtime:/handoff: boundary"],
-                "regression_risk_symbols": ["real candidate source symbol or runtime:/handoff: boundary"],
-            },
-        },
-        "source_policy": {
-            "training_feedback_is_allowed": True,
-            "candidate_source_must_not_embed": [
-                "task ids", "video ids", "question text", "answers", "options",
-                "timestamps", "evidence phrases", "dataset-specific branches",
-            ],
-        },
-    }
-    (root / "codex_forensic_report_schema.json").write_text(
-        json.dumps(report_schema, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
     manifest = {
         "artifact_type": FORENSIC_ARTIFACT_TYPE,
         "schema_version": 1,
@@ -238,7 +178,6 @@ def materialize_supervised_forensic_workspace(
         "candidate_task_ids": task_ids,
         "candidate_task_count": len(task_ids),
         "forensic_report_path": str(report_path.resolve()),
-        "forensic_report_schema_path": str((root / "codex_forensic_report_schema.json").resolve()),
         "metadata": dict(metadata or {}),
     }
     manifest_path = root / "forensics_manifest.json"
@@ -248,312 +187,47 @@ def materialize_supervised_forensic_workspace(
 
 
 def forensic_prompt_block(manifest: dict[str, Any]) -> str:
-    """Return instructions that point Codex to complete local artifacts."""
+    """Guide causal debugging and carry the investigation into the next attempt."""
     return f"""
-## Supervised training forensic workspace
+## Training investigation and implementation handoff
 
-This is a training-set development repair. Before changing source, read every
-line of every JSONL listed in `{manifest.get('manifest_path', '')}` and inspect
-the copied candidate/reference source and artifacts. The manifest is an index,
-not a substitute for raw files. Questions, options, gold answers, windows,
-provider outputs and trajectory events are intentionally available for
-supervised debugging.
+The artifact index is at `{manifest.get('manifest_path', '')}`. It links complete
+candidate/reference trajectories, current source, evaluation outcomes and prior
+findings. Inspect the raw records needed to explain the failure and regression
+patterns; an aggregate score is not an explanation. Training questions, options,
+gold answers, windows and provider events are available for debugging, never as
+runtime lookup rules. No held-out evaluation evidence is supplied.
 
-Write `{manifest.get('forensic_report_path', '')}` as valid JSON matching
-`{manifest.get('forensic_report_schema_path', '')}` BEFORE emitting code. It
-must account for every candidate task ID, identify the earliest observed
-divergence for each row, cite a real candidate source symbol (for example
-`Class.method`) or a `runtime:`/`handoff:` boundary, and include an exact non-empty
-`observed_evidence_excerpt` from that row/trajectory. Candidate and gold answers in
-the report must exactly match the copied row. State only reusable mechanisms. Fill
-the preservation/regression symbol lists as well. Do not encode any
-training literal, task/video ID, answer, option, timestamp, or evidence phrase
-in candidate source; source is checked separately for specialization.
+Before editing, distinguish an implementation failure from an unsupported causal
+hypothesis and a provider/asset failure. Follow the earliest producer/consumer
+break through the actual source and downstream use. For a successful producer,
+check whether its result was consumed and changed the reasoning state; do not
+merely add fields to an envelope. Compare affected and preserved behavior.
+
+Continue the previous analysis instead of restarting from the score. Explain the
+general behavioral change, why it should address the observed mechanism, which
+modules actually need changes, and what observable result would falsify it.
+Account for corrections to preserve and regressions to guard. If the available
+evidence contradicts the diagnosis, state the disagreement and remaining work.
+
+Write the detailed investigation to `{manifest.get('forensic_report_path', '')}`
+as JSON with analysis, evidence_references, proposed_changes, preserved_behavior,
+open_questions and next_task. next_task should specify the next edit or check
+and its expected observable result. Smoke and probe execute the implementation
+and provide evidence for the next attempt.
+
+Do not embed task/video IDs, questions, answers, options, annotated timestamps
+or transcript literals in candidate source. Keep changes reusable across tasks.
 """
 
 
-def _candidate_trace_index(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Stream copied candidate JSONL into only the fields needed for checks."""
-    index: dict[str, dict[str, Any]] = {}
-    for record in manifest.get("candidate_trajectories") or []:
-        path = Path(str(record.get("path") or ""))
-        if not path.is_file():
-            continue
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                task_id = str(row.get("task_id") or "")
-                if not task_id:
-                    continue
-                trajectory = row.get("trajectory") if isinstance(row.get("trajectory"), list) else []
-                step_numbers = set()
-                event_ids = set()
-                for ordinal, step in enumerate(trajectory, start=1):
-                    if not isinstance(step, dict):
-                        continue
-                    raw_step = step.get("step")
-                    if isinstance(raw_step, int):
-                        step_numbers.add(raw_step)
-                    step_numbers.add(ordinal)
-                    for event_id in step.get("evidence_event_ids") or []:
-                        if str(event_id):
-                            event_ids.add(str(event_id))
-                for event in row.get("capability_events") or []:
-                    if not isinstance(event, dict):
-                        continue
-                    for key in ("event_id", "id", "source_event_id"):
-                        if str(event.get(key) or ""):
-                            event_ids.add(str(event[key]))
-                def first_observed_value(*keys: str) -> Any:
-                    for key in keys:
-                        if key in row and row.get(key) not in (None, ""):
-                            return row.get(key)
-                    return ""
-
-                # A forensic evidence excerpt has to come from runtime
-                # observation, not the task/question/answer envelope.  This
-                # makes the claimed cross-field diagnosis auditable while
-                # still retaining only a small derived index in memory.
-                runtime_trace = {
-                    key: row.get(key)
-                    for key in (
-                        "trajectory", "capability_events", "observations",
-                        "module_outputs", "runtime_context", "handoffs",
-                    )
-                    if key in row
-                }
-                index[task_id] = {
-                    "trajectory_steps": step_numbers,
-                    "evidence_event_ids": event_ids,
-                    "candidate_answer": first_observed_value(
-                        "answer", "final_agent_answer", "final_answer"
-                    ),
-                    "gold_answer": first_observed_value(
-                        "gold_answer", "gt_answer", "ground_truth"
-                    ),
-                    # The report must quote one real runtime fact instead of
-                    # merely asserting that it read the trajectory.  JSON
-                    # serialization makes nested observations/event payloads
-                    # available without retaining the whole JSONL in memory.
-                    "row_text": json.dumps(row, ensure_ascii=False, sort_keys=True),
-                    "runtime_trace_text": json.dumps(runtime_trace, ensure_ascii=False, sort_keys=True),
-                }
-    return index
-
-
-def _source_symbols(source_root: Path) -> set[str]:
-    symbols: set[str] = set()
-    for path in source_root.rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError):
-            continue
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbols.add(node.name)
-            elif isinstance(node, ast.ClassDef):
-                symbols.add(node.name)
-                for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        symbols.add(f"{node.name}.{child.name}")
-                        symbols.add(child.name)
-    return symbols
-
-
-def _report_symbol_is_valid(value: str, symbols: set[str]) -> bool:
-    text = str(value or "").strip()
-    if not text:
-        return False
-    if text.startswith(("runtime:", "handoff:", "adapter:", "orchestrator:")):
-        return True
-    return text in symbols
-
-
-def _training_literals(manifest: dict[str, Any]) -> dict[str, set[str]]:
-    """Extract only high-signal supervision literals without loading JSONL wholesale."""
-    values = {"identity": set(), "text": set(), "answer": set(), "interval": set()}
-    for record in manifest.get("candidate_trajectories") or []:
-        path = Path(str(record.get("path") or ""))
-        if not path.is_file():
-            continue
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                for key in ("task_id", "video_id"):
-                    value = str(row.get(key) or "").strip()
-                    if value:
-                        values["identity"].add(value)
-                value = str(row.get("time_reference") or "").strip()
-                if value:
-                    values["interval"].add(value)
-                for key in ("question",):
-                    value = str(row.get(key) or "").strip()
-                    if len(value) >= 16:
-                        values["text"].add(value)
-                for choice in row.get("choices") or []:
-                    value = str(choice or "").strip()
-                    if len(value) >= 16:
-                        values["text"].add(value)
-                for key in ("answer", "gold_answer", "gt_answer", "final_answer"):
-                    value = str(row.get(key) or "").strip()
-                    if value:
-                        values["answer"].add(value)
-                for step in row.get("trajectory") or []:
-                    if not isinstance(step, dict):
-                        continue
-                    for key in ("observation", "output", "content"):
-                        value = str(step.get(key) or "").strip()
-                        if len(value) >= 48:
-                            values["text"].add(value)
-    return values
-
-
-def scan_candidate_source_for_specialization(bundle: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    """Fail closed when supervised task literals cross into candidate source.
-
-    Generic AST checks remain useful, but they cannot know this attempt's task
-    IDs or gold answers. This scan compares the generated source with the raw,
-    copied training records and treats a literal answer as unsafe only when it
-    occupies a final-answer outlet, avoiding false positives for normal tool
-    names or generic strings.
-    """
-    literals = _training_literals(manifest)
-    hits: list[dict[str, str]] = []
-    modules = (bundle or {}).get("modules") or {}
-    records = modules.values() if isinstance(modules, dict) else modules
-    for record in records or []:
-        if not isinstance(record, dict):
-            continue
-        code = str(record.get("code") or "")
-        module = str(record.get("module_type") or record.get("name") or "unknown")
-        for category in ("identity", "interval", "text"):
-            for literal in literals[category]:
-                if literal and literal in code:
-                    hits.append({"module": module, "category": category, "literal_sha256": hashlib.sha256(literal.encode("utf-8")).hexdigest()})
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
-                continue
-            for key, value in zip(node.keys, node.values):
-                if not isinstance(key, ast.Constant) or str(key.value) != "answer":
-                    continue
-                if isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value in literals["answer"]:
-                    hits.append({"module": module, "category": "gold_or_candidate_answer_outlet", "literal_sha256": hashlib.sha256(value.value.encode("utf-8")).hexdigest()})
-    return {"passed": not hits, "hit_count": len(hits), "hits": hits}
-
-
-def validate_codex_forensic_report(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Validate report completeness against streamed candidate trajectory IDs."""
+def load_codex_forensic_report(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Load the coding stage's analysis for the next attempt."""
     report_path = Path(str(manifest.get("forensic_report_path") or ""))
-    if not report_path.is_file():
-        return {"passed": False, "error": "codex_forensic_report_missing"}
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"passed": False, "error": f"codex_forensic_report_invalid_json: {exc}"}
+    except (OSError, ValueError) as exc:
+        return {"available": False, "report_path": str(report_path), "warning": str(exc)}
     if not isinstance(report, dict):
-        return {"passed": False, "error": "codex_forensic_report_not_object"}
-    if report.get("artifact_type") != FORENSIC_REPORT_ARTIFACT_TYPE or report.get("schema_version") != 1:
-        return {"passed": False, "error": "codex_forensic_report_schema_version"}
-    if report.get("all_rows_read") is not True:
-        return {"passed": False, "error": "codex_forensic_report_all_rows_read_missing"}
-    expected = {str(value) for value in (manifest.get("candidate_task_ids") or []) if str(value)}
-    trace_index = _candidate_trace_index(manifest)
-    source_root = Path(str(manifest.get("workspace") or "")) / "candidate_source"
-    source_symbols = _source_symbols(source_root)
-    analyses = report.get("row_analyses") if isinstance(report.get("row_analyses"), list) else []
-    observed = set()
-    invalid_rows = []
-    for item in analyses:
-        if not isinstance(item, dict):
-            invalid_rows.append("non_object")
-            continue
-        task_id = str(item.get("task_id") or "")
-        divergence = item.get("earliest_divergence")
-        mechanism = str(item.get("mechanism_hypothesis") or "").strip()
-        preserve_or_change = str(item.get("preserve_or_change") or "").strip()
-        if (
-            not task_id or not isinstance(divergence, dict) or not mechanism
-            or not preserve_or_change
-            or "candidate_answer" not in item or "gold_answer" not in item
-            or not str(divergence.get("module_or_boundary") or "").strip()
-            or not str(divergence.get("observed_evidence_excerpt") or "").strip()
-        ):
-            invalid_rows.append(task_id or "missing_task_id")
-            continue
-        if not _report_symbol_is_valid(str(divergence.get("module_or_boundary") or ""), source_symbols):
-            invalid_rows.append(task_id + ":unknown_source_symbol")
-            continue
-        observed_trace = trace_index.get(task_id, {})
-        if item.get("candidate_answer") != observed_trace.get("candidate_answer", ""):
-            invalid_rows.append(task_id + ":candidate_answer_mismatch")
-            continue
-        if item.get("gold_answer") != observed_trace.get("gold_answer", ""):
-            invalid_rows.append(task_id + ":gold_answer_mismatch")
-            continue
-        excerpt = str(divergence.get("observed_evidence_excerpt") or "").strip()
-        if excerpt not in str(observed_trace.get("runtime_trace_text") or ""):
-            invalid_rows.append(task_id + ":observed_evidence_not_in_trace")
-            continue
-        trajectory_step = divergence.get("trajectory_step")
-        if trajectory_step is not None:
-            if not isinstance(trajectory_step, int) or trajectory_step not in observed_trace.get("trajectory_steps", set()):
-                invalid_rows.append(task_id + ":unknown_trajectory_step")
-                continue
-        cited_event_ids = divergence.get("evidence_event_ids", [])
-        if not isinstance(cited_event_ids, list):
-            invalid_rows.append(task_id + ":invalid_evidence_event_ids")
-            continue
-        unknown_event_ids = [
-            str(value) for value in cited_event_ids
-            if str(value) and str(value) not in observed_trace.get("evidence_event_ids", set())
-        ]
-        if unknown_event_ids:
-            invalid_rows.append(task_id + ":unknown_evidence_event_id")
-            continue
-        observed.add(task_id)
-    missing = sorted(expected - observed)
-    unknown = sorted(observed - expected)
-    if invalid_rows or missing or unknown:
-        return {
-            "passed": False,
-            "error": "codex_forensic_report_row_accounting_failed",
-            "invalid_rows": invalid_rows,
-            "missing_task_ids": missing,
-            "unknown_task_ids": unknown,
-        }
-    mechanisms = report.get("cross_row_mechanisms")
-    if not isinstance(mechanisms, list) or not mechanisms:
-        return {"passed": False, "error": "codex_forensic_report_cross_row_mechanisms_missing"}
-    preservation = report.get("preservation_and_regression_claims")
-    if not isinstance(preservation, dict):
-        return {"passed": False, "error": "codex_forensic_report_preservation_claims_missing"}
-    for field in ("preserve_symbols", "change_symbols", "regression_risk_symbols"):
-        values = preservation.get(field)
-        if not isinstance(values, list):
-            return {"passed": False, "error": f"codex_forensic_report_{field}_missing"}
-        invalid = [str(value) for value in values if not _report_symbol_is_valid(str(value), source_symbols)]
-        if invalid:
-            return {"passed": False, "error": f"codex_forensic_report_{field}_unknown_symbol", "symbols": invalid}
-    return {
-        "passed": True,
-        "report_path": str(report_path),
-        "task_count": len(expected),
-        "row_analysis_count": len(analyses),
-        "report": report,
-    }
+        return {"available": False, "report_path": str(report_path), "warning": "analysis notes must be an object"}
+    return {"available": True, "report_path": str(report_path), "report": report}

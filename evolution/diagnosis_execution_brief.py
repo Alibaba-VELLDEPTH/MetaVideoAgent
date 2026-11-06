@@ -1,30 +1,27 @@
-"""Validated bundle handoff for later-round MetaVideoAgent evolution.
+"""Add operational fields to the full diagnosis without discarding reasoning.
 
-The full diagnosis remains an audit artifact. Downstream Codex stages receive
-only a compact, deterministically validated five-module bundle task.
+The same report is read by Research and Codex. Probe selection remains a
+separate operational sidecar because it is consumed by the evaluator.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from copy import deepcopy
 from typing import Any, Dict
 
 try:
     from runtime_capability_context import (
-        DEFAULT_EVOLUTION_LLM_PROFILE_ID,
+        DEFAULT_EXECUTION_LLM_PROFILE_ID,
         DEFAULT_PROFILE_IDS,
-        build_runtime_capability_context,
     )
     from target_selection import canonical_task_ref
 except ImportError:  # pragma: no cover - package-mode fallback
     from .runtime_capability_context import (
-        DEFAULT_EVOLUTION_LLM_PROFILE_ID,
+        DEFAULT_EXECUTION_LLM_PROFILE_ID,
         DEFAULT_PROFILE_IDS,
-        build_runtime_capability_context,
     )
     from .target_selection import canonical_task_ref
 
@@ -77,106 +74,8 @@ RUNTIME_CAPABILITIES = {
 }
 DEFAULT_CAPABILITY_PROFILES = {
     **DEFAULT_PROFILE_IDS,
-    "llm": DEFAULT_EVOLUTION_LLM_PROFILE_ID,
+    "llm": DEFAULT_EXECUTION_LLM_PROFILE_ID,
 }
-# A thinking fallback may preserve an uncertainty *metadata* field, but it
-# cannot terminate an evaluated task with a generic failure token.  The smoke
-# contract requires payload.answer to remain a concrete parseable answer.
-# This guard is intentionally limited to a *terminal fallback*.  A thinking
-# role may use the phrase "evidence is insufficient" as a re-planning
-# trigger, but it must never use that state as the final answer.  The previous
-# expression only caught the tokenised spelling (``evidence_insufficient``),
-# letting natural-language variants such as "output that the evidence is
-# insufficient" through the compiler and into codegen.
-_FORBIDDEN_THINKING_FINAL_FALLBACK_RE = re.compile(
-    r"\b(?:uncertain(?:ty)?|unanswerable|evidence[_ -]?insufficient|unknown(?:\s+answer)?)\b|"
-    r"\b(?:return|output|emit|answer|finali[sz]e(?:\s+with)?)\b[^.\n]{0,160}"
-    r"\bevidence\s+(?:is|remains|was)\s+insufficient\b|"
-    r"(?:return|output|answer|give)[^. \\n]{0,80}(?:Insufficient evidence|Unable to answer|Uncertain)",
-    flags=re.IGNORECASE,
-)
-
-# Question identities and gold-evidence intervals are evaluation-only. They
-# must never survive into a compiler/research/Codex model handoff, even when an
-# LLM repeats them inside a natural-language probe criterion.
-_TASK_REF_RE = re.compile(
-    r"\b[A-Za-z0-9_.-]+::\s*\[\[[^\n]*?\]\](?:::[A-Za-z0-9_-]+)?"
-)
-_BARE_EVIDENCE_INTERVAL_RE = re.compile(
-    r"\[\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?"
-)
-_QUESTION_COUNT_CLAIM_RE = re.compile(
-    r"(?:about|at least|more than|over\\s+)?\\s*\\d+(?:\\s*[-~to]\\s*\\d+)?\\s*"
-    r"(?:question|questions?|failures?|errors?)",
-    flags=re.IGNORECASE,
-)
-
-
-def sanitize_model_handoff(value: Any) -> Any:
-    """Remove machine-only evidence identifiers from model-visible content."""
-    if isinstance(value, dict):
-        return {key: sanitize_model_handoff(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [sanitize_model_handoff(item) for item in value]
-    if not isinstance(value, str):
-        return value
-    text = _TASK_REF_RE.sub("[machine-only task reference]", value)
-    text = _BARE_EVIDENCE_INTERVAL_RE.sub("[[machine-only evidence interval", text)
-    # Failure counts belong to the deterministic ledger. Keep model design
-    # language causal, not a competing quantitative attribution.
-    return _QUESTION_COUNT_CLAIM_RE.sub("ledger-supported failures", text)
-
-
-def model_handoff_issues(value: Any, *, path: str = "model_handoff") -> list[str]:
-    """Return deterministic violations in content visible to a model."""
-    issues: list[str] = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            issues.extend(model_handoff_issues(item, path=f"{path}.{key}"))
-        return issues
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            issues.extend(model_handoff_issues(item, path=f"{path}[{index}]"))
-        return issues
-    if not isinstance(value, str):
-        return issues
-    if _TASK_REF_RE.search(value) or _BARE_EVIDENCE_INTERVAL_RE.search(value):
-        issues.append(f"{path} contains a machine-only task/evidence reference")
-    if _QUESTION_COUNT_CLAIM_RE.search(value):
-        issues.append(f"{path} contains a non-ledger question-count claim")
-    return issues
-
-
-def _profile_inventory() -> Dict[str, Dict[str, Any]]:
-    return {
-        str(profile.get("profile_id") or ""): profile
-        for profile in build_runtime_capability_context().get("profiles", [])
-        if isinstance(profile, dict) and profile.get("profile_id")
-    }
-
-
-def _profile_validation_issues(capability: str, profile_id: Any, provenance: Any, *, path: str) -> list[str]:
-    profile_id = str(profile_id or DEFAULT_CAPABILITY_PROFILES.get(capability, "")).strip()
-    if not profile_id:
-        return [f"{path}.profile_id is required for {capability}"]
-    profile = _profile_inventory().get(profile_id)
-    if not profile:
-        return [f"{path}.profile_id is not registered: {profile_id}"]
-    issues = []
-    if profile.get("capability") != capability:
-        issues.append(f"{path}.profile_id {profile_id} does not support capability {capability}")
-    expected = str(profile.get("input_provenance") or "")
-    actual = str(provenance or "")
-    if expected and actual and actual != expected:
-        issues.append(f"{path}.input_provenance must match profile {profile_id}: {expected}")
-    if capability in {"asr", "ocr"} and expected and actual != expected:
-        issues.append(f"{path}.input_provenance must be {expected} for profile {profile_id}")
-    return issues
-
-
-# ---------------------------------------------------------------------------
-# Adaptive bundle brief
-# ---------------------------------------------------------------------------
 
 def _bundle_modules(design: Dict[str, Any]) -> list[str]:
     try:
@@ -187,89 +86,32 @@ def _bundle_modules(design: Dict[str, Any]) -> list[str]:
 
 
 def validate_bundle_execution_brief(brief: Dict[str, Any]) -> list[str]:
-    """Validate the model-visible direction contract for a bundle round.
-
-    ``initial_focus_modules`` provides a starting point only.  It is not an
-    edit whitelist: later probe feedback may change any module in the five-slot
-    bundle as long as the immutable interface/capability boundaries hold.
-    """
-    brief = brief if isinstance(brief, dict) else {}
-    issues: list[str] = []
-    if brief.get("artifact_type") != "diagnosis_execution_brief":
-        return ["artifact_type must be diagnosis_execution_brief"]
-    if int(brief.get("schema_version", 0) or 0) != BUNDLE_SCHEMA_VERSION:
-        return [f"bundle execution brief schema_version must be {BUNDLE_SCHEMA_VERSION}"]
+    """Check actionable content; executable ABI/capabilities are tested on code."""
+    if not isinstance(brief, dict):
+        return ["diagnosis must be an object"]
     try:
-        modules = _bundle_modules((brief.get("execution_policy") or {}))
+        modules = _bundle_modules(brief.get("execution_policy") or brief.get("evolution_design") or {})
     except ValueError as exc:
         return [str(exc)]
-    policy = brief.get("execution_policy") or {}
-    focus = policy.get("initial_focus_modules") or []
-    if not isinstance(focus, list) or any(item not in modules for item in focus):
-        issues.append("initial_focus_modules must be a subset of target_modules")
-    if policy.get("module_scope_policy") != "codex_adaptive_within_five_module_bundle":
-        issues.append("bundle brief must allow Codex adaptive module selection")
     task = brief.get("implementation_task") or {}
-    for field in ("failure_chain", "evolution_mechanism", "goal"):
-        if not str(task.get(field) or "").strip():
-            issues.append(f"implementation_task.{field} is empty")
-    responsibilities = task.get("module_responsibilities")
-    if not isinstance(responsibilities, dict):
-        issues.append("implementation_task.module_responsibilities must be an object")
-    else:
-        try:
-            from bundle_contract import MODULE_TYPES as all_bundle_modules
-        except ImportError:  # pragma: no cover
-            from .bundle_contract import MODULE_TYPES as all_bundle_modules
-        for module in all_bundle_modules:
-            item = responsibilities.get(module)
-            if not isinstance(item, dict):
-                issues.append(f"module_responsibilities.{module} is missing")
-                continue
-            for field in ("responsibility", "input_invariant", "output_invariant", "fallback"):
-                if not str(item.get(field) or "").strip():
-                    issues.append(f"module_responsibilities.{module}.{field} is empty")
-        thinking = responsibilities.get("thinking") or {}
-        for field in ("output_invariant", "fallback"):
-            value = str(thinking.get(field) or "")
-            if _FORBIDDEN_THINKING_FINAL_FALLBACK_RE.search(value):
-                issues.append(
-                    f"module_responsibilities.thinking.{field} may not terminate with an "
-                    "uncertain/unanswerable/evidence-insufficient token; keep limitations in metadata "
-                    "while returning a concrete parseable final answer"
-                )
+    issues = [
+        f"implementation_task.{field} is empty"
+        for field in ("failure_chain", "evolution_mechanism", "goal")
+        if not str(task.get(field) or "").strip()
+    ]
     handoffs = task.get("handoff_contracts")
-    try:
-        from bundle_contract import validate_handoff_contracts
-    except ImportError:  # pragma: no cover
-        from .bundle_contract import validate_handoff_contracts
-    issues.extend(validate_handoff_contracts(handoffs, changed_modules=modules))
-    capabilities = task.get("runtime_capabilities") or []
-    if not isinstance(capabilities, list):
-        issues.append("implementation_task.runtime_capabilities must be a list")
-    else:
-        for index, item in enumerate(capabilities):
-            if not isinstance(item, dict):
-                issues.append(f"runtime_capabilities[{index}] must be an object")
-                continue
-            capability = str(item.get("capability") or "")
-            if capability not in RUNTIME_CAPABILITIES:
-                issues.append(f"runtime_capabilities[{index}] requests unknown capability")
-                continue
-            issues.extend(_profile_validation_issues(
-                capability, item.get("profile_id"), item.get("input_provenance"),
-                path=f"runtime_capabilities[{index}]",
-            ))
-    if model_handoff_issues(task, path="implementation_task"):
-        issues.extend(model_handoff_issues(task, path="implementation_task"))
+    if handoffs:
+        try:
+            from bundle_contract import validate_handoff_contracts
+        except ImportError:
+            from .bundle_contract import validate_handoff_contracts
+        issues.extend(validate_handoff_contracts(handoffs, changed_modules=modules))
     return issues
 
 
 def build_bundle_execution_brief(diagnosis: Dict[str, Any], *, diagnosis_path: str,
-                                 review: Dict[str, Any] | None = None,
                                  review_path: str = "") -> Dict[str, Any]:
-    """Compile an adaptive bundle brief without choosing future edits."""
-    del diagnosis_path, review, review_path
+    """Expose an operational view alongside the complete causal diagnosis."""
     diagnosis = diagnosis or {}
     design = deepcopy(diagnosis.get("evolution_design", {}) or {})
     modules = _bundle_modules(design)
@@ -324,10 +166,12 @@ def build_bundle_execution_brief(diagnosis: Dict[str, Any], *, diagnosis_path: s
         ],
     }
     brief = {
+        **deepcopy(diagnosis),
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "artifact_type": "diagnosis_execution_brief",
         "created_at": int(time.time()),
-        "compiler": {"compiler": "diagnosis_design_deterministic_bundle", "validated": True},
+        "diagnosis_path": diagnosis_path,
+        "evolution_review_path": review_path or diagnosis.get("evolution_review_path", ""),
         "execution_policy": {
             "combo_base": str(decision.get("combo_base") or "current_best"),
             "base_combo_policy": str(decision.get("base_combo_policy") or "keep_current_best"),
@@ -347,11 +191,6 @@ def build_bundle_execution_brief(diagnosis: Dict[str, Any], *, diagnosis_path: s
             "objective": "Research the selected mechanism and affected module boundaries, not a locked per-file implementation.",
             "questions": task["research_questions"],
             "output_requirements": ["Map each recommendation to a module responsibility or handoff contract.", "Do not introduce unregistered capabilities or task-specific rules."],
-        },
-        "bounded_handoff_policy": {
-            "full_diagnosis_is_audit_only": True,
-            "downstream_must_use_this_brief": True,
-            "brief_is_direction_not_edit_whitelist": True,
         },
     }
     issues = validate_bundle_execution_brief(brief)
@@ -491,11 +330,7 @@ def build_bundle_machine_evaluation_contract(diagnosis: Dict[str, Any], *, brief
 
 
 def validate_bundle_machine_evaluation_contract(contract: Dict[str, Any]) -> list[str]:
-    """Fail closed on incomplete adaptive bundle probe contracts.
-
-    This checks the complete selected direction and never derives an edit target
-    solely from the first listed module.
-    """
+    """Check selected modules, probe hypotheses and executable witness references."""
     contract = contract if isinstance(contract, dict) else {}
     issues: list[str] = []
     if contract.get("artifact_type") != "machine_evaluation_contract":
@@ -546,16 +381,16 @@ def validate_bundle_machine_evaluation_contract(contract: Dict[str, Any]) -> lis
 
 
 def write_bundle_execution_brief(diagnosis: Dict[str, Any], *, diagnosis_path: str,
-                                review: Dict[str, Any] | None = None,
                                 review_path: str = "") -> Dict[str, str]:
     timestamp = diagnosis.get("timestamp") or int(time.time())
     attempt = max(1, int(diagnosis.get("diagnosis_attempt", 1) or 1))
     suffix = f"_attempt{attempt}" if attempt > 1 else ""
     directory = os.path.dirname(os.path.abspath(diagnosis_path))
-    brief = build_bundle_execution_brief(diagnosis, diagnosis_path=diagnosis_path, review=review, review_path=review_path)
-    path = os.path.join(directory, f"diagnosis_execution_brief_{timestamp}{suffix}.json")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(brief, handle, ensure_ascii=False, indent=2)
+    brief = build_bundle_execution_brief(diagnosis, diagnosis_path=diagnosis_path, review_path=review_path)
+    # One authoritative diagnosis carries analysis and operational fields.
+    path = os.path.abspath(diagnosis_path)
+    diagnosis.update(brief)
+    diagnosis["execution_brief_path"] = path
     contract = build_bundle_machine_evaluation_contract(diagnosis, brief=brief)
     contract_issues = validate_bundle_machine_evaluation_contract(contract)
     if contract_issues:
@@ -566,4 +401,7 @@ def write_bundle_execution_brief(diagnosis: Dict[str, Any], *, diagnosis_path: s
     contract_path = os.path.join(directory, f"machine_evaluation_contract_{timestamp}{suffix}.json")
     with open(contract_path, "w", encoding="utf-8") as handle:
         json.dump(contract, handle, ensure_ascii=False, indent=2)
+    diagnosis["machine_evaluation_contract_path"] = contract_path
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(diagnosis, handle, ensure_ascii=False, indent=2)
     return {"execution_brief_path": path, "machine_evaluation_contract_path": contract_path}

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -66,20 +65,11 @@ def load_evolution_memory(run_id: str, output_root: str = "") -> Dict:
     return payload
 
 
-def _file_digest(path: str) -> str:
-    if not path or not os.path.exists(path):
-        return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _path_meta(path: str) -> Dict[str, str]:
     return {
         "path": os.path.abspath(path) if path else "",
-        "sha256": _file_digest(path),
     }
 
 
@@ -122,11 +112,7 @@ def _candidate_identity(candidate: Dict, full_report: Dict, candidate_run: str,
         "name": "MetaVideoAgent bundle",
         "target_modules": list(candidate.get("changed_modules") or []),
         "changed_modules": list(candidate.get("changed_modules") or []),
-        "bundle_fingerprint": candidate.get("bundle_fingerprint", ""),
-        # The signature is a compact mechanism-level guard.  It deliberately
-        # excludes candidate code and task data, so later diagnosis can avoid
-        # repeating an exhausted repair without turning a module into a ban.
-        "mechanism_signature": candidate.get("bundle_fingerprint", ""),
+        "mechanism": candidate.get("change_rationale", {}),
         "candidate_run": os.path.abspath(candidate_run) if candidate_run else "",
         "candidate_bundle": _path_meta(candidate_bundle_path),
     }
@@ -164,7 +150,7 @@ def _probe_mechanism_summary(rejection: Dict) -> Dict:
         "capability_summary": audit.get("capability_summary") or {},
         "consumer_contract_summary": audit.get("consumer_contract_summary") or {},
         "mechanism_witness_outcome": (audit.get("mechanism_witness") or {}).get("outcome", ""),
-        "mechanism_signature": (rejection.get("candidate") or {}).get("mechanism_signature", ""),
+        "mechanism": (rejection.get("candidate") or {}).get("mechanism", {}),
     })
 
 
@@ -179,7 +165,7 @@ def _rebuild_module_summary(records: list[Dict]) -> Dict:
                 "probe_rejected": 0,
                 "engineering_invalid": 0,
                 "recent_record_ids": [],
-                "recent_mechanism_signatures": [],
+                "recent_mechanisms": [],
             })
             bucket["attempts"] += 1
             status = record.get("outcome", {}).get("status", "")
@@ -194,14 +180,12 @@ def _rebuild_module_summary(records: list[Dict]) -> Dict:
             record_id = record.get("record_id", "")
             if record_id:
                 bucket["recent_record_ids"].append(record_id)
-            signature = str((record.get("candidate") or {}).get("mechanism_signature") or "")
-            if signature:
-                bucket["recent_mechanism_signatures"].append(signature)
+            mechanism = (record.get("candidate") or {}).get("mechanism")
+            if mechanism:
+                bucket["recent_mechanisms"].append(mechanism)
     for bucket in summary.values():
         bucket["recent_record_ids"] = bucket["recent_record_ids"][-8:]
-        bucket["recent_mechanism_signatures"] = list(dict.fromkeys(
-            bucket["recent_mechanism_signatures"][-8:]
-        ))
+        bucket["recent_mechanisms"] = bucket["recent_mechanisms"][-8:]
     return summary
 
 
@@ -328,16 +312,6 @@ def record_evolution_outcome(
     return memory
 
 
-def _entry_score(entry: Dict) -> tuple:
-    metrics = entry.get("metrics") or {}
-    return (
-        int(metrics.get("correct") or metrics.get("candidate_correct") or 0),
-        int(metrics.get("total_questions") or 0),
-        int(metrics.get("accuracy_delta") or 0),
-        -int(metrics.get("regressions") or 0),
-    )
-
-
 def _same_record(existing: Dict, label: str, report_path: str, results_path: str) -> bool:
     return (
         existing.get("label") == label
@@ -378,18 +352,15 @@ def record_reference(run_id: str, label: str, report_path: str, results_path: st
         "artifacts": {
             "bundle": {
                 "path": os.path.abspath(bundle_path) if bundle_path else "",
-                "sha256": _file_digest(bundle_path),
             },
             "candidate_bundle": {
                 "path": os.path.abspath(candidate_bundle_path) if candidate_bundle_path else "",
-                "sha256": _file_digest(candidate_bundle_path),
             },
             "modules": module_artifacts or {},
             "structure": structure_artifact or {},
         },
         "run_scope": {
             "manifest_path": os.path.abspath(manifest_path) if manifest_path else "",
-            "manifest_sha256": _file_digest(manifest_path),
             "split": split,
             "dataset_version": dataset_version,
             "output_root": os.path.abspath(output_root) if output_root else "",
@@ -413,20 +384,6 @@ def record_reference(run_id: str, label: str, report_path: str, results_path: st
         entries[existing_idx].update(entry)
         entry = entries[existing_idx]
     if update_current_best:
-        current = ledger.get("current_best")
-        # The caller has already applied the post-full-eval acceptance policy.
-        # Do not re-rank against historical deltas here: an accuracy_delta is
-        # relative to each candidate's own parent and is not comparable across
-        # generations. In particular, an accepted equal-accuracy/lower-cost
-        # candidate must replace the prior best even when its delta is zero.
-        if current and _entry_score(entry) < _entry_score(current):
-            ledger.setdefault("current_best_policy_overrides", []).append({
-                "timestamp": int(time.time()),
-                "label": label,
-                "candidate_score": _entry_score(entry),
-                "current_best_score": _entry_score(current),
-                "reason": "explicit_post_eval_acceptance_overrides_noncomparable_historical_score",
-            })
         ledger["current_best"] = entry
     if finalized:
         ledger["finalized_combo"] = entry

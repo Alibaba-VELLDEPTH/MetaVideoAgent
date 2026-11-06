@@ -72,7 +72,6 @@ def _load_prompt(filename: str, fallback: str = "") -> str:
 
 
 MAX_ROUNDS = 15         # ReAct maximum number of rounds; use the number of rounds to prevent infinite loops without setting a low tool budget
-MAX_TOOL_CALLS = MAX_ROUNDS
 API_TIMEOUT_SEC = 120   # Prevent a single provider call from hanging indefinitely
 WATCH_MAX_FRAMES = min(TEACHER_MAX_FRAMES, 96)
 LONG_WATCH_MAX_FRAMES = min(TEACHER_MAX_FRAMES, 48)
@@ -84,52 +83,8 @@ LONG_WATCH_THRESHOLD_SEC = 120
 # multi-window question can never lose an interval to a shared global cap.
 REVIEW_FRAMES_PER_WINDOW = 10
 REVIEW_DETAIL_FRAMES_PER_WINDOW = 8
-SEEK_WINDOW = 120       # seek fast forward/rewind window (seconds)
 DETAIL_MAX_SEC = 5      # detailed_watch review with narrow video clips, up to 5 seconds
 EVIDENCE_EPS = 1e-3     # Evidence interval clipping tolerance
-
-TEACHER_OUTPUT_TOOL_REPLACEMENTS = {
-    "DIAG_VIDEO_AUDIT": "Video evidence review",
-    "DIAG_DETAIL_VIDEO_AUDIT": "Detailed video review",
-    "AUDIT_VIDEO": "Video evidence review",
-    "AUDIT_DETAIL_VIDEO": "Detailed video review",
-    "AUDIT_ENHANCED_VIDEO": "Enhanced video review",
-    "AUDIT_STRUCTURE": "Structure library review",
-    "AUDIT_TRANSCRIPT": "Subtitle/transcription review",
-    "watch_video": "Video evidence review",
-    "video_review": "Video evidence review",
-    "teacher_video_verification": "Video evidence review",
-    "detailed_watch": "Detailed video review",
-    "detail_video_review": "Detailed video review",
-    "teacher_detailed_video_verification": "Detailed video review",
-    "enhanced_watch": "Enhanced video review",
-    "enhanced_video_review": "Enhanced video review",
-    "teacher_enhanced_video_verification": "Enhanced video review",
-    "browse_struct_db": "Structure library review",
-    "structure_review": "Structure library review",
-    "teacher_structure_db_audit": "Structure library review",
-    "read_transcript": "Subtitle/transcription review",
-    "transcript_review": "Subtitle/transcription review",
-    "teacher_transcript_audit": "Subtitle/transcription review",
-    "listen_audio": "Audio review",
-    "frame_inspect": "visual perception ability",
-    "single_frame_inspect": "visual perception ability",
-    "inspect_frames": "visual perception ability",
-    "runtime_visual_observation_tool": "visual perception ability",
-    "runtime_visual_observation_capability": "visual perception ability",
-    "clip_search": "Structure retrieval/location capabilities",
-    "frame_clip_search": "Structure retrieval/location capabilities",
-    "search_evidence": "Evidence retrieval/location capabilities",
-    "runtime_localization_or_structure_retrieval_tool": "Structure retrieval/location capabilities",
-    "runtime_localization_or_structure_retrieval_capability": "Structure retrieval/location capabilities",
-    "runtime_evidence_retrieval_capability": "Structure retrieval/location capabilities",
-    "global_browse": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_tool": "Global structure browsing capabilities",
-    "runtime_broad_structure_retrieval_capability": "Global structure browsing capabilities",
-    "audio_analysis": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_evidence_tool": "Audio/subtitle understanding ability",
-    "runtime_audio_or_transcript_capability": "Audio/subtitle understanding ability",
-}
 
 
 # =====================================================================
@@ -247,51 +202,6 @@ def _parse_time_reference_windows(time_ref) -> list[tuple[float, float]]:
     return windows
 
 
-
-def _sanitize_teacher_output_terms(value, preserve_trace: bool = False):
-    """Remove internal Teacher/runtime tool names from saved review fields.
-
-    Teacher ReAct still uses concrete internal tool names for ACTION dispatch,
-    but micro-review JSON is later consumed by DiagnosisAgent and Codex.  Those
-    downstream stages should receive capability-level descriptions, not tool
-    names that are unavailable in the execution-layer candidate runtime.
-    By default this also sanitizes ``react_trace`` because generated reports are
-    directly reused as diagnosis/Codex context.
-    """
-    if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            if not preserve_trace and key == "react_trace":
-                # ReAct traces contain Teacher-only dispatch tokens and raw
-                # observations.  They are useful while debugging locally, but
-                # harmful as downstream Diagnosis/Codex context because
-                # generated runtime modules may mistake them for executable
-                # tools.  Drop the field entirely from saved reports.
-                continue
-            if not preserve_trace and key in {
-                "tool",
-                "tool_name",
-                "tool_call",
-                "target_tool",
-                "action",
-            }:
-                out[key] = _sanitize_teacher_output_terms(item, preserve_trace=preserve_trace)
-                continue
-            if preserve_trace and key == "react_trace":
-                out[key] = item
-            else:
-                out[key] = _sanitize_teacher_output_terms(item, preserve_trace=preserve_trace)
-        return out
-    if isinstance(value, list):
-        return [_sanitize_teacher_output_terms(item, preserve_trace=preserve_trace) for item in value]
-    if isinstance(value, str):
-        text = value
-        for term, replacement in TEACHER_OUTPUT_TOOL_REPLACEMENTS.items():
-            text = re.sub(re.escape(term), replacement, text, flags=re.IGNORECASE)
-        return text
-    return value
-
-
 def _extract_content(response) -> str:
     """Extract text from either scalar or content-part provider responses."""
     content = response.choices[0].message.content
@@ -368,7 +278,7 @@ def _review_prompt_json(value, *, max_chars: int) -> str:
 
 
 def _format_trajectory(trajectory: list) -> str:
-    """Render an anchored, bounded trajectory excerpt for Teacher prompts."""
+    """Index every trajectory record; full values remain available for reading."""
     if not isinstance(trajectory, list) or not trajectory:
         return "(No trajectory data)"
     rendered = []
@@ -386,7 +296,7 @@ def _format_trajectory(trajectory: list) -> str:
             tool_step_index += 1
             item["trajectory_step_index"] = tool_step_index
         rendered.append(item)
-    return _review_prompt_json(rendered, max_chars=90000)
+    return json.dumps(rendered, ensure_ascii=False, indent=2, default=str)
 
 
 def _extract_student_time_windows(trajectory: list) -> list:
@@ -491,8 +401,6 @@ def _phase_max_tokens(phase_name: str) -> int:
     return 3000
 
 
-
-
 # =====================================================================
 # System prompt
 # =====================================================================
@@ -517,6 +425,7 @@ class TeacherAgent:
     def __init__(self, workspace_dir: str, video_id: str, structure_dir: str = ""):
         self.workspace_dir = workspace_dir
         self.video_id = video_id
+        self._review_materials = {}
         self.structure_dirs = []
         for directory in (
             structure_dir,
@@ -614,7 +523,6 @@ class TeacherAgent:
                 "skipped": True,
             }
 
-            print(f"     Reviewing trajectory [{time_reference}] agent={agent_letter or 'No answer'} gt={gt_answer}")
         return self.review_trajectory_three_phase(
             question=question,
             gt_answer=gt_answer,
@@ -678,6 +586,11 @@ class TeacherAgent:
         answer_letter = _extract_answer_letter(agent_answer) or agent_answer or "No answer"
         reference_answer_letter = _extract_answer_letter(reference_answer) or reference_answer or "Not provided"
         reference_traj_text = _format_trajectory(reference_trajectory or [])
+        self._review_materials = {
+            "student_trajectory": trajectory or [],
+            "reference_trajectory": reference_trajectory or [],
+            "gold_evidence": gold_video_evidence,
+        }
 
         cost_line = ""
         if cost:
@@ -799,6 +712,7 @@ Output `ACTION: FINISH`, followed by JSON:
             allow_tools=True,
         )
         react_trace.extend(gold.get("react_trace", []))
+        self._review_materials["gold_path"] = gold
 
         student_prompt = common_context + f"""You are now only performing Phase 2: Student Path.
 
@@ -847,6 +761,7 @@ Output `ACTION: FINISH`, followed by JSON:
             allow_tools=True,
         )
         react_trace.extend(student.get("react_trace", []))
+        self._review_materials["student_path"] = student
 
         divergence_prompt = common_context + f"""You now perform Phase 3: Divergence Diagnosis.
 
@@ -1007,7 +922,36 @@ Output ACTION: FINISH and give JSON:
         result["gt_answer"] = gt_answer
         result["agent_answer"] = agent_answer
         result["gold_evidence_coverage"] = gold_video_evidence
-        return _sanitize_teacher_output_terms(result, preserve_trace=False)
+        return result
+
+    def _material_read_instruction(self) -> str:
+        return (
+            '\nRead complete review records with {"action":"read","material":"student_trajectory",'
+            '"offset":0,"limit":160}. Continue with next_offset for further lines. '
+            'Trajectory indexes cover every step; individual prompt excerpts are navigation aids. '
+            'Available materials: ' + ', '.join(getattr(self, "_review_materials", {}))
+        )
+
+    def _read_review_material(self, content: str, messages: list, trace: list) -> bool:
+        try:
+            request = json.loads(content)
+        except ValueError:
+            return False
+        if not isinstance(request, dict) or request.get("action") != "read":
+            return False
+        materials = getattr(self, "_review_materials", {})
+        name = request.get("material")
+        try:
+            lines = json.dumps(materials[name], ensure_ascii=False, indent=2, default=str).splitlines()
+            offset = max(0, int(request.get("offset", 0)))
+            end = min(len(lines), offset + max(1, min(400, int(request.get("limit", 160)))))
+            result = {"material": name, "offset": offset, "content": "\n".join(lines[offset:end]),
+                      "next_offset": end if end < len(lines) else None, "total_lines": len(lines)}
+        except (KeyError, TypeError, ValueError) as exc:
+            result = {"error": str(exc), "available_materials": list(materials)}
+        trace.append({"action": "read", "request": request, "result": result})
+        messages.append({"role": "user", "content": json.dumps(result, ensure_ascii=False)})
+        return True
 
     def _run_teacher_phase(
         self,
@@ -1023,8 +967,9 @@ Output ACTION: FINISH and give JSON:
         allow_tools: bool,
     ) -> dict:
         """Run one bounded Teacher ReAct phase and return parsed JSON."""
+        self._review_materials.setdefault("tool_observations", [])
         messages = [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": system_content + self._material_read_instruction()},
             {"role": "user", "content": user_prompt},
         ]
         tool_call_re = re.compile(
@@ -1054,12 +999,12 @@ Output ACTION: FINISH and give JSON:
                 )
                 content = _extract_content(resp)
             except Exception as e:
-                return _sanitize_teacher_output_terms({
+                return {
                     "success": False,
                     "phase": phase_name,
                     "error": str(e),
                     "react_trace": react_trace,
-                }, preserve_trace=False)
+                }
 
             if not content:
                 messages.append({"role": "user", "content": "Go ahead and output THOUGHT and ACTION strictly."})
@@ -1067,6 +1012,8 @@ Output ACTION: FINISH and give JSON:
 
             messages.append({"role": "assistant", "content": content})
             last_content = content
+            if self._read_review_material(content, messages, react_trace):
+                continue
 
             if "FINISH" in content.upper() or "```json" in content:
                 parsed = _robust_json_extract(content)
@@ -1080,14 +1027,14 @@ Output ACTION: FINISH and give JSON:
                         "thought": content,
                     }]
                     parsed["react_trace"] = trace
-                    return _sanitize_teacher_output_terms(parsed, preserve_trace=False)
+                    return parsed
                 last_parse_error = "FINISH/JSON detected but JSON was not parseable, likely truncated or malformed"
                 react_trace.append({
                     "phase": phase_name,
                     "round": round_idx + 1,
                     "action": "PARSE_FAILED",
                     "error": last_parse_error,
-                    "thought": content[-2000:],
+                    "thought": content,
                 })
                 messages.append({
                     "role": "user",
@@ -1118,17 +1065,21 @@ Output ACTION: FINISH and give JSON:
                         phase_name=phase_name,
                     )
                 print(f"     {phase_name}: {tool_name}({raw_args}) -> {len(obs)} chars")
+                self._review_materials["tool_observations"].append({
+                    "phase": phase_name, "tool": tool_name, "arguments": raw_args,
+                    "observation": obs,
+                })
                 react_trace.append({
                     "phase": phase_name,
                     "round": round_idx + 1,
                     "action": "TOOL_CALL",
                     "tool_call": f"{tool_name}({raw_args})",
-                    "observation": obs[:800] + ("...[truncated]" if len(obs) > 800 else ""),
+                    "observation": obs,
                     "thought": content,
                 })
                 messages.append({
                     "role": "user",
-                    "content": "The tool returns the result (the long original text has been retained in the review trace, the following is a bounded excerpt): \\n"
+                    "content": "Tool observation excerpt; read tool_observations for the complete record:\n"
                     + str(_review_prompt_value(obs, key="observation")),
                 })
             else:
@@ -1140,18 +1091,13 @@ Output ACTION: FINISH and give JSON:
                 })
                 messages.append({"role": "user", "content": "Please continue with this stage of analysis, or ACTION: FINISH to output JSON."})
 
-        return _sanitize_teacher_output_terms({
+        return {
             "success": False,
             "phase": phase_name,
             "error": last_parse_error or "The stage reaches the maximum number of rounds and still does not output parsable JSON.",
-            "last_output": _sanitize_teacher_output_terms(last_content[-4000:]),
+            "last_output": last_content,
             "react_trace": react_trace,
-        }, preserve_trace=False)
-
-    # ==================================================================
-    # ReAct main loop
-    # ==================================================================
-
+        }
 
     # ==================================================================
     # Tool distribution
@@ -1937,11 +1883,6 @@ Output ACTION: FINISH and give JSON:
 
 
     # ==================================================================
-    # Final attribution fallback
-    # ==================================================================
-
-
-    # ==================================================================
     # Low-level tools
     # ==================================================================
 
@@ -2084,74 +2025,18 @@ Compare the trajectories and determine:
         compare_prompt = COMPARE_EVOLUTION_PROMPT.replace(
             "{model_registry}", self._model_registry)
 
-        messages = [
-            {"role": "system", "content": compare_prompt},
-            {"role": "user", "content": init_msg},
-        ]
-
-        tool_call_re = re.compile(
-            r'TOOL_CALL:\s*(\w+)\s*\(([^)]*)\)', re.IGNORECASE
+        self._review_materials = {
+            "student_trajectory": evolved_trajectory or [],
+            "reference_trajectory": baseline_trajectory or [],
+        }
+        result = self._run_teacher_phase(
+            phase_name="compare_evolution", system_content=compare_prompt, user_prompt=init_msg,
+            start_sec=start_sec, end_sec=end_sec, time_reference=time_reference,
+            evidence_windows=evidence_windows, student_windows=compare_student_windows,
+            max_rounds=MAX_ROUNDS, allow_tools=True,
         )
-
-        tool_calls_used = 0
-        for round_idx in range(MAX_ROUNDS):
-            print(f"     [Compare Round {round_idx + 1}/{MAX_ROUNDS}] {time_reference}")
-
-            try:
-                resp = self.llm_client.chat.completions.create(
-                    model=TEACHER_LLM_MODEL,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=3000,
-                    extra_body=dict(TEACHER_LLM_REQUEST_OPTIONS),
-                )
-                content = _extract_content(resp)
-            except Exception as e:
-                print(f"     ❌ LLM call failed: {e}")
-                return {"success": False, "error": str(e)}
-
-            if not content:
-                messages.append({"role": "user", "content": "Please continue to analyze."})
-                continue
-
-            messages.append({"role": "assistant", "content": content})
-
-            # Check if FINISH
-            if "FINISH" in content.upper() and "```json" in content:
-                result = _robust_json_extract(content)
-                if result:
-                    result["success"] = True
-                    result["change_type"] = change_type
-                    result["time_reference"] = time_reference
-                    return _sanitize_teacher_output_terms(result, preserve_trace=False)
-
-            # Check tool calls
-            m = tool_call_re.search(content)
-            if m:
-                tool_name, raw_args = m.group(1).lower(), m.group(2).strip()
-                if tool_calls_used >= MAX_TOOL_CALLS:
-                    messages.append({"role": "user", "content":
-                        f"Tool call budget exhausted ({MAX_TOOL_CALLS}/{MAX_TOOL_CALLS}). Please ACTION: FINISH now and output JSON."})
-                    continue
-                tool_calls_used += 1
-                obs = self._dispatch_tool(
-                    tool_name, raw_args, start_sec or 0, end_sec or 0, time_reference,
-                    student_windows=compare_student_windows,
-                    phase_name="compare_evolution",
-                    evidence_windows=evidence_windows)
-                print(f"     {tool_name}({raw_args}) -> {len(obs)} chars")
-                messages.append({
-                    "role": "user",
-                    "content": "The full tool result is retained in the review trace. Bounded excerpt:\\n"
-                    + str(_review_prompt_value(obs, key="observation")),
-                })
-            else:
-                # No tools and no FINISH → urge
-                messages.append({"role": "user", "content":
-                    "Please output your analysis conclusion. Format: THOUGHT + ACTION: FINISH + JSON."})
-
-        return {"success": False, "error": "The analysis-round limit was reached without a final result.",
-                "change_type": change_type, "time_reference": time_reference}
+        result.update(change_type=change_type, time_reference=time_reference)
+        return result
 
     def review_evolved_trajectory(self, question: str, gt_answer: str,
                                   time_reference: str, evolved_trajectory: list,
@@ -2194,7 +2079,6 @@ Compare the trajectories and determine:
     # ==================================================================
     # Batch evolution comparison
     # ==================================================================
-
 
 
     def summarize_post_evolution(self, payload: dict) -> dict:
@@ -2248,9 +2132,7 @@ Compare the trajectories and determine:
         initial_reference_mode = review_mode in {
             "unique_initial_current_best", "initial_reference_single_baseline",
         }
-        # Do not slice the first JSON bytes.  The ledger is intentionally a
-        # complete per-question causal record built by the runner, so a macro
-        # conclusion is grounded in all reviewed training questions.
+        # The ledger includes the causal record for every reviewed question.
         macro_material = {
             "metrics": payload.get("metrics", {}),
             "reviewed_execution_context": payload.get("reviewed_execution_context", {}),
@@ -2262,7 +2144,7 @@ Compare the trajectories and determine:
             "observed_distribution_profile": payload.get("observed_distribution_profile", {}),
             "macro_evidence_ledger": macro_ledger,
         }
-        digest = json.dumps(macro_material, ensure_ascii=False, indent=2, default=str)
+        evidence_overview = json.dumps(macro_material, ensure_ascii=False, indent=2, default=str)
         semantics_instruction = (
             "This is a health review of the initial current best. No predecessor or candidate delta exists, "
             "so do not use repair, regression, or candidate-retention semantics. Focus on cross-question "
@@ -2293,10 +2175,10 @@ Generate a post-evolution macro review from the material below.
 - Keep output compact: at most five items per list, at most five entries per `*_refs`, and at most two sentences per module-responsibility rationale. Prefer representative evidence over exhaustive enumeration.
 - `observed_distribution_profile` contains five-frame training-video observations and associated questions/options. It never contains answers, evidence annotations, task traces, or inferred genre labels. Describe observable channel properties and failure patterns without naming or guessing video genres.
 - Output both `distribution_evidence_profile` and `distribution_level_failure_pattern`.
-- Do not expose internal Teacher or historical runtime tool names as future callable tools. Use capability-level descriptions; the active combo's registry determines actual runtime names.
+- Quote observed tool names when citing execution evidence. Describe improvement opportunities at module/capability level; the active combo's registry lists callable runtime tools.
 
 ## Material JSON
-{digest}
+{evidence_overview}
 
 Output JSON:
 ```json
@@ -2372,13 +2254,13 @@ Output JSON:
         result, primary_error = request_macro_json(prompt, 20000)
         if result:
             result["success"] = True
-            return _sanitize_teacher_output_terms(result, preserve_trace=False)
+            return result
         compact_prompt = f"""You are the macro trajectory reviewer for MetaVideoAgent.
 
 The previous macro-review response could not be parsed. Return one valid JSON object from the compact evidence below.
 Requirements:
 - Only output JSON, no Markdown.
-- Do not expose Teacher audit-token names or runtime implementation names. Use capability-level descriptions.
+- Cite observed runtime facts accurately and describe causal mechanisms at module/capability level.
 - Include `module_responsibility`, `diagnosis_evidence_seed`, and `distribution_level_failure_pattern`.
 - All refs must come verbatim from task_id/time_reference in compact material; high/medium
   module responsibility must have at least one `evidence_ref`. Distinguish repairs,
@@ -2388,7 +2270,7 @@ Requirements:
   `implementation_contract`, or `evolution_hypothesis`.
 
 Complete mechanism ledger (review all rows, not only the first few):
-{digest}
+{evidence_overview}
 
 JSON schema:
 {{  "overall_verdict": "accept / reject / conditional",
@@ -2431,7 +2313,7 @@ JSON schema:
         if result:
             result["success"] = True
             result["compact_retry"] = True
-            return _sanitize_teacher_output_terms(result, preserve_trace=False)
+            return result
         return {
             "success": False,
             "error": "Unable to parse post evolution macro comment JSON",

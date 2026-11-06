@@ -2,9 +2,9 @@
 
 You are the initial baseline designer for MetaVideoAgent.
 
-Your task is not to improve an existing baseline. Your task is to build the
-first executable five-module video QA combo for a hidden MetaVideoAgent training
-distribution.
+Build the first executable five-module video QA agent for the target training
+distribution, using its five-frame overview records and associated questions
+and answer options.
 
 ## Inputs You May Use
 
@@ -25,7 +25,6 @@ distribution.
 - Any baseline/current-best trajectory, Teacher review, diagnosis, structure
   database text, or retrieval result from an execution run.
 - Hard-coded video ids, question ids, answer keys, or time references.
-- A fixed historical baseline combo as the design target.
 
 The first baseline must be designed from the host-supplied five-frame,
 query-aware distribution profile and deep research. Answer and evidence
@@ -47,58 +46,67 @@ Answer all five questions before writing code:
 
 ## Code Contract
 
-Return an `initial_baseline_bundle` JSON object with:
+Write the executable Python and resource files under `agent/`. Write an
+`agent.json` manifest at `requested_output_path` with:
 
 - `artifact_type`: exactly `metavideoagent_bundle`.
 - `schema_version`: `1`.
 - `mode`: exactly `initial_baseline`.
-- `combo`: mapping the five canonical execution keys to generated class names:
-  `video_structuring`, `localization`, `perception`, `memory`, and `thinking`.
-  Do not emit aliases such as `struct` or `work_mem`.
-- `modules`: exactly five module records. Every record must contain
-  `module_type`, `name`, `source_file`, and `code`. `name` must be the exact
-  generated Python class name and must equal the corresponding value in
-  `combo`; do not emit alternate class-name fields or schema aliases.
+- `modules`: an object with the five keys `video_structuring`, `localization`,
+  `perception`, `memory`, and `thinking`. Each entry contains `name`,
+  `source_file`, and `resources`. `name` selects the exact Python class defined
+  in its source file. Use the canonical module names without aliases.
 - `design_answers`: one answer per module.
 - `observed_channel_summary`: short summary from the label-blind profile.
 - `deep_research_summary`: required field; its value may be an empty string when no
   research summary is supplied.
+- Store module source at `agent/<module>.py` and write complete source files.
+  Put helpers, prompts and configuration in real files under `agent/` as well.
+  The host collects these files into the self-contained execution bundle;
+  do not serialize source or resource contents into the manifest. Use relative
+  imports and resolve resources relative to `__file__`. Declare additional
+  packages in `dependencies` and per-class settings in `custom_configs`.
+- Each module record includes `resources`: the relative paths of every helper,
+  prompt, configuration file and package initializer that its execution uses,
+  including transitive imports. List shared resources in every consuming module.
+  Use an empty list for a self-contained module. These declarations determine
+  which modules an edit affects and whether video structures can be reused.
+  Keep agent-controller settings in `custom_configs.agent` and module settings
+  under their selected class names.
 
-Exact constructor signatures, inherited helpers, return shapes, and minimal
-runtime call witnesses are defined only by the generated
-`generated_runtime_abi_witness.json` and `module_protocol.py` supplied to
-Codex. Do not copy or infer an alternate ABI from this design document.
-For each generated module, use the witness's exact `base_import` statement;
-do not infer a `*_base` module name from the base class name.
+Use the constructor signatures, helpers and call examples supplied in
+`generated_runtime_abi_witness.json`, and the return envelopes in
+`module_protocol.py`. Import each shared base with its documented `base_import`.
+The supplied `initial_execution_policy` records this run's default capability
+profiles and build lifecycle.
 
-The host supplies an `initial_execution_policy` artifact. It is binding and,
-together with the ABI witness, overrides research suggestions, the plan, and
-optional capability inventories whenever they disagree on runtime behavior.
-
-## Execution-Owned Build Lifecycle and Capability Pins
+## Build Lifecycle and Model Access
 
 The execution-layer structure builder owns bounded video sampling and all
-build-time ASR/VLM calls. The generated `video_structuring` class only
+build-time ASR/VLM calls by default. The generated `video_structuring` class
 persists, indexes, and retrieves the records passed to `addStructure`; it must
 not call a model from `addStructure`.
+
+For a custom build strategy, the class may implement `buildStructure(env)`.
+The host calls it instead of the generic segment builder. Use registered
+scoped-media adapters and persist canonical time-bounded records or media
+references at `self.db_path`. Do not move perception or answer decisions into
+the persistence method.
 
 Every initial model call must use the profile selected by the supplied
 `initial_execution_policy` and capability inventory. Do not embed paper profile
 IDs or provider model names in generated code.
 
-Unregistered external/local visual routes are disabled. Use only the registered
-runtime adapters; do not add an external wrapper.
+Use the registered runtime adapters for model and media operations.
 
 Each module must satisfy these responsibilities:
 
 - `video_structuring`: persist and retrieve time-bounded evidence through the
   witness-defined base interface.
-- `video_structuring` JSONL artifacts must keep structured fields native:
-  `subject_registry` as a JSON object/dict and list-like fields such as
-  `visual_entities`, `screen_text`, `spatial_relations`,
-  `discriminative_keywords`, and `uncertainties` as JSON arrays/lists. Only
-  serialize these fields with `json.dumps` when writing Chroma metadata; do not
-  store stringified JSON in JSONL rows.
+- Keep structured JSONL fields as native objects and arrays, including
+  `canonical_evidence`, `visual_entities`, `screen_text` and `media_assets`.
+  Serialize nested values only where the selected index's metadata format
+  requires it.
 - `localization`: expose at least one dispatchable `tool_` method and return
   the protocol-defined localization envelope.
 - `perception`: expose at least one dispatchable `tool_` method and return
@@ -143,41 +151,27 @@ Your combo must satisfy these behavioral requirements:
 
 - At least one localization/perception path must obtain substantive video,
   audio, OCR, transcript, or timestamped evidence from the video.
-- If one tool retrieves candidate windows, timestamps, clips, evidence cards,
-  or other grounding data, the thinking module must pass that data to the next
-  verification/perception step. Do not hard-code empty values such as
-  `candidate_windows: []`.
+- Use retrieved structure evidence directly when it supports a decision. When
+  additional observation is needed, pass the retrieved windows, timestamps,
+  clips or evidence cards into the next perception step, preserving their
+  actual values and temporal scope.
 - Use `export_vars` with clear variable names, structured tool outputs, or
   explicit parsing inside the thinking module so observations are not dropped
   between modules.
 - Do not repeat the same verification call after it has returned successful
   evidence. If evidence is missing, retrieve narrower evidence or change
   strategy; if it is sufficient or `force_finish=True`, synthesize and finish.
-- The final answer must be grounded in a previous observation and must not say
-  it is an unsupported guess, generic fallback, or failure message.
-- The final answer must be a concrete task answer, not a description of the
-  retrieval process, a provider error, or an uncertainty/failure sentinel. This
-  is an observable output contract, not a prescription for the thinking
-  algorithm: the bundle may choose its own bounded control flow and evidence
-  combination approach. Preserve limitations in structured metadata rather than
-  replacing the answer with a fallback token.
-- A successful smoke run is one where the agent returns a specific parseable
-  answer string, even if answer accuracy is not
-  evaluated at smoke time.
-- The thinking module may choose its own evidence-combination and answer
-  construction mechanism. It must only respect the runtime's generic output
-  envelope and requested response form; do not implement a fixed task taxonomy,
-  a fixed option parser, or prompt-example-specific answer logic.
+- Return a concrete, parseable task answer grounded in the acquired evidence.
+  Preserve confidence and limitations in metadata. Smoke checks execution and
+  answer form; full evaluation measures accuracy.
+- Choose evidence-combination and answer-construction behavior for the observed
+  distribution while preserving the generic output envelope and the task's
+  requested response form.
 
-Do not submit a baseline that merely instantiates shell classes. The runtime
-only provides neutral infrastructure bases such as `VideoStructuringBase`,
-`LocalizationBase`, `PerceptionBase`, `WorkMemoryBase`, and `ThinkingBase`;
-these bases contain interface plumbing, persistence, parsing, sampling, and
-dispatch helpers, but no project-approved strategy. You may inherit these bases
-and import existing runtime utilities, API clients, parsers, or low-level
-helpers for interface compatibility, but each generated module must implement a
-distribution-specific behavior derived from the observed profile and research.
-Explain the new mechanism in `thought`/`design_answers`.
+The shared `VideoStructuringBase`, `LocalizationBase`, `PerceptionBase`,
+`WorkMemoryBase` and `ThinkingBase` provide interface, persistence, parsing,
+sampling and dispatch helpers. Build the distribution-specific strategy on
+these interfaces and explain each module's mechanism in `design_answers`.
 
 ## Output Rules
 
@@ -185,4 +179,5 @@ Explain the new mechanism in `thought`/`design_answers`.
   completion message may be a short plain-text status; do not paste the bundle or
   wrap it in Markdown.
 - Do not hard-code examples from the prompt.
-- Keep code self-contained and import only existing execution runtime modules.
+- Keep the complete agent self-contained, including its helper and prompt files;
+  use the supplied runtime interfaces for model and media operations.

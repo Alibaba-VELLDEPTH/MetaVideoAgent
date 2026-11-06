@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Staged target-distribution evolution entrypoint.
 
-The from-scratch workflow:
+The automatic workflow:
 
-1. Build five-frame, query-aware records for the target distribution.
-2. Design and run an initial combo as the first reference.
+1. Initialize from five-frame distribution observations or a source-agent mapping.
+2. Validate and run the initial combo as the first reference.
 3. Diagnose the initial reference trajectories.
 4. Run explicit review, diagnosis, optional research, candidate authoring,
    smoke, probe, and full-evaluation stages against the current best.
@@ -15,11 +15,8 @@ Codex performs automatic multi-round authoring and bounded repair.
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import time
@@ -33,9 +30,6 @@ METAVIDEOAGENT_RUNTIME_DIR = os.path.join(CURRENT_DIR, "action_runtime")
 DEFAULT_METAVIDEOAGENT_WORKSPACE = os.path.join(CURRENT_DIR, "workspace")
 ACTIVE_RUNTIME_DIR = METAVIDEOAGENT_RUNTIME_DIR
 EVOLUTION_SPLIT = "train"
-DIAGNOSIS_BRIEF_MAX_ATTEMPTS = max(
-    1, int(os.environ.get("DIAGNOSIS_BRIEF_MAX_ATTEMPTS", "3") or "3")
-)
 METAVIDEOAGENT_PYTHON = os.environ.get("METAVIDEOAGENT_PYTHON") or sys.executable
 for path in (PROJECT_ROOT, EVOLUTION_DIR, ACTIVE_RUNTIME_DIR, CURRENT_DIR):
     if path not in sys.path:
@@ -48,12 +42,6 @@ os.environ.setdefault("METAVIDEOAGENT_RUNTIME_DIR", METAVIDEOAGENT_RUNTIME_DIR)
 from runtime_config import bootstrap_cli_api_env  # noqa: E402
 
 bootstrap_cli_api_env(sys.argv[1:])
-from capability_registry import resolve_profile  # noqa: E402
-from bundle_contract import normalize_modules  # noqa: E402
-
-DEFAULT_EXECUTION_LLM_MODEL = str(resolve_profile("llm").get("model_id") or "")
-DEFAULT_EXECUTION_VLM_MODEL = str(resolve_profile("vlm").get("model_id") or "")
-
 import diagnosis_agent as diagnosis_agent_module  # noqa: E402
 from channel_profile_runner import (  # noqa: E402
     build_channel_profile,
@@ -64,8 +52,8 @@ from codex_runtime_settings import (  # noqa: E402
     DEFAULT_REASONING_EFFORT,
     resolve_codex_runtime_settings,
 )
-from deep_research_runner import run_deep_research, validate_design_brief  # noqa: E402
-from diagnosis_agent import DiagnosisAgent, sanitize_tool_terms_for_evolution  # noqa: E402
+from deep_research_runner import run_deep_research  # noqa: E402
+from diagnosis_agent import DiagnosisAgent  # noqa: E402
 from diagnosis_execution_brief import (  # noqa: E402
     validate_bundle_execution_brief,
     write_bundle_execution_brief,
@@ -74,8 +62,9 @@ from distribution_spec import (  # noqa: E402
     load_distribution_spec,
     resolve_distribution_manifest_path,
 )
-from evaluation_audit import build_full_eval_audit, read_jsonl, write_audit_files  # noqa: E402
 from iter_context import build_iter_context, inject_iter_context  # noqa: E402
+from iteration_workspace import IterationWorkspace, candidate_stage_paths  # noqa: E402
+from iteration_workspace import write_json as write_workspace_json  # noqa: E402
 from ledger import (  # noqa: E402
     load_evolution_memory,
     load_ledger,
@@ -83,7 +72,7 @@ from ledger import (  # noqa: E402
     record_reference,
 )
 from paths import run_dir as metavideoagent_run_dir  # noqa: E402
-from post_full_eval_decider import current_best_update_allowed, decide_post_full_eval  # noqa: E402
+from post_full_eval_decider import full_evaluation_is_valid  # noqa: E402
 from review_contract import review_is_consumable  # noqa: E402
 from runtime_paths import (  # noqa: E402
     require_metavideoagent_runtime,
@@ -95,7 +84,7 @@ from runtime_paths import (
 
 
 def _normalize_api_env(env: Dict[str, str], args: argparse.Namespace = None) -> Dict[str, str]:
-    """Normalize model/API env for subprocesses.
+    """Prepare provider and execution settings for subprocesses.
 
     Provider settings are injected through documented MetaVideoAgent environment variables.
     """
@@ -108,35 +97,18 @@ def _normalize_api_env(env: Dict[str, str], args: argparse.Namespace = None) -> 
             if value:
                 env[key] = value
     if args is not None:
-        if getattr(args, "exec_llm_model", ""):
-            env["METAVIDEOAGENT_LLM_MODEL"] = args.exec_llm_model
-            env["CODEX_SMOKE_JUDGE_MODEL"] = args.exec_llm_model
-        if getattr(args, "vlm_model", ""):
-            env["METAVIDEOAGENT_VLM_MODEL"] = args.vlm_model
-        if getattr(args, "asr_model", ""):
-            env["METAVIDEOAGENT_ASR_MODEL"] = args.asr_model
         if getattr(args, "structure_workers", None):
             env["VIDEO_STRUCT_REBUILD_WORKERS"] = str(args.structure_workers)
             env["VIDEO_STRUCT_REBUILD_BATCH"] = str(max(1, int(args.structure_workers) * 8))
-        # Bundle-internal ancestry guards must use the same finite budget as
-        # the staged outer feedback loop.  Otherwise a caller requesting three
-        # probe repairs would be rejected by the bundle's hidden default of
-        # two on the third resume.
+        # Candidate continuation and orchestration share one repair budget.
         if getattr(args, "probe_repair_attempts", None) is not None:
-            budget = str(max(1, int(args.probe_repair_attempts or 0)))
+            budget = str(max(0, int(args.probe_repair_attempts or 0)))
             env["BUNDLE_FEEDBACK_BUDGET"] = budget
-            env["BUNDLE_ENGINEERING_FEEDBACK_BUDGET"] = budget
     return env
 
 
 def _unique_run_id(prefix: str) -> str:
     return f"{prefix}_{int(time.time() * 1000)}_{os.getpid()}"
-
-
-def _configure_inprocess_diagnosis_model(args: argparse.Namespace) -> str:
-    """Return the configured diagnosis model, using the reproduction default."""
-    del args
-    return diagnosis_agent_module.DIAGNOSIS_MODEL
 
 
 def _refresh_diagnosis_probe_context(report: Dict) -> Dict:
@@ -160,13 +132,7 @@ def _read_json(path: str) -> Dict:
 
 
 def _probe_question_limit(args: argparse.Namespace) -> int:
-    """Return an explicit probe size without embedding a dataset-specific default.
-
-    A caller may override the manifest with ``--first-n``.  Otherwise the
-    distribution manifest is the single source of truth for bounded
-    probe coverage.  MetaVideoAgent runs must not silently fall back to an
-    arbitrary sample such as three questions.
-    """
+    """Use the CLI probe size or the distribution manifest's probe budget."""
     requested = int(getattr(args, "first_n", 0) or 0)
     if requested > 0:
         return requested
@@ -266,49 +232,14 @@ def _reference_label_for_report(args: argparse.Namespace, report: Dict,
     return f"reference:{combo_id}" if combo_id else (explicit or "reference")
 
 
-def _iter_from_path(path: str) -> int:
-    if not path:
-        return 0
-    matches = re.findall(r"(?:^|/)iter_(\d+)(?:/|$)", os.path.abspath(path))
-    return int(matches[-1]) if matches else 0
-
-
-def _resolve_iteration_index(args: argparse.Namespace, reference_report_path: str = "") -> int:
-    """Resolve an explicit staged iteration without silently writing ``iter_1``.
-
-    Explicit ``--iteration-index`` wins.  Otherwise output paths identify the
-    target iteration; a diagnosis that only points at the preceding full eval
-    is assigned to the following iteration.  If no artifact is available, use
-    the next unused iteration directory for this run.
-    """
+def _resolve_iteration_index(args: argparse.Namespace) -> int:
+    """Use the requested iteration or this run's persisted continuation point."""
     explicit = int(getattr(args, "iteration_index", 0) or 0)
     if explicit > 0:
         return explicit
-    direct_paths = (
-        getattr(args, "out_dir", ""),
-        getattr(args, "review_out_dir", ""),
-        getattr(args, "diagnosis_report", ""),
-        getattr(args, "candidate_run", ""),
-        getattr(args, "candidate_bundle", ""),
-        getattr(args, "evolution_review", ""),
-    )
-    for path in direct_paths:
-        index = _iter_from_path(path)
-        if index:
-            return index
-    prior_paths = (getattr(args, "full_eval_report", ""), reference_report_path)
-    for path in prior_paths:
-        index = _iter_from_path(path)
-        if index:
-            return index + 1 if args.stage in {"diagnose", "review"} else index
     run_root = metavideoagent_run_dir(args.run_id, args.output_root)
-    existing = [
-        int(match.group(1))
-        for name in (os.listdir(run_root) if os.path.isdir(run_root) else [])
-        if (match := re.fullmatch(r"iter_(\d+)", name))
-    ]
-    return max(existing, default=0) + 1
-
+    state = _read_json(os.path.join(run_root, "run.json"))
+    return int(state.get("next_iteration") or 1)
 
 
 def _synthetic_reference_report_from_initial(initial: Dict) -> Dict:
@@ -342,26 +273,12 @@ def _stage_report_path(args: argparse.Namespace, output: Dict) -> str:
         )
     return os.path.join(
         metavideoagent_run_dir(args.run_id, args.output_root),
+        *(("checks",) if args.check_only else ()),
         "metavideoagent_evolution_report.json",
     )
 
 
-def _external_history_meta(*paths: str) -> Dict:
-    formal_output_root = os.path.abspath(runtime_output_root())
-    external = []
-    for path in paths:
-        if not path:
-            continue
-        abs_path = os.path.abspath(path)
-        if not abs_path.startswith(formal_output_root + os.sep):
-            external.append(abs_path)
-    return {
-        "external_history_input": bool(external),
-        "external_history_paths": external,
-    }
-
-
-def _resolve_initial_report(workspace: str, initial_report: str = "",
+def _resolve_initial_report(initial_report: str = "",
                             run_id: str = "", output_root: str = "",
                             reference_label: str = "") -> str:
     if initial_report:
@@ -374,25 +291,11 @@ def _resolve_initial_report(workspace: str, initial_report: str = "",
         ledger_report = selection.get("train_diagnostic_report_path", "") or ledger_entry.get("report_path", "")
         if ledger_report and os.path.exists(ledger_report):
             return os.path.abspath(ledger_report)
-        candidates = [
-            os.path.join(
-                metavideoagent_run_dir(run_id, output_root),
-                "initial_baseline_report.json",
-            ),
-            os.path.join(
-                metavideoagent_run_dir(run_id, output_root),
-                "initial_baselines",
-                "initial_baseline_report.json",
-            ),
-            os.path.join(
-                metavideoagent_run_dir(run_id, output_root),
-                "initial_combo",
-                "initial_combo_report.json",
-            ),
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
+        initial = _read_json(os.path.join(metavideoagent_run_dir(run_id, output_root),
+                                         "iter_0", "metavideoagent_initial_pipeline.json"))
+        report_path = (initial.get("initial_reference_report") or {}).get("report_path", "")
+        if report_path and os.path.isfile(report_path) and (initial.get("initial_reference_report") or {}).get("ready"):
+            return os.path.abspath(report_path)
     return ""
 
 
@@ -488,25 +391,11 @@ def _combo_from_reference_report(report: Dict) -> Dict:
     return {}
 
 
-def _brief_target_modules(value: Dict) -> list[str]:
-    """Return the validated adaptive target set for a later-round brief."""
-    policy = value.get("execution_policy") if isinstance(value, dict) else {}
-    modules = (policy or {}).get("target_modules")
-    try:
-        return normalize_modules(modules)
-    except ValueError as exc:
-        raise RuntimeError(
-            "later-round evolution requires a valid non-empty "
-            f"execution_policy.target_modules list: {exc}"
-        ) from exc
-
-
 def _profile_path(workspace: str, manifest: str, run_id: str,
                   output_root: str = "",
                   explicit_profile: str = "",
                   force: bool = False,
-                  include_execution_artifacts: bool = False,
-                  semantic_kwargs: Dict = None) -> str:
+                  semantic_kwargs: Dict = None, check_only: bool = False) -> str:
     if explicit_profile:
         path = os.path.abspath(explicit_profile)
         if not os.path.exists(path):
@@ -517,7 +406,8 @@ def _profile_path(workspace: str, manifest: str, run_id: str,
         distribution_manifest=manifest,
         run_id=run_id,
         output_root=output_root,
-        include_execution_artifacts=include_execution_artifacts,
+        output_path=os.path.join(metavideoagent_run_dir(run_id, output_root),
+                                 *(('checks',) if check_only else ()), "iter_0", "initialization", "profile.json"),
         force=force,
         **(semantic_kwargs or {}),
     )
@@ -528,19 +418,22 @@ def _load_or_build_profile(workspace: str, manifest: str, run_id: str,
                            output_root: str = "",
                            explicit_profile: str = "",
                            force: bool = False,
-                           include_execution_artifacts: bool = False,
-                           semantic_kwargs: Dict = None) -> Dict:
+                           semantic_kwargs: Dict = None, check_only: bool = False) -> Dict:
     path = _profile_path(
         workspace, manifest, run_id, output_root=output_root,
         explicit_profile=explicit_profile,
         force=force,
-        include_execution_artifacts=include_execution_artifacts,
         semantic_kwargs=semantic_kwargs,
+        check_only=check_only,
     )
     profile = _read_json(path)
     matches, reason = profile_matches_manifest(profile, manifest)
-    if matches:
+    from channel_profile_runner import profile_ready_for_mode
+    mode = (semantic_kwargs or {}).get("semantic_observer_mode", "observe")
+    if matches and profile_ready_for_mode(profile, mode):
         return profile
+    if matches:
+        reason = "semantic_observation_not_completed"
 
     # An explicit profile from a different run is never silently relabelled
     # as belonging to the current train manifest.  Rebuild a new, run-scoped
@@ -548,8 +441,7 @@ def _load_or_build_profile(workspace: str, manifest: str, run_id: str,
     # audit. This also accepts profiles carrying an explicit provenance record.
     rebuilt_path = os.path.join(
         metavideoagent_run_dir(run_id, output_root),
-        "profiles",
-        "channel_profile_manifest_attested.json",
+        *(('checks',) if check_only else ()), "iter_0", "initialization", "profile.json",
     )
     rebuilt = build_channel_profile(
         workspace=workspace,
@@ -557,7 +449,6 @@ def _load_or_build_profile(workspace: str, manifest: str, run_id: str,
         output_path=rebuilt_path,
         run_id=run_id,
         output_root=output_root,
-        include_execution_artifacts=include_execution_artifacts,
         force=True,
         **(semantic_kwargs or {}),
     )
@@ -571,10 +462,6 @@ def _load_or_build_profile(workspace: str, manifest: str, run_id: str,
 
 
 def _profile_semantic_kwargs(args: argparse.Namespace) -> Dict:
-    # Both public workflows expose the selected visual model as ``--vlm-model``.
-    # Normalize once so a semantic profile
-    # cannot accidentally inherit an unrelated shell/default model.
-    formal_vlm_model = getattr(args, "vlm_model", "") or DEFAULT_EXECUTION_VLM_MODEL
     observer_mode = getattr(args, "semantic_observer_mode", "observe")
     if getattr(args, "check_only", False) and observer_mode == "observe":
         observer_mode = "plan"
@@ -584,15 +471,13 @@ def _profile_semantic_kwargs(args: argparse.Namespace) -> Dict:
         "semantic_video_budget": getattr(args, "semantic_video_budget", 0),
         "semantic_observe_workers": getattr(args, "semantic_observe_workers", 1),
         "runtime_dir": selected_runtime_dir(),
-        "vlm_model": formal_vlm_model,
     }
 
 
 def _run_deep_research_context(args: argparse.Namespace, profile: Dict,
                                run_id: str,
                                diagnosis_path: str = "",
-                               review_path: str = "",
-                               output_subdir: str = "deep_research") -> Dict:
+                               review_path: str = "") -> Dict:
     if getattr(args, "check_only", False):
         return {"skipped": True, "reason": "check-only mode does not execute Codex research"}
     if getattr(args, "deep_research_report", ""):
@@ -610,8 +495,14 @@ def _run_deep_research_context(args: argparse.Namespace, profile: Dict,
     profile_path = profile.get("output_path", "") or getattr(args, "profile", "")
     if not profile_path:
         return {}
-    out_dir = os.path.join(metavideoagent_run_dir(run_id, args.output_root), output_subdir)
-    return run_deep_research(
+    iteration = IterationWorkspace(os.path.join(metavideoagent_run_dir(run_id, args.output_root), "iter_0"))
+    saved = (iteration.progress().get("stages") or {}).get("initialization") or {}
+    if saved.get("status") == "complete":
+        report = _read_json(saved["result"])
+        if report.get("formal_research") and report.get("research_complete"):
+            return report
+    out_dir = str(iteration.reserve("initialization"))
+    result = run_deep_research(
         workspace=args.workspace,
         channel_profile_path=profile_path,
         output_dir=out_dir,
@@ -624,135 +515,59 @@ def _run_deep_research_context(args: argparse.Namespace, profile: Dict,
         codex_cli=getattr(args, "research_codex_cli", "") or getattr(args, "codex_cli", ""),
         min_sources=getattr(args, "research_min_sources", 2),
     )
+    iteration.record("initialization", result["report_path"],
+                     status="complete" if result.get("research_complete") else "pending",
+                     notes_path=result.get("summary_path", ""), next_task=result.get("next_task") or {})
+    return result
 
 
 def _run_codex_deep_research_context(args: argparse.Namespace, profile: Dict,
                                      diagnosis_path: str, review_path: str,
                                      round_dir: str) -> Dict:
-    """Run diagnosis-conditioned research immediately before automatic codegen."""
+    """Research the full diagnosis, evidence and unresolved implementation questions."""
     if getattr(args, "check_only", False):
         return {"skipped": True, "reason": "check-only mode does not execute Codex research"}
     if getattr(args, "probe_failed_run", "") or getattr(args, "engineering_failed_run", ""):
-        return {
-            "skipped": True,
-            "reason": "same-candidate feedback reuses the existing diagnosis/research handoff",
-        }
+        return {"skipped": True, "reason": "same-candidate feedback reuses its research"}
     if getattr(args, "skip_codex_deep_research", False):
-        return {"skipped": True, "reason": "--skip-codex-deep-research"}
+        return {"skipped": True, "reason": "--skip-iteration-research"}
     if getattr(args, "codex_deep_research_report", ""):
-        if not diagnosis_path:
-            raise RuntimeError("cannot resume research without the diagnosis execution brief")
-        resume_diagnosis = _read_json(diagnosis_path)
-        resume_execution_brief_path = str(resume_diagnosis.get("execution_brief_path") or "")
-        execution_brief = _read_json(resume_execution_brief_path)
-        if not execution_brief or validate_bundle_execution_brief(execution_brief):
-            raise RuntimeError("cannot resume Codex research with an invalid diagnosis execution brief")
-        report_path = os.path.abspath(args.codex_deep_research_report)
-        report = _read_json(report_path)
-        if report:
-            # An explicit report can be resumed only after it is revalidated
-            # against the *current* execution brief.  This supports recovery
-            # from a repaired validator without re-running an already
-            # completed online Codex search, while preserving the original
-            # failed report as immutable audit evidence.
-            design_brief_path = str(report.get("design_brief_path") or "")
-            design_brief = _read_json(design_brief_path)
-            allowed_capabilities = (
-                (execution_brief.get("implementation_task", {}) or {})
-                .get("runtime_capabilities", [])
-            )
-            validation = validate_design_brief(
-                design_brief,
-                min_sources=max(1, int(getattr(args, "research_min_sources", 2) or 2)),
-                verify_source_urls=False,
-                expected_target_modules=_brief_target_modules(execution_brief),
-                allowed_runtime_capabilities=allowed_capabilities,
-                required_bundle_contract=execution_brief,
-            )
-            previous_validation = report.get("validation") or {}
-            prior_source_verified = (
-                previous_validation.get("source_url_verification") is True
-                and not list(previous_validation.get("unreachable_sources") or [])
-                and int(previous_validation.get("valid_source_count", 0) or 0)
-                >= max(1, int(getattr(args, "research_min_sources", 2) or 2))
-            )
-            if not validation.get("passed") or not prior_source_verified:
-                raise RuntimeError(
-                    "explicit deep-research report is not resumable under the current "
-                    "execution brief: "
-                    + "; ".join(validation.get("issues") or ["source verification missing"])
-                )
-            resumed = dict(report)
-            resumed.update({
-                "formal_research": True,
-                "research_complete": True,
-                "validation_passed": True,
-                "target_modules": _brief_target_modules(execution_brief),
-                "validation": {
-                    **validation,
-                    "source_url_verification": True,
-                    "resumed_from_report": report_path,
-                    "resumed_after_validator_revalidation": True,
-                },
-                "resumed_from_report": report_path,
-            })
-            resume_dir = os.path.join(
-                round_dir, "codex_deep_research", _unique_run_id("revalidated")
-            )
-            resumed_path = os.path.join(resume_dir, "deep_research_report.json")
-            resumed["report_path"] = resumed_path
-            _write_json(resumed_path, resumed)
-            return resumed
+        report = _read_json(args.codex_deep_research_report)
+        if not report or not report.get("formal_research") or not report.get("research_complete"):
+            raise RuntimeError("the supplied research report is missing or incomplete")
+        return report
     if getattr(args, "codex_deep_research_summary", ""):
         return {
             "summary_text": args.codex_deep_research_summary,
-            "source": "inline_argument",
-            "report_path": "",
-            "summary_path": "",
-            "design_brief_path": "",
-            "research_complete": True,
+            "source": "inline_argument", "research_complete": True,
             "formal_research": False,
         }
-    if not diagnosis_path:
-        return {"skipped": True, "reason": "missing diagnosis_path"}
-    diagnosis = _read_json(diagnosis_path)
-    execution_brief_path = diagnosis.get("execution_brief_path", "")
-    if not execution_brief_path or not os.path.exists(execution_brief_path):
-        raise RuntimeError(
-            "diagnosis is missing execution_brief_path; rerun diagnosis so deep research "
-            "does not consume the full audit report"
-        )
-    execution_brief = _read_json(execution_brief_path)
-    _brief_target_modules(execution_brief)
-    from diagnosis_execution_brief import validate_bundle_machine_evaluation_contract
-    contract_path = str(diagnosis.get("machine_evaluation_contract_path") or "")
-    contract = _read_json(contract_path)
-    issues = validate_bundle_machine_evaluation_contract(contract)
-    if issues:
-        raise RuntimeError(
-            "diagnosis-conditioned deep research requires a valid machine evaluation contract: "
-            + "; ".join(issues)
-        )
+    if not diagnosis_path or not _read_json(diagnosis_path):
+        raise RuntimeError("research requires the completed diagnosis")
     profile_path = profile.get("output_path", "") or getattr(args, "profile", "")
     if not profile_path:
-        return {"skipped": True, "reason": "missing channel profile"}
-    out_dir = os.path.join(round_dir, "codex_deep_research", _unique_run_id("attempt"))
+        raise RuntimeError("research requires the observed distribution profile")
+    iteration = IterationWorkspace(round_dir)
+    saved = (iteration.progress().get("stages") or {}).get("research") or {}
+    if saved.get("status") == "complete":
+        return _read_json(saved["result"])
+    attempt = iteration.reserve("research")
     result = run_deep_research(
         workspace=args.workspace,
         channel_profile_path=profile_path,
-        output_dir=out_dir,
-        run_id=args.run_id,
-        output_root=args.output_root,
-        diagnosis_path=execution_brief_path,
-        review_path="",
+        output_dir=str(attempt),
+        run_id=args.run_id, output_root=args.output_root,
+        diagnosis_path=diagnosis_path,
+        review_path=review_path or _read_json(diagnosis_path).get("evolution_review_path", ""),
         max_queries=getattr(args, "deep_research_max_queries", 5),
         search_timeout=getattr(args, "research_search_timeout", 20),
         codex_cli=getattr(args, "research_codex_cli", "") or getattr(args, "codex_cli", ""),
         min_sources=getattr(args, "research_min_sources", 2),
     )
     result["usage"] = "diagnosis_to_automatic_code_generation"
-    result["full_diagnosis_path"] = os.path.abspath(diagnosis_path)
-    result["execution_brief_path"] = os.path.abspath(execution_brief_path)
+    iteration.record("research", result["report_path"],
+                     status="complete" if result.get("research_complete") else "pending",
+                     notes_path=result.get("summary_path", ""), next_task=result.get("next_task") or {})
     return result
 
 
@@ -782,178 +597,44 @@ def _research_record(research: Dict) -> Dict:
 
 
 def _write_diagnosis_for_codex(diagnosis_path: str, research: Dict,
-                               round_dir: str,
-                               iter_context: Dict = None) -> str:
-    if not diagnosis_path or not research or research.get("skipped"):
-        return diagnosis_path
-    source_diagnosis = _read_json(diagnosis_path)
-    if not source_diagnosis:
-        return diagnosis_path
-    diagnosis = source_diagnosis
-    if diagnosis.get("artifact_type") != "diagnosis_execution_brief":
-        execution_brief_path = diagnosis.get("execution_brief_path", "")
-        execution_brief = _read_json(execution_brief_path)
-        if not execution_brief or execution_brief.get("artifact_type") != "diagnosis_execution_brief":
-            raise RuntimeError(
-                "Codex handoff requires diagnosis_execution_brief; rerun diagnosis "
-                "instead of passing the full audit report to code generation"
-            )
-        diagnosis = execution_brief
-    expected_targets = _brief_target_modules(diagnosis)
-    validation = research.get("validation", {}) or {}
-    validation_passed = research.get(
-        "validation_passed",
-        validation.get("passed") if isinstance(validation, dict) else None,
-    )
-    design_brief_path = str(research.get("design_brief_path") or "")
-    if not (
-        research.get("formal_research") is True
-        and research.get("research_complete") is True
-        and validation_passed is True
-        and list(research.get("target_modules") or []) == expected_targets
-        and design_brief_path
-        and os.path.isfile(design_brief_path)
-    ):
-        raise RuntimeError(
-            "refusing to write diagnosis_for_codex without a validated same-direction "
-            "formal research record and design brief"
-        )
-    # The compact execution brief intentionally omits audit prose, but bundle
-    # assembly/runtime need an executable current-best provenance record.  It
-    # must survive audit -> brief -> Codex handoff rather than be reconstructed
-    # from a mutable workspace after Codex has already edited source files.
-    source_context = source_diagnosis.get("iter_context") or iter_context or {}
-    # Explicit staged diagnoses may have been compiled from a checked
-    # provenance attestation instead of the normal iter_context injector.
-    # Treat it as an equally auditable source, but never discover paths by
-    # scanning mutable output trees.
-    attested_runtime = source_diagnosis.get("runtime_provenance") or {}
-    source_reference = source_context.get("reference") or {}
-    source_best = source_context.get("current_best") or {}
-    source_artifacts = source_best.get("artifacts") or {}
-    bundle_info = source_artifacts.get("bundle") or source_reference.get("initial_baseline_bundle") or {}
-    # A staged later-round diagnosis can intentionally run without a
-    # mutable current-best ledger.  In that case ``iter_context.reference`` is
-    # the historical initial reference, while ``diagnosis_inputs`` carries the
-    # immutable full-eval report of the candidate that the just-completed
-    # review diagnosed.  The latter is the executable parent for the next
-    # bundle; silently retaining the initial bundle would select the wrong base.
-    diagnosis_inputs = source_diagnosis.get("diagnosis_inputs") or {}
-    previous_round = source_context.get("previous_round") or {}
-    previous_full_eval_path = str(
-        diagnosis_inputs.get("previous_full_eval_report")
-        or (previous_round.get("full_eval_report") or {}).get("path")
-        or ""
-    )
-    previous_full_eval = _read_json(previous_full_eval_path)
-    previous_candidate_bundle = _initial_bundle_path_from_report(previous_full_eval)
-    previous_candidate_results = _reference_results_path_from_report(previous_full_eval)
-    previous_candidate_combo = previous_full_eval.get("combo") or previous_full_eval.get("agent_combo") or {}
-    use_staged_candidate_parent = bool(
-        previous_candidate_bundle
-        and os.path.isfile(previous_candidate_bundle)
-        and previous_candidate_results
-        and os.path.isfile(previous_candidate_results)
-        and isinstance(previous_candidate_combo, dict)
-        and previous_candidate_combo
-        and not source_best
-        and not source_diagnosis.get("reference_bundle_path")
-        and not attested_runtime.get("reference_bundle_path")
-    )
-    runtime_provenance = {
-        "reference_report_path": str(
-            previous_full_eval_path if use_staged_candidate_parent else
-            source_diagnosis.get("reference_report_path")
-            or attested_runtime.get("reference_report_path")
-            or (source_reference.get("report") or {}).get("path") or ""
-        ),
-        "reference_results_path": str(
-            previous_candidate_results if use_staged_candidate_parent else
-            source_diagnosis.get("reference_results_path")
-            or attested_runtime.get("reference_results_path")
-            or diagnosis_inputs.get("reference_results_path")
-            or (source_reference.get("results") or {}).get("path") or ""
-        ),
-        "reference_bundle_path": str(
-            previous_candidate_bundle if use_staged_candidate_parent else
-            source_diagnosis.get("reference_bundle_path")
-            or attested_runtime.get("reference_bundle_path")
-            or bundle_info.get("path") or ""
-        ),
-        "reference_combo": dict(
-            previous_candidate_combo if use_staged_candidate_parent else
-            source_diagnosis.get("reference_combo")
-            or attested_runtime.get("reference_combo")
-            or source_best.get("combo") or source_reference.get("combo") or {}
-        ),
-        "distribution_manifest": str(
-            source_diagnosis.get("distribution_manifest")
-            or attested_runtime.get("distribution_manifest")
-            or source_context.get("distribution_manifest") or ""
-        ),
-    }
-    missing_runtime = [
-        name for name in ("reference_report_path", "reference_results_path", "reference_bundle_path", "distribution_manifest")
-        if not runtime_provenance[name] or not os.path.isfile(runtime_provenance[name])
-    ]
-    if missing_runtime or not runtime_provenance["reference_combo"]:
-        raise RuntimeError(
-            "refusing Codex bundle handoff without immutable runtime provenance: "
-            + ", ".join(missing_runtime or ["reference_combo"])
-        )
-    diagnosis["runtime_provenance"] = runtime_provenance
-    diagnosis.update(runtime_provenance)
+                               round_dir: str, iter_context: Dict = None) -> str:
+    """Assemble the code-writing input without stripping upstream reasoning."""
+    diagnosis = _read_json(diagnosis_path)
+    if not diagnosis:
+        raise RuntimeError("code generation requires the completed diagnosis")
+    if research.get("skipped") is not True and research.get("research_complete") is not True:
+        raise RuntimeError("research is incomplete; resolve its open questions before code generation")
+    stage_context = IterationWorkspace(round_dir).context("codegen")
+    diagnosis.setdefault("iter_context", {})["stage_context"] = stage_context
     diagnosis["codex_deep_research"] = {
         **_research_record(research),
-        "summary_text": (research.get("summary_text") or "")[:20000],
-        "design_brief": research.get("design_brief", {}),
+        "summary_text": research.get("summary_text", ""),
+        "design_brief": research.get("design_brief") or _read_json(research.get("design_brief_path", "")),
     }
-    diagnosis = sanitize_tool_terms_for_evolution(diagnosis)
+    from runtime_capability_context import candidate_runtime_capabilities
+    diagnosis.setdefault("implementation_task", {})["runtime_capabilities"] = candidate_runtime_capabilities(diagnosis)
+    diagnosis["working_materials"] = {
+        **((iter_context or {}).get("working_materials") or {}),
+        **(diagnosis.get("working_materials") or {}),
+        **({"research": research["report_path"]} if research.get("report_path") else {}),
+    }
+    from working_materials import material_paths
+    diagnosis["working_materials"].update(material_paths({"stage_context": stage_context}))
     out_path = os.path.join(round_dir, "diagnosis_for_codex.json")
     _write_json(out_path, diagnosis)
     return out_path
 
 
-def _load_validated_diagnosis_for_codex(path: str, execution_brief: Dict) -> Dict:
-    """Load a persisted same-direction research handoff for staged evolution."""
+def _load_validated_diagnosis_for_codex(path: str) -> Dict:
+    """Load the diagnosis and its completed or explicitly skipped research."""
     handoff = _read_json(path)
-    if handoff.get("artifact_type") != "diagnosis_execution_brief":
-        raise RuntimeError("staged evolution requires an existing diagnosis_for_codex execution brief")
     issues = validate_bundle_execution_brief(handoff)
     if issues:
-        raise RuntimeError("existing diagnosis_for_codex is invalid: " + "; ".join(issues))
-    handoff_task = handoff.get("implementation_task", {}) or {}
-    brief_task = execution_brief.get("implementation_task", {}) or {}
-    _brief_target_modules(execution_brief)
-    if handoff_task != brief_task:
-        raise RuntimeError(
-            "existing diagnosis_for_codex does not match the supplied diagnosis execution brief"
-        )
-    research = handoff.get("codex_deep_research", {}) or {}
-    validation = research.get("validation", {}) or {}
-    validation_passed = research.get(
-        "validation_passed",
-        validation.get("passed") if isinstance(validation, dict) else None,
-    )
-    expected_targets = _brief_target_modules(execution_brief)
-    design_brief_path = str(research.get("design_brief_path") or "")
-    if not (
-        research.get("formal_research") is True
-        and research.get("research_complete") is True
-        and validation_passed is True
-        and list(research.get("target_modules") or []) == expected_targets
-        and design_brief_path
-        and os.path.isfile(design_brief_path)
-    ):
-        raise RuntimeError(
-            "existing diagnosis_for_codex lacks a validated same-direction formal research record"
-        )
+        raise RuntimeError("saved code-writing input is incomplete: " + "; ".join(issues))
+    research = handoff.get("codex_deep_research") or {}
+    if research.get("skipped") is not True and research.get("research_complete") is not True:
+        raise RuntimeError("saved code-writing input requires completed or explicitly skipped research")
     return handoff
-
-
-def _validate_existing_diagnosis_for_codex(path: str, execution_brief: Dict) -> None:
-    """Validate a persisted handoff before a no-write evolve preflight."""
-    _load_validated_diagnosis_for_codex(path, execution_brief)
 
 
 def _ensure_research_ready(args: argparse.Namespace, research: Dict) -> None:
@@ -976,26 +657,21 @@ def _run_initial(args: argparse.Namespace, run_id: str) -> Dict:
         profile=args.profile,
         combo_plan=args.combo_plan,
         initial_baseline_bundle=getattr(args, "initial_baseline_bundle", ""),
-        out_dir=args.out_dir,
+        initialization=getattr(args, "initialization", "observe"),
+        source_agent=getattr(args, "source_agent", ""),
+        out_dir=(args.out_dir or os.path.join(metavideoagent_run_dir(run_id, args.output_root), "checks", "iter_0")) if args.check_only else args.out_dir,
         run_id=run_id,
         video_id=args.video_id,
         question_split=EVOLUTION_SPLIT,
         concurrency=args.concurrency,
         first_n=args.first_n,
-        llm_model=args.exec_llm_model,
         rebuild_structure=args.rebuild_structure,
         structure_workers=args.structure_workers,
         combo_id=args.combo_id,
-        # The staged orchestrator has already built and attested this exact
-        # profile before calling the initial plan/codegen stages. Reuse it
-        # verbatim so codegen cannot silently create a second profile.
-        skip_profile=bool(args.profile) or args.skip_profile,
         semantic_observer_mode=getattr(args, "semantic_observer_mode", "none"),
         semantic_observer_dir=getattr(args, "semantic_observer_dir", ""),
         semantic_video_budget=getattr(args, "semantic_video_budget", 0),
         semantic_observe_workers=getattr(args, "semantic_observe_workers", 1),
-        vlm_model=(getattr(args, "vlm_model", "") or DEFAULT_EXECUTION_VLM_MODEL),
-        asr_model=getattr(args, "asr_model", ""),
         api_key=getattr(args, "api_key", ""),
         base_url=getattr(args, "base_url", ""),
         output_root=args.output_root,
@@ -1004,12 +680,12 @@ def _run_initial(args: argparse.Namespace, run_id: str) -> Dict:
         deep_research_report=getattr(args, "deep_research_report", ""),
         codex_cli=getattr(args, "initial_codex_cli", "") or getattr(args, "codex_cli", ""),
         codegen_timeout=getattr(args, "codegen_timeout", 900),
-        skip_bundle_smoke_test=False,
-        smoke_only=False,
         bundle_smoke_repair_attempts=getattr(args, "repair_attempts", 0),
         adopt_smoke_report="",
+        restart_from=getattr(args, "restart_from", ""),
     )
-    if not common["initial_baseline_bundle"]:
+    initialization_dir = common["out_dir"] or os.path.join(metavideoagent_run_dir(run_id, args.output_root), "iter_0")
+    if not common["initial_baseline_bundle"] and not os.path.isfile(os.path.join(initialization_dir, "initialization", "plan.json")):
         plan_report = run_initial_combo(SimpleNamespace(**common, stage="plan"))
         common["initial_baseline_bundle"] = plan_report.get("initial_baseline_bundle_path", "")
         common["combo_plan"] = plan_report.get("combo_plan_path", common["combo_plan"])
@@ -1069,9 +745,16 @@ def _diagnose(args: argparse.Namespace, reference_report: Dict,
             candidate,
         )
     previous_diagnosis = _read_json(getattr(args, "previous_diagnosis", ""))
-    diagnosis_model = _configure_inprocess_diagnosis_model(args)
-    diagnosis_attempt = max(1, int(getattr(args, "_diagnosis_attempt", 1) or 1))
-    prior_brief_feedback = list(getattr(args, "_brief_validation_feedback", []) or [])
+    iter_context = dict(iter_context or {})
+    reference_context = iter_context.get("reference") or {}
+    reference_bundle = (_initial_bundle_path_from_report(reference_report)
+                        or (reference_context.get("initial_baseline_bundle") or {}).get("path", ""))
+    if reference_bundle:
+        iter_context["working_materials"] = {
+            **(iter_context.get("working_materials") or {}),
+            "current_agent": reference_bundle,
+        }
+    diagnosis_model = diagnosis_agent_module.DIAGNOSIS_MODEL
     agent = DiagnosisAgent(
         args.workspace,
         evolution_memory="",
@@ -1084,13 +767,17 @@ def _diagnose(args: argparse.Namespace, reference_report: Dict,
         evolution_review_path=review_path or None,
         iter_context=iter_context,
         iter_context_path=(iter_context or {}).get("path", ""),
-        brief_validation_feedback=prior_brief_feedback,
-        diagnosis_attempt=diagnosis_attempt,
     )
     report = agent.run()
     report = _refresh_diagnosis_probe_context(report)
     report = inject_iter_context(report, iter_context or {})
     report["evolution_review_path"] = os.path.abspath(review_path) if review_path else ""
+    report["reference_report_path"] = str(
+        reference_report.get("report_path") or (reference_context.get("report") or {}).get("path") or ""
+    )
+    report["reference_bundle_path"] = reference_bundle
+    report["reference_combo"] = reference_report.get("combo") or reference_report.get("agent_combo") or reference_context.get("combo") or {}
+    report["distribution_manifest"] = args.distribution_manifest
     report["previous_diagnosis_path"] = os.path.abspath(
         getattr(args, "previous_diagnosis", "")
     ) if getattr(args, "previous_diagnosis", "") else ""
@@ -1104,9 +791,8 @@ def _diagnose(args: argparse.Namespace, reference_report: Dict,
         ) if getattr(args, "full_eval_report", "") else "",
         "previous_candidate_artifact": os.path.abspath(candidate_path) if candidate_path else "",
         "iter_context_path": (iter_context or {}).get("path", ""),
-        "exec_llm_model": diagnosis_model,
-        "diagnosis_attempt": diagnosis_attempt,
-        "prior_brief_validation_feedback": prior_brief_feedback,
+        "diagnosis_model": diagnosis_model,
+        "diagnosis_attempt": report.get("diagnosis_attempt", 1),
     }
     # A current-best reference is a hard execution baseline.  Normalize the
     # LLM report before it becomes a Codex input so the accepted current best
@@ -1125,7 +811,7 @@ def _diagnose(args: argparse.Namespace, reference_report: Dict,
         })
         report["evolution_decision"] = decision
         algo = report.get("algorithmic_evolution") or {}
-        algo["evolution_hint"] = (
+        algo["evolution_hint"] = algo.get("evolution_hint") or (
             "Preserve the accepted current-best bundle as the base. The module-set brief "
             "sets direction only; Codex may keep one target or adapt related modules inside the five-module bundle."
         )
@@ -1137,30 +823,8 @@ def _diagnose(args: argparse.Namespace, reference_report: Dict,
     execution_artifacts = write_bundle_execution_brief(
         report,
         diagnosis_path=report_path,
-        review=_read_json(review_path) if review_path else {},
         review_path=review_path,
     )
-    execution_brief_path = str(execution_artifacts.get("execution_brief_path") or "")
-    execution_brief = _read_json(execution_brief_path)
-    brief_issues = validate_bundle_execution_brief(execution_brief)
-    if brief_issues:
-        failure = {
-            "attempt": diagnosis_attempt,
-            "issues": list(brief_issues),
-            "execution_brief_path": execution_brief_path,
-            "action": "retry_evolution_llm_diagnosis" if diagnosis_attempt < DIAGNOSIS_BRIEF_MAX_ATTEMPTS else "fail_closed",
-        }
-        report["brief_compilation_failure"] = failure
-        _write_json(report_path, report)
-        if diagnosis_attempt < DIAGNOSIS_BRIEF_MAX_ATTEMPTS:
-            retry_args = copy.copy(args)
-            retry_args._diagnosis_attempt = diagnosis_attempt + 1
-            retry_args._brief_validation_feedback = list(brief_issues)
-            return _diagnose(retry_args, reference_report, profile, iter_context=iter_context)
-        raise RuntimeError(
-            "diagnosis did not produce a valid adaptive bundle execution brief after "
-            f"{diagnosis_attempt} evolution LLM attempts: " + "; ".join(brief_issues)
-        )
     report.update(execution_artifacts)
     _write_json(report_path, report)
     return report
@@ -1199,43 +863,40 @@ def _run_command(cmd: List[str], cwd: str, env: Dict[str, str],
     return subprocess.run(cmd, cwd=cwd, env=env, check=False).returncode
 
 
-def _latest_candidate_run(codex_root: str, started_at: float = 0) -> str:
-    root = os.path.join(codex_root, "codex_candidates")
-    if not os.path.isdir(root):
-        return ""
-    candidates = []
-    for name in os.listdir(root):
-        path = os.path.join(root, name)
-        artifact_path = os.path.join(path, "candidate_bundle.json")
-        # A Codex attempt creates its run directory before it can guarantee a
-        # serializable bundle.  Codegen/extraction failures therefore leave a
-        # perfectly legitimate directory without this artifact.  It is not a
-        # candidate and must not turn discovery of the *next* candidate into a
-        # FileNotFoundError.
-        if not os.path.isdir(path) or not os.path.isfile(artifact_path):
-            continue
-        mtime = os.path.getmtime(artifact_path)
-        if started_at and mtime + 1 < started_at:
-            continue
-        candidates.append((mtime, path))
-    if not candidates:
-        return ""
-    candidates.sort(reverse=True)
-    return candidates[0][1]
-
-
 def _candidate_artifact_path(candidate_run: str) -> str:
     """Return the only formal candidate artifact: a complete bundle."""
     path = os.path.join(candidate_run, "candidate_bundle.json")
     return path if os.path.isfile(path) else ""
 
 
-
 def _run_codex_subprocess(args: argparse.Namespace, diagnosis_path: str,
                           reference_report_path: str, round_dir: str,
-                          machine_evaluation_contract_path: str = "",
-                          iter_context_path: str = "") -> Dict:
-    codex_root = os.path.join(round_dir, "codex")
+                          machine_evaluation_contract_path: str = "") -> Dict:
+    if args.check_only:
+        round_dir = getattr(args, "_iteration_dir", "") or os.path.join(
+            os.path.dirname(round_dir), "checks", os.path.basename(round_dir))
+    iteration = IterationWorkspace(round_dir)
+    saved = (iteration.progress().get("stages") or {}).get("codegen") or {}
+    requested_restart = getattr(args, "restart_from", "")
+    args.restart_from = ""
+    repair_requested = bool(getattr(args, "probe_failed_run", "") or getattr(args, "engineering_failed_run", ""))
+    resume_stage = requested_restart if not repair_requested else ""
+    resume_bundle = ""
+    if not repair_requested and saved.get("status") == "complete" and saved.get("result"):
+        previous = os.path.dirname(saved["result"])
+        gate = _probe_gate_from_candidate_run(previous)
+        prior_validation = _read_json(os.path.join(previous, "validation.json"))
+        if resume_stage not in {"smoke", "probe"} and gate.get("action") == "probe_missing":
+            resume_stage = "probe" if (prior_validation.get("bundle_smoke") or {}).get("passed") else "smoke"
+        if resume_stage not in {"smoke", "probe"} and gate.get("action") == "execution_layer_rerun":
+            resume_stage = "probe" if gate.get("origin_stage") == "probe" else "smoke"
+        if resume_stage in {"smoke", "probe"}:
+            resume_bundle = os.path.join(previous, "candidate_bundle.json")
+    if (saved.get("status") == "complete" and saved.get("result")
+            and not resume_bundle and not repair_requested):
+        return {"exit_code": 0, "candidate_run": os.path.dirname(saved["result"]),
+                "iteration_dir": str(iteration.root), "authoring_engine": "codex", "resumed": True}
+    candidate_run = str(iteration.reserve("codegen"))
     probe_first_n = _probe_question_limit(args)
     reference_report = _read_json(reference_report_path) if reference_report_path else {}
     reference_results_path = _reference_results_path_from_report(reference_report)
@@ -1250,12 +911,11 @@ def _run_codex_subprocess(args: argparse.Namespace, diagnosis_path: str,
         "--distribution-manifest", args.distribution_manifest,
         "--reference-report", reference_report_path,
         "--reference-label", args.reference_label,
-        "--output-root", codex_root,
+        "--iteration-dir", str(iteration.root),
+        "--candidate-dir", candidate_run,
         "--first_n", str(probe_first_n),
         "--concurrency", str(args.concurrency),
         "--repair-attempts", str(args.repair_attempts),
-        "--probe-repair-attempts", str(args.probe_repair_attempts),
-        "--candidate-rounds", str(args.candidate_rounds),
         "--codex-model", args.codex_runtime_settings["model"],
         "--codex-reasoning-effort", args.codex_runtime_settings["reasoning_effort"],
     ]
@@ -1263,26 +923,12 @@ def _run_codex_subprocess(args: argparse.Namespace, diagnosis_path: str,
         cmd.extend(["--reference-results", os.path.abspath(reference_results_path)])
     if machine_evaluation_contract_path:
         cmd.extend(["--machine-evaluation-contract", machine_evaluation_contract_path])
-    if args.probe_feedback_rounds is not None:
-        cmd.extend(["--probe-feedback-rounds", str(args.probe_feedback_rounds)])
-    if args.profile:
-        cmd.extend(["--distribution-profile", args.profile])
-    if iter_context_path:
-        cmd.extend(["--iter-context", iter_context_path])
+    if resume_bundle:
+        cmd.extend(["--resume-stage", resume_stage, "--resume-bundle", resume_bundle])
     if getattr(args, "probe_failed_run", ""):
         cmd.extend(["--probe-failed-run", args.probe_failed_run])
-        cmd.extend(["--probe-feedback-round", str(args.probe_feedback_round)])
     if getattr(args, "engineering_failed_run", ""):
         cmd.extend(["--engineering-failed-run", args.engineering_failed_run])
-    if getattr(args, "candidate_rejection_run", ""):
-        cmd.extend(["--candidate-rejection-run", args.candidate_rejection_run])
-    if getattr(args, "candidate_rejection_context", ""):
-        cmd.extend(["--candidate-rejection-context", args.candidate_rejection_context])
-    if getattr(args, "write_candidate_rejection_context", ""):
-        cmd.extend([
-            "--write-candidate-rejection-context",
-            args.write_candidate_rejection_context,
-        ])
     if getattr(args, "skip_probe_verification", False):
         cmd.append("--skip_probe_verification")
     if getattr(args, "codex_cli", ""):
@@ -1295,22 +941,20 @@ def _run_codex_subprocess(args: argparse.Namespace, diagnosis_path: str,
         return {
             "exit_code": 0,
             "cmd": cmd,
-            "codex_root": codex_root,
-            "candidate_run": os.path.join(codex_root, "codex_candidates", "<candidate_run>"),
+            "iteration_dir": str(iteration.root),
+            "candidate_run": candidate_run,
             "authoring_engine": "codex",
         }
-    started_at = time.time()
-    stdout_path = os.path.join(round_dir, "codex_stdout.txt")
-    stderr_path = os.path.join(round_dir, "codex_stderr.txt")
+    stdout_path = os.path.join(candidate_run, "stdout.txt")
+    stderr_path = os.path.join(candidate_run, "stderr.txt")
     exit_code = _run_command(
         cmd, cwd=PROJECT_ROOT, env=_subprocess_env(args),
         stdout_path=stdout_path, stderr_path=stderr_path,
     )
-    candidate_run = _latest_candidate_run(codex_root, started_at=started_at)
     return {
         "exit_code": exit_code,
         "cmd": cmd,
-        "codex_root": codex_root,
+        "iteration_dir": str(iteration.root),
         "candidate_run": candidate_run,
         "stdout_path": stdout_path,
         "stderr_path": stderr_path,
@@ -1320,8 +964,7 @@ def _run_codex_subprocess(args: argparse.Namespace, diagnosis_path: str,
 
 def _run_bundle_feedback_loop(args: argparse.Namespace, *, initial_codex: Dict,
                               diagnosis_path: str, reference_report_path: str,
-                              round_dir: str, machine_evaluation_contract_path: str,
-                              iter_context_path: str = "") -> Dict:
+                              round_dir: str, machine_evaluation_contract_path: str) -> Dict:
     """Continue one bundle through bounded same-direction Codex feedback.
 
     Bundle smoke repair is already internal to ``codex_evolve``.  This outer
@@ -1334,7 +977,6 @@ def _run_bundle_feedback_loop(args: argparse.Namespace, *, initial_codex: Dict,
     limit = max(0, int(getattr(args, "probe_repair_attempts", 0) or 0))
     saved_probe = getattr(args, "probe_failed_run", "")
     saved_engineering = getattr(args, "engineering_failed_run", "")
-    saved_round = getattr(args, "probe_feedback_round", 1)
     try:
         for index in range(1, limit + 1):
             candidate_run = str(current.get("candidate_run") or "")
@@ -1344,18 +986,17 @@ def _run_bundle_feedback_loop(args: argparse.Namespace, *, initial_codex: Dict,
             action = str(gate.get("action") or "")
             if action not in {"codex_engineering_repair", "codex_same_direction_behavior_iteration"}:
                 break
+            if int(_read_json(os.path.join(candidate_run, "run_record.json")).get("feedback_round") or 0) >= limit:
+                break
             args.probe_failed_run = ""
             args.engineering_failed_run = ""
-            if action == "codex_engineering_repair":
+            if action == "codex_engineering_repair" and gate.get("origin_stage") != "probe":
                 args.engineering_failed_run = candidate_run
             else:
                 args.probe_failed_run = candidate_run
-                args.probe_feedback_round = index
-            child_dir = os.path.join(round_dir, "bundle_feedback", f"attempt_{index}")
             child = _run_codex_subprocess(
-                args, diagnosis_path, reference_report_path, child_dir,
+                args, diagnosis_path, reference_report_path, round_dir,
                 machine_evaluation_contract_path=machine_evaluation_contract_path,
-                iter_context_path=iter_context_path,
             )
             attempts.append({
                 "round": index,
@@ -1368,98 +1009,43 @@ def _run_bundle_feedback_loop(args: argparse.Namespace, *, initial_codex: Dict,
     finally:
         args.probe_failed_run = saved_probe
         args.engineering_failed_run = saved_engineering
-        args.probe_feedback_round = saved_round
     current["bundle_feedback_attempts"] = attempts
     current["bundle_feedback_limit"] = limit
     return current
-
-
-def _resolve_candidate_rejection_context(args: argparse.Namespace, run_id: str) -> str:
-    """Materialize candidate rejection context for diagnosis/iteration prompts."""
-    if getattr(args, "candidate_rejection_context", ""):
-        context_path = os.path.abspath(args.candidate_rejection_context)
-        if not _rejection_context_allows_rediagnosis(context_path):
-            raise RuntimeError(
-                "--candidate-rejection-context identifies an implementation or "
-                "dataflow contract failure. Use --probe-failed-run for same-direction "
-                "Codex repair instead of entering diagnosis."
-            )
-        return context_path
-    rejection_run = getattr(args, "candidate_rejection_run", "")
-    if not rejection_run:
-        # Explicit stage transitions should have the same evidence flow as the
-        # auto-loop.  Reuse the newest run-scoped rejected probe context rather
-        # than requiring a caller to re-enter its path explicitly.
-        memory = load_evolution_memory(run_id, args.output_root)
-        for record in reversed(memory.get("records", []) or []):
-            outcome = record.get("outcome", {}) if isinstance(record, dict) else {}
-            if outcome.get("status") != "probe_rejected":
-                continue
-            artifacts = record.get("artifacts", {}) if isinstance(record, dict) else {}
-            context = artifacts.get("candidate_rejection_context", {}) if isinstance(artifacts, dict) else {}
-            context_path = context if isinstance(context, str) else context.get("path", "")
-            if (
-                context_path
-                and os.path.exists(context_path)
-                and _rejection_context_allows_rediagnosis(context_path)
-            ):
-                return os.path.abspath(context_path)
-        return ""
-    output_path = getattr(args, "write_candidate_rejection_context", "") or os.path.join(
-        metavideoagent_run_dir(run_id, args.output_root),
-        "candidate_rejection_context.json",
-    )
-    try:
-        from codex_evolve import write_candidate_rejection_context  # noqa: WPS433
-
-        context_path = write_candidate_rejection_context(rejection_run, output_path)
-        context = _read_json(context_path)
-        decision = context.get("decision", {}) if isinstance(context, dict) else {}
-        next_action = decision.get("probe_next_action", {}) or {}
-        if (
-            decision.get("candidate_should_enter_full_eval")
-            or next_action.get("action") == "full_eval_candidate"
-        ):
-            raise RuntimeError(
-                "--candidate-rejection-run points to a probe result that should "
-                "enter full evaluation, not round-level rediagnosis. Run full_eval "
-                "or pass a genuinely rejected/no-gain probe candidate."
-            )
-        if next_action.get("action") == "execution_layer_rerun":
-            raise RuntimeError(
-                "--candidate-rejection-run points to a provider/asset execution failure. "
-                "Repair the execution environment and rerun the same candidate; do not create diagnosis input."
-            )
-        if next_action.get("action") != "round_level_rediagnosis":
-            raise RuntimeError(
-                "--candidate-rejection-run identifies an implementation or dataflow "
-                "contract failure. Use --probe-failed-run for same-direction Codex repair."
-            )
-        return context_path
-    except Exception as exc:
-        if "should enter full evaluation" in str(exc):
-            raise
-        if getattr(args, "check_only", False):
-            return os.path.abspath(output_path)
-        raise RuntimeError(
-            f"Failed to build candidate rejection context from {rejection_run}: {exc}"
-        ) from exc
 
 
 def _run_full_eval_subprocess(args: argparse.Namespace,
                               reference_report_path: str) -> int:
     if not args.candidate_run:
         raise RuntimeError("--candidate-run is required for --stage full_eval")
+    candidate_record = _read_json(os.path.join(args.candidate_run, "run_record.json"))
+    iteration_dir = candidate_record["iteration_dir"]
+    if args.check_only:
+        iteration_dir = getattr(args, "_iteration_dir", "") or os.path.join(
+            os.path.dirname(iteration_dir), "checks", os.path.basename(iteration_dir))
+    iteration = IterationWorkspace(iteration_dir)
+    saved = (iteration.progress().get("stages") or {}).get("full_eval") or {}
+    receipt = _read_json(os.path.join(args.candidate_run, "full_eval_result.json"))
+    same_evaluation = bool(saved.get("result") and receipt.get("report_path") == saved["result"])
+    evaluated = _read_json(saved["result"]) if same_evaluation else {}
+    if full_evaluation_is_valid(evaluated) and evaluated.get("post_full_eval_decision"):
+        iteration.record("full_eval", saved["result"], status="complete")
+        return 0
+    evaluation_dir = str(iteration.reserve("full_eval"))
+    report_path = os.path.join(evaluation_dir, "full_eval_report.json")
+    if not args.check_only:
+        _write_json(os.path.join(args.candidate_run, "full_eval_result.json"), {"report_path": report_path})
+    iteration.record("full_eval", report_path, status="running")
     cmd = [
         METAVIDEOAGENT_PYTHON,
         os.path.join(EVOLUTION_DIR, "full_eval_runner.py"),
         "--workspace", args.workspace,
         "--candidate-run", args.candidate_run,
+        "--evaluation-dir", evaluation_dir,
         "--distribution-manifest", args.distribution_manifest,
         "--reference-report", reference_report_path,
         "--reference-label", args.reference_label,
         "--concurrency", str(args.concurrency),
-        "--llm-model", args.exec_llm_model,
         "--structure-workers", str(args.structure_workers),
         "--metavideoagent-run-id", args.run_id,
         "--metavideoagent-output-root", args.output_root,
@@ -1478,8 +1064,8 @@ def _run_full_eval_subprocess(args: argparse.Namespace,
             "other rounds must reuse the current-best structure artifact."
         )
     reference_bundle = (
-        args.initial_baseline_bundle
-        or _initial_bundle_path_from_report(_read_json(reference_report_path))
+        _initial_bundle_path_from_report(_read_json(reference_report_path))
+        or args.initial_baseline_bundle
     )
     if reference_bundle:
         cmd.extend(["--reference-bundle", reference_bundle])
@@ -1499,7 +1085,15 @@ def _run_full_eval_subprocess(args: argparse.Namespace,
     print(" ".join(cmd))
     if args.check_only:
         cmd.append("--check-only")
-    return subprocess.run(cmd, cwd=PROJECT_ROOT, check=False, env=_subprocess_env(args)).returncode
+    exit_code = subprocess.run(cmd, cwd=PROJECT_ROOT, check=False, env=_subprocess_env(args)).returncode
+    evaluated = _read_json(report_path)
+    complete = bool(full_evaluation_is_valid(evaluated) and evaluated.get("post_full_eval_decision"))
+    iteration.record("full_eval", report_path,
+                     status="complete" if exit_code == 0 and complete else "pending",
+                     next_task={} if exit_code == 0 and complete else {
+                         "stage": "full_eval", "task": "Resolve the recorded failure and rerun full evaluation for this candidate.",
+                     })
+    return exit_code if args.check_only or exit_code else (0 if complete else 1)
 
 
 def _run_review_subprocess(args: argparse.Namespace,
@@ -1514,12 +1108,31 @@ def _run_review_subprocess(args: argparse.Namespace,
         or (
             reference_report.get("validation_scope") == "initial_reference_multi_video"
             and not reference_report.get("candidate_bundle")
-            and not getattr(args, "full_eval_report", "")
+            and not _read_json(getattr(args, "full_eval_report", "")).get("candidate_bundle")
         )
     )
+    iteration = IterationWorkspace(args._iteration_dir) if getattr(args, "_iteration_dir", "") else None
+    stage = "teacher" if initial_reference_review else "review"
+    if iteration and not args.check_only:
+        saved = (iteration.progress().get("stages") or {}).get(stage) or {}
+        if saved.get("status") == "complete" and review_is_consumable(_read_json(saved["result"])):
+            args.review_out_dir = os.path.dirname(saved["result"])
+            return 0
+        args.review_out_dir = str(iteration.reserve(stage))
+
+    def execute_review(cmd: list[str]) -> int:
+        code = subprocess.run(cmd, cwd=PROJECT_ROOT, check=False, env=_subprocess_env(args)).returncode
+        if iteration:
+            path = _find_review_path(args.review_out_dir)
+            passed = code == 0 and bool(path) and review_is_consumable(_read_json(path))
+            iteration.record(stage, path or os.path.join(args.review_out_dir, "teacher_evolution_review.json"),
+                             status="complete" if passed else "pending",
+                             next_task={} if passed else {"stage": stage, "task": "Complete the trajectory review."})
+        return code
+
     if initial_reference_review:
         results_path = _reference_results_path_from_report(reference_report)
-        report_path = args.initial_report or reference_report.get("report_path", "")
+        report_path = reference_report.get("report_path", "") or args.initial_report or args.full_eval_report
         if not results_path or not report_path:
             raise RuntimeError(
                 "initial-reference review requires an executed reference report with results_path; "
@@ -1534,7 +1147,7 @@ def _run_review_subprocess(args: argparse.Namespace,
             "--verification-report", report_path,
             "--distribution-manifest", args.distribution_manifest,
             "--reference-results", results_path,
-            "--reference-label", "initial_existing_agent",
+            "--reference-label", "initial_agent",
             "--concurrency", str(args.concurrency),
             "--initial-reference-review",
         ]
@@ -1546,7 +1159,7 @@ def _run_review_subprocess(args: argparse.Namespace,
         print(" ".join(cmd))
         if args.check_only:
             return 0
-        return subprocess.run(cmd, cwd=PROJECT_ROOT, check=False, env=_subprocess_env(args)).returncode
+        return execute_review(cmd)
     results_path = args.full_eval_results or reference_report.get("results_path", "")
     report_path = args.full_eval_report or reference_report.get("report_path", "")
     verification_report = _read_json(report_path)
@@ -1592,7 +1205,7 @@ def _run_review_subprocess(args: argparse.Namespace,
     print(" ".join(cmd))
     if args.check_only:
         return 0
-    return subprocess.run(cmd, cwd=PROJECT_ROOT, check=False, env=_subprocess_env(args)).returncode
+    return execute_review(cmd)
 
 
 def _read_candidate(candidate_run: str) -> Dict:
@@ -1605,184 +1218,17 @@ def _read_candidate(candidate_run: str) -> Dict:
     return {
         "name": "MetaVideoAgent bundle",
         "changed_modules": candidate.get("changed_modules") or [],
-        "bundle_fingerprint": candidate.get("bundle_fingerprint", ""),
         "candidate_bundle_path": path,
     }
 
 
 def _find_full_eval_report(candidate_run: str) -> str:
-    candidates = [
-        os.path.join(candidate_run, "full_eval_report.json"),
-        os.path.join(candidate_run, "full_eval_report_retry.json"),
-    ]
-    import glob
-    candidates.extend(glob.glob(os.path.join(candidate_run, "full_eval*_report.json")))
-    candidates = [path for path in dict.fromkeys(candidates) if os.path.exists(path)]
-    if not candidates:
-        return ""
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    return candidates[0]
+    path = _read_json(os.path.join(candidate_run, "full_eval_result.json")).get("report_path", "")
+    return path if path and os.path.isfile(path) else ""
 
 
-def _find_eval_audit_path(full_report_path: str, full_report: Dict = None) -> str:
-    full_report = full_report or _read_json(full_report_path)
-    path = (
-        full_report.get("evaluation_audit_path", "")
-        or ((full_report.get("evaluation_audit") or {}).get("path", ""))
-    )
-    if path and os.path.exists(path):
-        return path
-    candidate = os.path.join(
-        os.path.dirname(os.path.abspath(full_report_path)),
-        "evaluation_audit.json",
-    )
-    return candidate if os.path.exists(candidate) else ""
 
 
-def _run_post_decision_stage(args: argparse.Namespace,
-                             run_id: str = "",
-                             full_report_path: str = "") -> Dict:
-    full_report_path = full_report_path or args.full_eval_report
-    if not full_report_path and args.candidate_run:
-        full_report_path = _find_full_eval_report(args.candidate_run)
-    if not full_report_path:
-        raise RuntimeError("--full-eval-report or --candidate-run is required for post_decision")
-    full_report = _read_json(full_report_path)
-    # Persist the same deterministic objective policy that diagnosis/brief use,
-    # so the executable current-best decision cannot silently revert to a
-    # cost-sensitive default.
-    from evolution_phase_policy import for_iteration
-    phase_index = int(getattr(args, "iteration_index", 0) or 0)
-    full_report.setdefault("evolution_phase_policy", for_iteration(phase_index))
-    decision_dir = (
-        os.path.join(
-            metavideoagent_run_dir(run_id or args.run_id, args.output_root),
-            "checks",
-            f"iter_{int(getattr(args, 'iteration_index', 0) or 0) or 1}",
-            "post_decision",
-        )
-        if args.check_only
-        else
-        os.path.dirname(os.path.abspath(full_report_path))
-    )
-    audit_path = _find_eval_audit_path(full_report_path, full_report)
-    if not audit_path:
-        audit_path = os.path.join(decision_dir, "evaluation_audit.json")
-        audit = build_full_eval_audit(
-            full_report,
-            read_jsonl(full_report.get("results_path", "")),
-            read_jsonl(full_report.get("reference_source", "")),
-            full_report.get("sandbox_dir", ""),
-        )
-        write_audit_files(
-            audit,
-            audit_path,
-            os.path.join(os.path.dirname(audit_path), "evaluation_audit_summary.md"),
-        )
-    else:
-        audit = _read_json(audit_path)
-    if full_report.get("evaluation_complete", True) is not True:
-        raise RuntimeError(
-            "post_decision requires a completed full eval; rerun the same candidate instead"
-        )
-    ledger_path = os.path.join(
-        metavideoagent_run_dir(run_id or args.run_id, args.output_root),
-        "current_best_ledger.json",
-    )
-    decision = decide_post_full_eval(
-        full_report,
-        audit,
-        _read_json(ledger_path),
-        call_llm=(not args.skip_post_eval_decision and not args.check_only),
-    )
-    out_path = os.path.join(
-        decision_dir,
-        "post_full_eval_decision.json",
-    )
-    _write_json(out_path, decision)
-    can_update_best = current_best_update_allowed(full_report, decision)
-    if not args.check_only:
-        full_report["evaluation_audit_path"] = audit_path
-        full_report["post_full_eval_decision_path"] = out_path
-        full_report["evaluation_audit"] = {
-            "path": audit_path,
-            "summary_path": os.path.join(os.path.dirname(audit_path), "evaluation_audit_summary.md"),
-            "cost_ratio_vs_reference": audit.get("cost_ratio_vs_reference"),
-            "recommended_next_focus": (
-                audit.get("decision_guidance", {}) or {}
-            ).get("recommended_next_focus", ""),
-            "issue_summary": audit.get("issue_summary", []),
-        }
-        if can_update_best:
-            bundle_source = (
-                full_report.get("current_best_bundle_path", "")
-                or full_report.get("candidate_full_eval_bundle_path", "")
-                or (full_report.get("combo_policy", {}) or {}).get("effective_bundle_path", "")
-            )
-            if not bundle_source or not os.path.isfile(bundle_source):
-                raise RuntimeError(
-                    "accepted current-best candidate is missing its complete effective bundle: "
-                    f"{bundle_source}"
-                )
-            current_best_bundle = os.path.join(
-                os.path.dirname(os.path.abspath(full_report_path)),
-                "current_best_bundle.json",
-            )
-            if os.path.abspath(bundle_source) != os.path.abspath(current_best_bundle):
-                shutil.copy2(bundle_source, current_best_bundle)
-            full_report["current_best_bundle_path"] = current_best_bundle
-            full_report.setdefault("combo_policy", {})["current_best_bundle_path"] = current_best_bundle
-        full_report["post_full_eval_decision"] = decision
-        _write_json(full_report_path, full_report)
-    if (not args.check_only) and full_report.get("evaluation_complete", True) is True:
-        should_update_best = can_update_best
-        record_reference(
-            run_id or args.run_id,
-            "current_best" if should_update_best else "candidate_full_eval",
-            full_report.get("report_path", full_report_path),
-            full_report.get("results_path", ""),
-            combo=full_report.get("combo", {}),
-            metrics={
-                "total_questions": full_report.get("total_questions"),
-                "correct": full_report.get("candidate_correct"),
-                "accuracy_delta": full_report.get("accuracy_delta", full_report.get("accuracy_delta_vs_reference")),
-                "corrections": len(full_report.get("corrections", []) or []),
-                "regressions": len(full_report.get("regressions", []) or []),
-                "cost_ratio_vs_reference": audit.get("cost_ratio_vs_reference"),
-                "api_cost_per_question": (
-                    (audit.get("candidate_cost", {}) or {}).get("per_question_avg", {})
-                ),
-            },
-            output_root=args.output_root,
-            manifest_path=args.distribution_manifest,
-            split=full_report.get("question_split", EVOLUTION_SPLIT),
-            dataset_version=full_report.get("dataset_version", ""),
-            update_current_best=should_update_best,
-            decision=decision,
-            decision_path=out_path,
-            bundle_path=(
-                full_report.get("current_best_bundle_path", "")
-                or full_report.get("candidate_full_eval_bundle_path", "")
-                or (full_report.get("combo_policy", {}) or {}).get("effective_bundle_path", "")
-            ),
-            candidate_bundle_path=full_report.get("candidate_bundle", ""),
-            module_artifacts=full_report.get("module_artifacts", {}),
-            structure_artifact=full_report.get("structure_artifact", {}),
-            selection_split=(full_report.get("current_best_selection") or {}).get("this_eval_split", ""),
-            train_diagnostic_report_path=(
-                (full_report.get("current_best_selection") or {}).get("train_diagnostic_report_path", "")
-            ),
-            train_diagnostic_results_path=(
-                (full_report.get("current_best_selection") or {}).get("train_diagnostic_results_path", "")
-            ),
-        )
-    return {
-        "decision_path": out_path,
-        "decision": decision,
-        "full_eval_report": full_report_path,
-        "evaluation_audit": audit_path,
-        "current_best_ledger": ledger_path,
-    }
 
 
 def _find_review_path(review_dir: str) -> str:
@@ -1827,7 +1273,6 @@ def _annotate_and_record_candidate_history(
             "iteration": iteration,
             "candidate_run": os.path.abspath(candidate_run) if candidate_run else "",
             "candidate_combo_id": full_report.get("combo_id", ""),
-            "candidate_bundle_fingerprint": candidate.get("bundle_fingerprint", ""),
             "target_modules": list(candidate.get("changed_modules") or []),
             "parent_reference_report": os.path.abspath(parent_report_path) if parent_report_path else "",
             "parent_reference_combo_id": parent_report.get("combo_id", ""),
@@ -1855,111 +1300,30 @@ def _annotate_and_record_candidate_history(
 
 
 def _probe_gate_from_candidate_run(candidate_run: str) -> Dict:
-    """Read the Codex probe decision for a candidate run.
-
-    `codex_evolve.py` writes the behavioral gate into validation.json.  The
-    autonomous MetaVideoAgent loop must honor that gate before spending full-eval
-    cost: probe net-positive candidates advance, while every other runnable
-    candidate returns to bounded same-direction Codex feedback. A new diagnosis
-    is only for an exhausted mechanism budget or an explicitly unclassifiable
-    audit, never the default no-gain route.
-    """
-    if not candidate_run:
-        return {"action": "", "reason": "missing candidate_run"}
+    """Read the recorded engineering or behavioral decision for a candidate."""
     validation = _read_json(os.path.join(candidate_run, "validation.json"))
-    if not validation:
-        return {"action": "", "reason": "missing validation.json"}
-    # Bundle assembly and runtime-smoke failures deliberately keep the gate
-    # inside ``assembly_validation``: no probe has happened yet, so presenting
-    # it as a top-level behavioral result would be misleading.  The staged
-    # launcher nevertheless has to honor that engineering gate before it
-    # considers previous/probe fallbacks.  Read both layouts so an incomplete
-    # bundle resumes with --engineering-failed-run rather than being sent to
-    # the supervised --probe-failed-run path (which correctly requires probe
-    # artifacts that a smoke failure cannot have produced).
+    probe_paths = candidate_stage_paths(candidate_run, "probe")
     assembly = validation.get("assembly_validation") or {}
-    action = validation.get("probe_next_action") or (
-        assembly.get("probe_next_action") if isinstance(assembly, dict) else {}
-    ) or {}
+    action = validation.get("probe_next_action") or assembly.get("probe_next_action")
     if action:
-        return _reclassify_probe_gate_from_artifacts(candidate_run, action)
+        origin = "probe" if (
+            validation.get("probe_verification")
+            or os.path.isfile(probe_paths.get("result", ""))
+        ) else "smoke"
+        return {**action, "origin_stage": origin}
     if validation.get("probe_skipped"):
-        return _reclassify_probe_gate_from_artifacts(candidate_run, {
-            "action": "full_eval_candidate",
-            "reason": "probe verification was explicitly skipped after smoke",
-            "requires_full_eval": True,
-        })
-    sandbox = validation.get("sandbox") or {}
-    status = sandbox.get("probe_status", "")
-    if status == "promising":
-        return _reclassify_probe_gate_from_artifacts(candidate_run, {
-            "action": "full_eval_candidate",
-            "reason": "previous promising probe status",
-            "requires_full_eval": True,
-        })
-    if status in ("invalid", "unsafe"):
-        return _reclassify_probe_gate_from_artifacts(candidate_run, {
-            "action": "codex_engineering_repair",
-            "reason": f"previous probe status={status}",
-            "codex_feedback_allowed": True,
-        })
-    return _reclassify_probe_gate_from_artifacts(candidate_run, {
-        "action": "codex_same_direction_behavior_iteration",
-        "reason": f"previous runnable probe needs same-direction feedback; probe_status={status or 'unknown'}",
-        "codex_feedback_allowed": True,
-    })
+        return {"action": "probe_skipped", "reason": "Smoke completed; probe was not requested."}
+    verification = validation.get("probe_verification") or _read_json(
+        probe_paths.get("result", ""),
+    )
+    if verification:
+        from codex_evolve import classify_probe_next_action
+        audit = _read_json(probe_paths.get("audit", ""))
+        return {**classify_probe_next_action(verification, audit), "origin_stage": "probe"}
+    return {"action": "probe_missing", "reason": "The candidate has no recorded probe decision."}
 
 
-def _reclassify_probe_gate_from_artifacts(candidate_run: str,
-                                          stored_action: Dict) -> Dict:
-    """Upgrade stale gates when probe artifacts reveal a contract failure.
-
-    Older candidate directories may carry `round_level_rediagnosis` from a
-    weaker routing policy.  The persisted audit is authoritative for the
-    behavior actually observed, so reclassify stale diagnosis gates and leave
-    a full-eval or already-feedback gate untouched.
-    """
-    stored_action = dict(stored_action or {})
-    if stored_action.get("action") not in ("", "round_level_rediagnosis"):
-        return stored_action
-    verification = _read_json(os.path.join(candidate_run, "probe_verification.json"))
-    audit = _read_json(os.path.join(candidate_run, "probe_audit.json"))
-    if not verification and not audit:
-        return stored_action
-    try:
-        from codex_evolve import classify_probe_next_action  # noqa: WPS433
-
-        current_action = classify_probe_next_action(verification, audit)
-    except Exception:
-        return stored_action
-    if current_action.get("action") not in {
-        "codex_engineering_repair",
-        "codex_same_direction_behavior_iteration",
-    }:
-        return stored_action
-    return {
-        **current_action,
-        "reclassified_from": stored_action,
-        "reason": (
-            "stored probe gate was reclassified from round-level diagnosis using "
-            "the persisted probe audit and current same-direction feedback policy"
-        ),
-    }
-
-
-def _rejection_context_allows_rediagnosis(context_path: str) -> bool:
-    """Return whether a persisted rejection context is behavioral, not repairable."""
-    context = _read_json(context_path)
-    source_run = str((context or {}).get("source_probe_run") or "")
-    if not source_run or not os.path.isdir(source_run):
-        # Previous/missing artifacts cannot be reclassified. Preserve the old
-        # behavior rather than silently discarding the caller's explicit input.
-        return True
-    return _probe_gate_from_candidate_run(source_run).get("action") == "round_level_rediagnosis"
-
-
-def _write_candidate_rejection_context_from_run(args: argparse.Namespace,
-                                                candidate_run: str,
+def _write_candidate_rejection_context_from_run(candidate_run: str,
                                                 output_path: str) -> str:
     from codex_evolve import write_candidate_rejection_context  # noqa: WPS433
 
@@ -1970,7 +1334,6 @@ def _previous_result_from_full_eval(full_report: Dict, candidate: Dict) -> Dict:
     return {
         "target_modules": list(candidate.get("changed_modules") or []),
         "evolved_bundle": {
-            "bundle_fingerprint": candidate.get("bundle_fingerprint", ""),
             "changed_modules": list(candidate.get("changed_modules") or []),
         },
         "verification": full_report,
@@ -1986,13 +1349,8 @@ def _diagnose_next_round(args: argparse.Namespace, profile: Dict,
                          reference_report: Dict, previous_diagnosis: Dict,
                          full_eval_report_path: str, candidate: Dict,
                          review_path: str,
-                         round_dir: str, iter_context: Dict = None) -> Dict:
-    """Use the same diagnosis-to-brief path as explicit staged iterations.
-
-    Auto-loop must not bypass `_diagnose`: doing so leaves the next round
-    without the bounded execution handoff and makes later research/codegen read
-    an inconsistent audit report.
-    """
+                         iter_context: Dict = None) -> Dict:
+    """Continue diagnosis with the completed candidate review and evaluation."""
     previous = {
         "evolution_review": getattr(args, "evolution_review", ""),
         "full_eval_report": getattr(args, "full_eval_report", ""),
@@ -2012,9 +1370,6 @@ def _diagnose_next_round(args: argparse.Namespace, profile: Dict,
         args.full_eval_report = previous["full_eval_report"]
         args.candidate_bundle = previous["candidate_bundle"]
         args.previous_diagnosis = previous["previous_diagnosis"]
-    snapshot = os.path.join(round_dir, "next_diagnosis.json")
-    _write_json(snapshot, diagnosis)
-    diagnosis["snapshot_path"] = snapshot
     return diagnosis
 
 
@@ -2039,6 +1394,7 @@ def _automatic_outcome(rounds: List[Dict], requested_rounds: int,
     }
     incomplete_statuses = {
         "probe_execution_layer_rerun_required", "probe_requires_codex_feedback",
+        "bundle_smoke_passed_probe_skipped",
     }
     if stop_reason == "no_incorrect_evolution_trajectories":
         outcome, exit_code = ("checked" if check_only else "completed"), 0
@@ -2077,18 +1433,18 @@ def _run_autonomous_loop(args: argparse.Namespace,
     last_candidate_bundle = ""
     rounds = []
     stop_reason = ""
-    requested_rounds = max(1, int(args.auto_rounds or 1))
-    start_iteration = max(1, int(getattr(args, "iteration_index", 0) or 1))
-    for round_idx in range(
-        start_iteration,
-        start_iteration + requested_rounds,
-    ):
-        if _report_has_no_incorrect_trajectory(current_reference_report):
-            stop_reason = "no_incorrect_evolution_trajectories"
-            break
-        # Use the same iter_N layout as staged execution. This makes a
-        # resumed automatic loop append to the run history instead of
-        # overwriting a previous round_1 directory.
+    run_state_path = os.path.join(metavideoagent_run_dir(args.run_id, args.output_root), "run.json")
+    run_state = _read_json(run_state_path)
+    requested_budget = (args.auto_rounds if args.auto_rounds is not None
+                        else run_state.get("automatic_target_iteration", 4))
+    requested_rounds = max(1, int(requested_budget))
+    if not args.check_only:
+        run_state["automatic_target_iteration"] = requested_rounds
+        write_workspace_json(run_state_path, run_state)
+    start_iteration = _resolve_iteration_index(args)
+    planned_rounds = max(0, requested_rounds - start_iteration + 1)
+    for round_idx in range(start_iteration, requested_rounds + 1):
+        # Keep automatic and staged runs in the same iter_N layout.
         round_dir = os.path.join(
             metavideoagent_run_dir(args.run_id, args.output_root),
             "checks", f"iter_{round_idx}"
@@ -2096,6 +1452,21 @@ def _run_autonomous_loop(args: argparse.Namespace,
             metavideoagent_run_dir(args.run_id, args.output_root), f"iter_{round_idx}"
         )
         os.makedirs(round_dir, exist_ok=True)
+        iteration = IterationWorkspace(round_dir)
+        if round_idx == start_iteration and getattr(args, "restart_from", ""):
+            iteration.restart(args.restart_from)
+        iteration.bind_base(bundle=_initial_bundle_path_from_report(current_reference_report),
+                            report=current_reference_path,
+                            results=_reference_results_path_from_report(current_reference_report))
+        base_reference = iteration.progress()["base_reference"]
+        if base_reference["report"] != current_reference_path:
+            current_reference_report = _read_json(base_reference["report"])
+        current_reference_path = base_reference["report"]
+        current_reference_label = _reference_label_for_report(args, current_reference_report, current_reference_path)
+        args._iteration_dir = round_dir
+        if _report_has_no_incorrect_trajectory(current_reference_report):
+            stop_reason = "no_incorrect_evolution_trajectories"
+            break
         round_record = {"round": round_idx, "round_dir": round_dir}
         if current_diagnosis is None and not current_review_path and round_idx > 1:
             current_review_path = _latest_valid_candidate_review(
@@ -2108,9 +1479,6 @@ def _run_autonomous_loop(args: argparse.Namespace,
                     "review record in evolution_memory_index.json; do not review the "
                     "current best against itself."
                 )
-        prior_candidate_rejection_run = getattr(args, "candidate_rejection_run", "")
-        prior_candidate_rejection_context = getattr(args, "candidate_rejection_context", "")
-        prior_write_candidate_rejection_context = getattr(args, "write_candidate_rejection_context", "")
         iter_context = build_iter_context(
             run_id=args.run_id,
             iter_index=round_idx,
@@ -2128,12 +1496,14 @@ def _run_autonomous_loop(args: argparse.Namespace,
             full_eval_report=last_full_eval_report,
             candidate_run=last_candidate_run,
             candidate_bundle=last_candidate_bundle,
-            candidate_rejection_context=_resolve_candidate_rejection_context(args, args.run_id),
             deep_research_summary=getattr(args, "deep_research_summary", ""),
             extra_artifacts=[getattr(args, "deep_research_report", "")],
             check_only=args.check_only,
         )
         round_record["iter_context_path"] = iter_context.get("path", "")
+        saved_diagnosis = ((iteration.progress().get("stages") or {}).get("diagnosis") or {})
+        if not args.check_only and saved_diagnosis.get("status") == "complete" and current_diagnosis is None:
+            current_diagnosis = _read_json(saved_diagnosis["result"])
 
         if current_diagnosis is None:
             if args.check_only:
@@ -2162,7 +1532,7 @@ def _run_autonomous_loop(args: argparse.Namespace,
                     try:
                         args.full_eval_report = current_reference_path
                         args.full_eval_results = _reference_results_path_from_report(current_reference_report)
-                        args.review_out_dir = os.path.join(round_dir, "review")
+                        args.review_out_dir = os.path.join(round_dir, "teacher")
                         args.candidate_bundle = ""
                         review_exit = _run_review_subprocess(args, current_reference_report)
                         review_path = _find_review_path(args.review_out_dir)
@@ -2194,7 +1564,7 @@ def _run_autonomous_loop(args: argparse.Namespace,
                     ),
                 }
         else:
-            diagnosis_path = current_diagnosis.get("report_path") or current_diagnosis.get("snapshot_path", "")
+            diagnosis_path = current_diagnosis.get("report_path", "")
             round_record["diagnosis"] = {
                 "path": diagnosis_path,
                 "target_modules": list(
@@ -2216,10 +1586,8 @@ def _run_autonomous_loop(args: argparse.Namespace,
             _ensure_research_ready(args, codex_research)
             round_record["codex_deep_research"] = _research_record(codex_research)
         if args.check_only:
-            audit = _read_json(diagnosis_path)
-            execution_brief = _read_json(audit.get("execution_brief_path", ""))
             diagnosis_for_codex = os.path.join(round_dir, "diagnosis_for_codex.json")
-            _validate_existing_diagnosis_for_codex(diagnosis_for_codex, execution_brief)
+            machine_contract_path = os.path.join(round_dir, "probe_plan.json")
         else:
             diagnosis_for_codex = _write_diagnosis_for_codex(
                 diagnosis_path,
@@ -2227,20 +1595,26 @@ def _run_autonomous_loop(args: argparse.Namespace,
                 round_dir,
                 iter_context=iter_context,
             )
-        audit = _read_json(diagnosis_path)
-        machine_contract_path = str(audit.get("machine_evaluation_contract_path") or "")
-        if not machine_contract_path or not os.path.isfile(machine_contract_path):
-            raise RuntimeError("Codex evolve requires diagnosis.machine_evaluation_contract_path")
+        if not args.check_only:
+            audit = _read_json(diagnosis_path)
+            machine_contract_path = str(audit.get("machine_evaluation_contract_path") or "")
+            if not machine_contract_path or not os.path.isfile(machine_contract_path):
+                raise RuntimeError("Codex evolve requires diagnosis.machine_evaluation_contract_path")
         codex = _run_codex_subprocess(
             args, diagnosis_for_codex, current_reference_path, round_dir,
             machine_evaluation_contract_path=machine_contract_path,
-            iter_context_path=iter_context.get("path", ""),
         )
+        if not args.check_only:
+            codex = _run_bundle_feedback_loop(
+                args, initial_codex=codex, diagnosis_path=diagnosis_for_codex,
+                reference_report_path=current_reference_path, round_dir=round_dir,
+                machine_evaluation_contract_path=machine_contract_path,
+            )
         round_record["codex"] = codex
         candidate_run = codex.get("candidate_run", "")
         if args.check_only:
-            placeholder_report = os.path.join(candidate_run, "full_eval_report.json")
-            placeholder_results = os.path.join(candidate_run, "full_eval_results.jsonl")
+            placeholder_report = os.path.join(round_dir, "full_eval", "attempt_0", "full_eval_report.json")
+            placeholder_results = os.path.join(round_dir, "full_eval", "attempt_0", "full_eval_results.jsonl")
             placeholder_review_dir = os.path.join(round_dir, "review")
             round_record["full_eval"] = {
                 "check_only": True,
@@ -2254,7 +1628,6 @@ def _run_autonomous_loop(args: argparse.Namespace,
                     "--reference-report", current_reference_path,
                     "--reference-label", current_reference_label,
                     "--concurrency", str(args.concurrency),
-                    "--llm-model", args.exec_llm_model,
                     "--metavideoagent-run-id", args.run_id,
                     "--metavideoagent-output-root", args.output_root,
                     "--check-only",
@@ -2294,77 +1667,15 @@ def _run_autonomous_loop(args: argparse.Namespace,
             )
             rounds.append(round_record)
             break
-        if probe_action == "round_level_rediagnosis":
-            rejection_context_path = os.path.join(
-                round_dir,
-                "candidate_rejection_context.json",
-            )
-            rejection_context_path = _write_candidate_rejection_context_from_run(
-                args,
-                candidate_run,
-                rejection_context_path,
-            )
-            round_record["candidate_rejection_context"] = rejection_context_path
-            rejection_memory = _annotate_and_record_candidate_history(
-                args,
-                iteration=round_idx,
-                parent_report_path=current_reference_path,
-                parent_report=current_reference_report,
-                candidate_run=candidate_run,
-                candidate_bundle_path=_candidate_artifact_path(candidate_run),
-                diagnosis_path=diagnosis_path,
-                research_report_path=(codex_research or {}).get("report_path", ""),
-                rejection_context_path=rejection_context_path,
-                outcome_status="probe_rejected",
-            )
-            round_record["evolution_memory_index"] = rejection_memory.get("path", "")
-            args.candidate_rejection_run = candidate_run
-            args.candidate_rejection_context = rejection_context_path
-            args.write_candidate_rejection_context = rejection_context_path
-            next_iter_context = build_iter_context(
-                run_id=args.run_id,
-                iter_index=round_idx + 1,
-                stage="probe_rejection_rediagnosis",
-                workspace=args.workspace,
-                distribution_manifest=args.distribution_manifest,
-                reference_report_path=current_reference_path,
-                reference_label=current_reference_label,
-                output_root=args.output_root,
-                profile_path=profile.get("output_path", ""),
-                profile=profile,
-                initial_baseline_bundle=_initial_bundle_path_from_report(current_reference_report),
-                previous_diagnosis=diagnosis_path,
-                evolution_review=current_review_path,
-                candidate_run=candidate_run,
-                candidate_bundle=_candidate_artifact_path(candidate_run),
-                candidate_rejection_context=rejection_context_path,
-                deep_research_summary=getattr(args, "deep_research_summary", ""),
-                extra_artifacts=[getattr(args, "deep_research_report", "")],
-            )
-            current_diagnosis = _diagnose(
-                args,
-                current_reference_report,
-                profile,
-                iter_context=next_iter_context,
-            )
-            round_record["next_diagnosis"] = {
-                "path": current_diagnosis.get("report_path", ""),
-                "target_modules": list(
-                    (current_diagnosis.get("algorithmic_evolution", {}) or {}).get("target_modules") or []
-                ),
-                "reason": "probe round_level_rediagnosis",
-            }
-            args.candidate_rejection_run = prior_candidate_rejection_run
-            args.candidate_rejection_context = prior_candidate_rejection_context
-            args.write_candidate_rejection_context = prior_write_candidate_rejection_context
+        if probe_action == "probe_skipped":
+            round_record["status"] = "bundle_smoke_passed_probe_skipped"
             rounds.append(round_record)
-            continue
+            break
         if probe_action in (
             "codex_engineering_repair",
             "codex_same_direction_behavior_iteration",
         ):
             rejection_context_path = _write_candidate_rejection_context_from_run(
-                args,
                 candidate_run,
                 os.path.join(round_dir, "candidate_rejection_context.json"),
             )
@@ -2387,20 +1698,25 @@ def _run_autonomous_loop(args: argparse.Namespace,
             round_record["candidate_rejection_context"] = rejection_context_path
             round_record["evolution_memory_index"] = memory.get("path", "")
             round_record["status"] = "probe_requires_codex_feedback"
+            resume_option = (
+                "--engineering-failed-run" if probe_action == "codex_engineering_repair"
+                else "--probe-failed-run"
+            )
             round_record["note"] = (
-                "codex_evolve did not produce a full-eval-ready candidate after "
-                "the configured bounded same-direction feedback attempts; resume it "
-                "with --probe-failed-run, or start a new diagnosis only after the "
-                "per-mechanism feedback budget is exhausted"
+                "The candidate still needs work after the configured repair budget. "
+                "Current best is retained. Inspect the saved failure evidence; "
+                f"candidate continuation uses {resume_option} and a larger repair budget."
             )
             rounds.append(round_record)
             break
-        if probe_action and probe_action != "full_eval_candidate":
+        if probe_action != "full_eval_candidate":
             round_record["status"] = "unknown_probe_gate"
             rounds.append(round_record)
             break
 
         args.candidate_run = candidate_run
+        args.candidate_bundle = _candidate_artifact_path(candidate_run)
+        args.diagnosis_report = diagnosis_path
         args.reference_label = current_reference_label
         full_exit = _run_full_eval_subprocess(args, current_reference_path)
         full_report_path = _find_full_eval_report(candidate_run)
@@ -2420,6 +1736,9 @@ def _run_autonomous_loop(args: argparse.Namespace,
         post_decision = full_report.get("post_full_eval_decision") or {}
         if post_decision:
             round_record["post_full_eval_decision"] = post_decision
+        parent_reference_path = current_reference_path
+        parent_reference_report = current_reference_report
+        parent_reference_label = current_reference_label
         next_reference_path = current_reference_path
         next_reference_report = current_reference_report
         next_reference_label = current_reference_label
@@ -2428,6 +1747,21 @@ def _run_autonomous_loop(args: argparse.Namespace,
             next_reference_report = full_report
             next_reference_label = _reference_label_for_report(args, full_report, full_report_path)
             round_record["current_best_updated"] = True
+        selected = load_ledger(args.run_id, args.output_root).get("current_best") or {}
+        selected_report = ((selected.get("selection") or {}).get("train_diagnostic_report_path")
+                           or selected.get("report_path") or "")
+        if selected_report:
+            next_reference_path = selected_report
+            next_reference_report = _read_json(selected_report)
+            next_reference_label = _reference_label_for_report(args, next_reference_report, selected_report)
+            round_record["current_best_updated"] = not _same_path(selected_report, parent_reference_path)
+
+        # Promotion has already been committed by full evaluation. Reflect it
+        # immediately, including when a later review fails. Paired review still
+        # uses the saved pre-promotion parent, not the newly accepted candidate.
+        current_reference_path = next_reference_path
+        current_reference_report = next_reference_report
+        current_reference_label = next_reference_label
 
         # Preserve every full-eval candidate even if a later Teacher review
         # crashes.  The subsequent call after review upgrades this same record
@@ -2435,8 +1769,8 @@ def _run_autonomous_loop(args: argparse.Namespace,
         memory = _annotate_and_record_candidate_history(
             args,
             iteration=round_idx,
-            parent_report_path=current_reference_path,
-            parent_report=current_reference_report,
+            parent_report_path=parent_reference_path,
+            parent_report=parent_reference_report,
             candidate_run=candidate_run,
             candidate_bundle_path=_candidate_artifact_path(candidate_run),
             diagnosis_path=diagnosis_path,
@@ -2452,9 +1786,9 @@ def _run_autonomous_loop(args: argparse.Namespace,
         args.review_out_dir = review_dir
         # Review this candidate against the immutable parent reference, even
         # when post-decision has already promoted it to current best.
-        args.reference_label = current_reference_label
-        review_exit = _run_review_subprocess(args, current_reference_report)
-        review_path = _find_review_path(review_dir)
+        args.reference_label = parent_reference_label
+        review_exit = _run_review_subprocess(args, parent_reference_report)
+        review_path = _find_review_path(args.review_out_dir)
         round_record["review"] = {
             "exit_code": review_exit,
             "review_path": review_path,
@@ -2467,8 +1801,8 @@ def _run_autonomous_loop(args: argparse.Namespace,
         memory = _annotate_and_record_candidate_history(
             args,
             iteration=round_idx,
-            parent_report_path=current_reference_path,
-            parent_report=current_reference_report,
+            parent_report_path=parent_reference_path,
+            parent_report=parent_reference_report,
             candidate_run=candidate_run,
             candidate_bundle_path=args.candidate_bundle,
             diagnosis_path=diagnosis_path,
@@ -2477,6 +1811,14 @@ def _run_autonomous_loop(args: argparse.Namespace,
             review_path=review_path,
         )
         round_record["evolution_memory_index"] = memory.get("path", "")
+
+        current_review_path = review_path
+        round_record["status"] = "complete"
+        iteration.finish("complete")
+        if (round_idx >= requested_rounds
+                or _report_has_no_incorrect_trajectory(current_reference_report)):
+            rounds.append(round_record)
+            continue
 
         candidate = _read_candidate(candidate_run)
         next_iter_context = build_iter_context(
@@ -2496,32 +1838,28 @@ def _run_autonomous_loop(args: argparse.Namespace,
             full_eval_report=full_report_path,
             candidate_run=candidate_run,
             candidate_bundle=_candidate_artifact_path(candidate_run),
-            candidate_rejection_context=_resolve_candidate_rejection_context(args, args.run_id),
             deep_research_summary=getattr(args, "deep_research_summary", ""),
             extra_artifacts=[getattr(args, "deep_research_report", "")],
         )
         args.reference_label = next_reference_label
         next_diagnosis = _diagnose_next_round(
             args, profile, next_reference_report, current_diagnosis or {},
-            full_report_path, candidate, review_path, round_dir,
+            full_report_path, candidate, review_path,
             iter_context=next_iter_context,
         )
         round_record["next_diagnosis"] = {
             "path": next_diagnosis.get("report_path", ""),
-            "snapshot_path": next_diagnosis.get("snapshot_path", ""),
             "target_modules": list(
                 (next_diagnosis.get("algorithmic_evolution", {}) or {}).get("target_modules") or []
             ),
         }
         current_diagnosis = next_diagnosis
-        current_reference_path = next_reference_path
-        current_reference_report = next_reference_report
-        current_reference_label = next_reference_label
-        current_review_path = review_path
         rounds.append(round_record)
 
     output["automatic_rounds"] = rounds
     output["automatic_requested_rounds"] = requested_rounds
+    output["automatic_start_iteration"] = start_iteration
+    output["automatic_planned_rounds"] = planned_rounds
     output["automatic_processed_rounds"] = len(rounds)
     output["automatic_stop_reason"] = stop_reason
     output["automatic_final_current_best"] = {
@@ -2531,7 +1869,7 @@ def _run_autonomous_loop(args: argparse.Namespace,
         "bundle_path": _initial_bundle_path_from_report(current_reference_report),
     }
     output.update(_automatic_outcome(
-        rounds, requested_rounds, check_only=bool(args.check_only),
+        rounds, planned_rounds, check_only=bool(args.check_only),
         stop_reason=stop_reason,
     ))
     return output
@@ -2555,16 +1893,6 @@ def run(args: argparse.Namespace) -> Dict:
         # are optional run-scoped overrides, which also supports local or
         # credential-free OpenAI-compatible endpoints.
         os.environ.update(_normalize_api_env({}, args))
-    if (getattr(args, "probe_failed_run", "") or getattr(args, "engineering_failed_run", "")) and (
-        getattr(args, "candidate_rejection_run", "")
-        or getattr(args, "candidate_rejection_context", "")
-        or getattr(args, "write_candidate_rejection_context", "")
-    ):
-        raise RuntimeError(
-            "same-candidate Codex feedback is incompatible with "
-            "--candidate-rejection-run/context, which is for round-level "
-            "rediagnosis/new-candidate context."
-        )
     workspace = os.path.abspath(args.workspace)
     args.workspace = workspace
     args.distribution_manifest = resolve_distribution_manifest_path(
@@ -2576,7 +1904,6 @@ def run(args: argparse.Namespace) -> Dict:
     os.environ["METAVIDEOAGENT_OUTPUT_ROOT"] = args.output_root
     os.environ["METAVIDEOAGENT_DISTRIBUTION_MANIFEST"] = args.distribution_manifest
     reference_report_path = _resolve_initial_report(
-        workspace,
         args.initial_report,
         args.initial_run_id or args.run_id,
         args.output_root,
@@ -2594,20 +1921,21 @@ def run(args: argparse.Namespace) -> Dict:
         "check_only": args.check_only,
     }
 
-    if args.stage in ("initial", "all", "automatic") and not reference_report_path:
-        initial_profile = _load_or_build_profile(
+    if args.stage in ("initial", "automatic") and not reference_report_path:
+        mapping_initialization = getattr(args, "initialization", "observe") == "map"
+        initial_profile = {} if mapping_initialization else _load_or_build_profile(
             workspace,
             args.distribution_manifest,
             run_id,
             output_root=args.output_root,
             explicit_profile=args.profile,
             force=args.refresh_profile,
-            include_execution_artifacts=False,
             semantic_kwargs=_profile_semantic_kwargs(args),
+            check_only=args.check_only,
         )
         if not args.profile:
             args.profile = initial_profile.get("output_path", "")
-        if not getattr(args, "skip_deep_research", False):
+        if not mapping_initialization and not getattr(args, "skip_deep_research", False):
             research = _run_deep_research_context(args, initial_profile, run_id)
             _ensure_research_ready(args, research)
             output["deep_research"] = {
@@ -2641,8 +1969,7 @@ def run(args: argparse.Namespace) -> Dict:
             output["reference_results_path"] = ""
         if args.check_only and not reference_report_path:
             output["status"] = "check_only_ready"
-            out_dir = metavideoagent_run_dir(run_id, args.output_root)
-            report_path = os.path.join(out_dir, "metavideoagent_evolution_report.json")
+            report_path = _stage_report_path(args, output)
             output["report_path"] = report_path
             _write_json(report_path, output)
             return output
@@ -2691,25 +2018,6 @@ def run(args: argparse.Namespace) -> Dict:
             _write_json(report_path, output)
             return output
 
-    if args.stage == "post_decision":
-        post_decision = _run_post_decision_stage(args, run_id=run_id)
-        output["post_full_eval_decision"] = post_decision
-        output["post_decision"] = post_decision
-        output["status"] = "post_decision_checked" if args.check_only else "post_decision_completed"
-        out_dir = (
-            os.path.join(
-                metavideoagent_run_dir(run_id, args.output_root),
-                "checks",
-                f"iter_{int(getattr(args, 'iteration_index', 0) or 0) or 1}",
-                "post_decision",
-            )
-            if args.check_only
-            else metavideoagent_run_dir(run_id, args.output_root)
-        )
-        report_path = os.path.join(out_dir, "metavideoagent_evolution_report.json")
-        output["report_path"] = report_path
-        _write_json(report_path, output)
-        return output
 
     if not reference_report_path:
         if args.check_only:
@@ -2736,19 +2044,25 @@ def run(args: argparse.Namespace) -> Dict:
         args, reference_report, reference_report_path
     )
     args.reference_label = inferred_reference_label
-    iteration_index = _resolve_iteration_index(args, reference_report_path)
+    iteration_index = _resolve_iteration_index(args)
     args.iteration_index = iteration_index
+    args._iteration_dir = os.path.join(metavideoagent_run_dir(run_id, args.output_root),
+                                     "checks", f"iter_{iteration_index}") if args.check_only else os.path.join(
+                                         metavideoagent_run_dir(run_id, args.output_root), f"iter_{iteration_index}")
+    if args.stage != "automatic":
+        iteration = IterationWorkspace(args._iteration_dir)
+        if getattr(args, "restart_from", ""):
+            iteration.restart(args.restart_from)
+        iteration.bind_base(bundle=_initial_bundle_path_from_report(reference_report),
+                            report=reference_report_path,
+                            results=_reference_results_path_from_report(reference_report))
     os.environ["METAVIDEOAGENT_ITERATION_INDEX"] = str(iteration_index)
     output["reference_label"] = inferred_reference_label
     output["iteration_index"] = iteration_index
     output["reference_report_path"] = reference_report_path
     output["reference_results_path"] = _reference_results_path_from_report(reference_report)
-    output["history_input_policy"] = _external_history_meta(
-        reference_report_path,
-        output["reference_results_path"],
-    )
     needs_reference_results = args.stage in (
-        "diagnose", "codex_deep_research", "evolve", "full_eval", "review", "all", "automatic"
+        "diagnose", "codex_deep_research", "evolve", "full_eval", "review", "automatic"
     )
     if needs_reference_results and not output["reference_results_path"]:
         output["status"] = "requires_executed_reference_results"
@@ -2816,15 +2130,15 @@ def run(args: argparse.Namespace) -> Dict:
         output_root=args.output_root,
         explicit_profile=profile_path_hint,
         force=args.refresh_profile,
-        include_execution_artifacts=False,
         semantic_kwargs=_profile_semantic_kwargs(args),
+        check_only=args.check_only,
     )
     # All later stages must consume the exact same distribution-aware profile.
     # Without this assignment Codex/review/full-eval subprocesses silently
     # rebuild separate profiles from the manifest and lose the observed-channel
     # artifact chosen for the current run.
     # ``_load_or_build_profile`` may replace an explicitly supplied previous or
-    # mismatched profile with a newly attested run-scoped artifact.  Propagate
+    # mismatched profile with the current run's observed artifact. Propagate
     # the effective path unconditionally so later stages cannot reopen the
     # stale caller path.
     if profile.get("output_path", ""):
@@ -2834,7 +2148,8 @@ def run(args: argparse.Namespace) -> Dict:
     # diagnosis stays review-focused; diagnosis-conditioned research is run
     # separately immediately before Codex writes code.
     initial_research_stage = (
-        args.stage in ("initial", "all", "automatic")
+        args.stage in ("initial", "automatic")
+        and getattr(args, "initialization", "observe") == "observe"
         and not args.diagnosis_report
         and not args.evolution_review
         and not args.full_eval_report
@@ -2885,45 +2200,6 @@ def run(args: argparse.Namespace) -> Dict:
         _write_json(report_path, output)
         return output
 
-    # A diagnosis is a decision over an executed review, never a direct
-    # interpretation of raw full-eval trajectories.  The first evolution round
-    # has only the initial baseline, so create the explicit single-baseline
-    # review here when the convenience ``all`` entrypoint is used.  Staged
-    # diagnosis, by contrast, must be given its already completed review: this
-    # prevents a caller from silently skipping the documented
-    # review -> diagnosis handoff.
-    if args.stage == "all" and not args.evolution_review:
-        review_dir = os.path.join(
-            metavideoagent_run_dir(run_id, args.output_root),
-            f"iter_{iteration_index}",
-            "review",
-        )
-        previous_review_out_dir = args.review_out_dir
-        try:
-            args.review_out_dir = review_dir
-            review_exit = _run_review_subprocess(args, reference_report)
-        finally:
-            args.review_out_dir = previous_review_out_dir
-        review_path = _find_review_path(review_dir)
-        output["initial_reference_review"] = {
-            "exit_code": review_exit,
-            "review_path": review_path,
-            "purpose": "required_review_before_first_diagnosis",
-        }
-        if args.check_only:
-            # Check-only has no subprocess output to discover.  Keep the
-            # planned path in the report without pretending it is consumable.
-            args.evolution_review = review_path or os.path.join(
-                review_dir, "teacher_evolution_review.json"
-            )
-        elif review_exit != 0 or not review_path or not review_is_consumable(_read_json(review_path)):
-            raise RuntimeError(
-                "The required initial-reference review failed or is not consumable; "
-                "do not run diagnosis until review is repaired."
-            )
-        else:
-            args.evolution_review = review_path
-
     if args.stage == "diagnose":
         review_path = getattr(args, "evolution_review", "")
         if not review_path:
@@ -2962,7 +2238,6 @@ def run(args: argparse.Namespace) -> Dict:
         full_eval_report=args.full_eval_report,
         candidate_run=args.candidate_run,
         candidate_bundle=args.candidate_bundle,
-        candidate_rejection_context=_resolve_candidate_rejection_context(args, run_id),
         deep_research_summary=(
             getattr(args, "deep_research_summary", "")
             or (deep_research.get("summary_text", "") if deep_research else "")
@@ -2973,20 +2248,12 @@ def run(args: argparse.Namespace) -> Dict:
             deep_research.get("design_brief_path", "") if deep_research else "",
         ],
         check_only=args.check_only,
-        attempt_tag=(
-            getattr(args, "attempt_tag", "")
-            # Any explicitly resumed evolution needs an isolated output tree.
-            # The formal diagnosis_for_codex handoff remains in iter_N/, while
-            # context, candidates and stage report are written under this tag.
-            if args.stage == "evolve"
-            else ""
-        ),
     )
     output["iter_context_path"] = iter_context.get("path", "")
     if args.evolution_review:
         output["evolution_review_path"] = os.path.abspath(args.evolution_review)
 
-    if args.stage in ("diagnose", "all"):
+    if args.stage == "diagnose":
         if args.check_only:
             output["diagnosis_check"] = {
                 "would_read_reference_results": output["reference_results_path"],
@@ -3020,10 +2287,7 @@ def run(args: argparse.Namespace) -> Dict:
         brief_issues = validate_bundle_execution_brief(_read_json(execution_brief_path))
         if brief_issues:
             raise RuntimeError("codex_deep_research requires a valid adaptive bundle brief: " + "; ".join(brief_issues))
-        # In an explicitly resumed stage, the supplied diagnosis audit is the
-        # authoritative lineage record.  Prefer its explicit round directory
-        # so a historical run_id (or a relocated runtime root) cannot create a
-        # parallel iter_N tree merely to write the Codex handoff.
+        # Continue research in the iteration recorded by its diagnosis.
         diagnosis_iter_context = diagnosis_audit.get("iter_context") or {}
         round_dir = (
             diagnosis_iter_context.get("iter_dir", "")
@@ -3055,42 +2319,9 @@ def run(args: argparse.Namespace) -> Dict:
                 iter_context=iter_context,
             )
 
-    # A no-model ``all`` preflight intentionally does not materialize a
-    # diagnosis or a Codex handoff.  Do not fall through and treat the absent
-    # machine-evaluation contract as a real pipeline error; report the planned
-    # research/evolve boundary instead.  Real ``all`` execution always writes
-    # the diagnosis above and continues through the normal gates.
-    if args.stage == "all" and args.check_only:
-        planned_round_dir = iter_context.get("iter_dir", "") or metavideoagent_run_dir(
-            run_id, args.output_root
-        )
-        output["codex_deep_research_check"] = {
-            "requires": "diagnosis.execution_brief_path from the preceding real diagnosis stage",
-            "planned_output_dir": os.path.join(planned_round_dir, "codex_deep_research"),
-        }
-        output["evolve_check"] = {
-            "requires": [
-                "validated diagnosis_execution_brief",
-                "validated diagnosis.machine_evaluation_contract_path",
-                "validated diagnosis-conditioned Codex deep-research handoff",
-            ],
-            "planned_candidate_root": os.path.join(planned_round_dir, "codex", "codex_candidates"),
-            "smoke_then_probe": True,
-        }
-        output["status"] = "all_checked"
-        report_path = _stage_report_path(args, output)
-        output["report_path"] = report_path
-        _write_json(report_path, output)
-        return output
-
-    if args.stage in ("evolve", "all"):
-        diagnosis_path = (
-            (output.get("diagnosis") or {}).get("report_path", "")
-            or args.diagnosis_report
-        )
-        # Staged evolution resumes an attested diagnosis. Its lineage
-        # owns the formal iter_N directory, even when the historical run_id
-        # was created under a different output-root layout.
+    if args.stage == "evolve":
+        diagnosis_path = args.diagnosis_report
+        # Continue implementation in the diagnosis's iteration workspace.
         staged_audit = _read_json(diagnosis_path) if diagnosis_path else {}
         staged_iter_context = staged_audit.get("iter_context") or {}
         round_dir = (
@@ -3098,58 +2329,30 @@ def run(args: argparse.Namespace) -> Dict:
             or iter_context.get("iter_dir", "")
             or metavideoagent_run_dir(run_id, args.output_root)
         )
-        if args.stage == "evolve":
-            # A staged evolution resume follows an already completed explicit
-            # codex_deep_research stage. Re-running that stage here would spend
-            # Codex quota and could replace the audited research handoff.
-            audit = _read_json(diagnosis_path)
-            _refresh_diagnosis_probe_context(audit)
-            # A staged diagnosis argument may be either a wrapper that points
-            # at its compiled brief or the adaptive bundle brief itself. The latter
-            # is the persisted handoff copied beside a candidate/probe and is
-            # the normal input for same-direction feedback; requiring a redundant
-            # self-reference made this formal entrypoint reject a valid brief.
-            execution_brief = (
-                audit
-                if audit.get("artifact_type") == "diagnosis_execution_brief"
-                else _read_json(audit.get("execution_brief_path", ""))
+        # Reuse the completed research handoff for this implementation stage.
+        audit = _read_json(diagnosis_path)
+        _refresh_diagnosis_probe_context(audit)
+        execution_brief = (
+            audit
+            if audit.get("artifact_type") == "diagnosis_execution_brief"
+            else _read_json(audit.get("execution_brief_path", ""))
+        )
+        if not execution_brief:
+            raise RuntimeError(
+                "staged evolution requires --diagnosis-report with a valid "
+                "adaptive bundle execution brief"
             )
-            if not execution_brief:
-                raise RuntimeError(
-                    "staged evolution requires --diagnosis-report with a valid "
-                    "adaptive bundle execution brief"
-                )
-            brief_issues = validate_bundle_execution_brief(execution_brief)
-            if brief_issues:
-                raise RuntimeError(
-                    "staged evolution requires a valid adaptive bundle brief: "
-                    + "; ".join(brief_issues)
-                )
-            formal_round_dir = round_dir
-            diagnosis_for_codex = os.path.join(formal_round_dir, "diagnosis_for_codex.json")
-            existing_handoff = _load_validated_diagnosis_for_codex(
-                diagnosis_for_codex, execution_brief,
+        brief_issues = validate_bundle_execution_brief(execution_brief)
+        if brief_issues:
+            raise RuntimeError(
+                "staged evolution requires a valid adaptive bundle brief: "
+                + "; ".join(brief_issues)
             )
-            codex_research = existing_handoff.get("codex_deep_research", {}) or {}
-            output["codex_deep_research"] = _research_record(codex_research)
-            output["diagnosis_for_codex_path"] = diagnosis_for_codex
-        else:
-            codex_research = _run_codex_deep_research_context(
-                args,
-                profile,
-                diagnosis_path,
-                args.evolution_review,
-                round_dir,
-            )
-            if codex_research:
-                _ensure_research_ready(args, codex_research)
-                output["codex_deep_research"] = _research_record(codex_research)
-            diagnosis_for_codex = _write_diagnosis_for_codex(
-                diagnosis_path,
-                codex_research,
-                round_dir,
-                iter_context=iter_context,
-            )
+        diagnosis_for_codex = os.path.join(round_dir, "diagnosis_for_codex.json")
+        existing_handoff = _load_validated_diagnosis_for_codex(diagnosis_for_codex)
+        codex_research = existing_handoff.get("codex_deep_research", {}) or {}
+        output["codex_deep_research"] = _research_record(codex_research)
+        output["diagnosis_for_codex_path"] = diagnosis_for_codex
         audit = _read_json(diagnosis_path)
         machine_contract_path = str(audit.get("machine_evaluation_contract_path") or "")
         if not machine_contract_path or not os.path.isfile(machine_contract_path):
@@ -3160,10 +2363,6 @@ def run(args: argparse.Namespace) -> Dict:
             reference_report_path,
             round_dir,
             machine_evaluation_contract_path=machine_contract_path,
-            iter_context_path=(
-                str(audit.get("iter_context_path") or "")
-                or iter_context.get("path", "")
-            ),
         )
         if not args.check_only:
             codex = _run_bundle_feedback_loop(
@@ -3173,7 +2372,6 @@ def run(args: argparse.Namespace) -> Dict:
                 reference_report_path=reference_report_path,
                 round_dir=round_dir,
                 machine_evaluation_contract_path=machine_contract_path,
-                iter_context_path=iter_context.get("path", ""),
             )
         output["codex"] = codex
         output["evolution_exit_code"] = codex.get("exit_code", 1)
@@ -3187,12 +2385,11 @@ def run(args: argparse.Namespace) -> Dict:
         elif codex.get("candidate_run"):
             output["candidate_run"] = codex.get("candidate_run")
             candidate_run = codex.get("candidate_run")
-            # A smoke-only supervised apply is deliberately a checkpoint, not
-            # a behavioral judgement.  There is no probe evidence to classify
-            # and therefore no valid rejection/repair context to materialize.
-            # Leaving this to the previous fallback below fabricated an
-            # ``probe_status=unknown`` same-direction repair route.
-            if getattr(args, "skip_probe_verification", False):
+            # Smoke-only execution is an engineering checkpoint; behavioral
+            # classification follows a subsequent probe.
+            probe_gate = _probe_gate_from_candidate_run(candidate_run)
+            output["probe_gate"] = probe_gate
+            if probe_gate.get("action") == "probe_skipped":
                 output["status"] = "bundle_smoke_passed_probe_skipped"
                 output["probe_gate"] = {
                     "action": "probe_skipped",
@@ -3205,46 +2402,26 @@ def run(args: argparse.Namespace) -> Dict:
                     "codex_feedback_allowed": False,
                 }
                 output["note"] = (
-                    "Smoke passed and was retained as an authoritative artifact. "
-                    "No candidate rejection context or repair route was created "
-                    "because no behavioral probe has run."
+                    "The saved candidate passed smoke. Run probe before full evaluation."
                 )
+                output["report_path"] = _stage_report_path(args, output)
+                _write_json(output["report_path"], output)
                 return output
-            probe_gate = _probe_gate_from_candidate_run(candidate_run)
-            output["probe_gate"] = probe_gate
             if probe_gate.get("action") == "execution_layer_rerun":
                 output["status"] = "probe_execution_layer_rerun_required"
+                output["evolution_exit_code"] = 2
                 output["note"] = (
                     "Probe observed provider/asset failure. Rerun the same candidate after "
                     "execution-layer repair; do not write rejection context."
                 )
+                output["report_path"] = _stage_report_path(args, output)
+                _write_json(output["report_path"], output)
                 return output
-            if probe_gate.get("action") == "round_level_rediagnosis":
-                rejection_path = _write_candidate_rejection_context_from_run(
-                    args,
-                    candidate_run,
-                    os.path.join(candidate_run, "candidate_rejection_context.json"),
-                )
-                memory = _annotate_and_record_candidate_history(
-                    args,
-                    iteration=iteration_index,
-                    parent_report_path=reference_report_path,
-                    parent_report=reference_report,
-                    candidate_run=candidate_run,
-                    candidate_bundle_path=_candidate_artifact_path(candidate_run),
-                    diagnosis_path=diagnosis_path,
-                    research_report_path=(codex_research or {}).get("report_path", ""),
-                    rejection_context_path=rejection_path,
-                    outcome_status="probe_rejected",
-                )
-                output["candidate_rejection_context"] = rejection_path
-                output["evolution_memory_index"] = memory.get("path", "")
-            elif probe_gate.get("action") in {
+            if probe_gate.get("action") in {
                 "codex_engineering_repair",
                 "codex_same_direction_behavior_iteration",
             }:
                 rejection_path = _write_candidate_rejection_context_from_run(
-                    args,
                     candidate_run,
                     os.path.join(candidate_run, "candidate_rejection_context.json"),
                 )
@@ -3268,64 +2445,26 @@ def run(args: argparse.Namespace) -> Dict:
                 )
                 output["candidate_rejection_context"] = rejection_path
                 output["evolution_memory_index"] = memory.get("path", "")
-    # ``all`` is the one-round convenience route.  Once its candidate passes
-    # the real smoke/probe gate, it must execute the same full evaluation and
-    # current-best decision as the explicit ``full_eval`` stage.  Previously
-    # it stopped at a successful probe, leaving a seemingly complete round
-    # without the mandatory initial/candidate full-eval artifact.
-    if (
-        args.stage == "all"
-        and output.get("candidate_run")
-        and (output.get("probe_gate") or {}).get("action") == "full_eval_candidate"
-    ):
-        saved_candidate_run = getattr(args, "candidate_run", "")
-        saved_candidate_bundle = getattr(args, "candidate_bundle", "")
-        saved_diagnosis_report = getattr(args, "diagnosis_report", "")
-        try:
-            args.candidate_run = output["candidate_run"]
-            args.candidate_bundle = _candidate_artifact_path(args.candidate_run)
-            args.diagnosis_report = diagnosis_path
-            full_exit = _run_full_eval_subprocess(args, reference_report_path)
-        finally:
-            args.candidate_run = saved_candidate_run
-            args.candidate_bundle = saved_candidate_bundle
-            args.diagnosis_report = saved_diagnosis_report
-        output["full_eval_exit_code"] = full_exit
-        if full_exit != 0:
-            output["status"] = "full_eval_failed"
-            output["failure_stage"] = "full_eval"
-            output["error"] = (
-                "Candidate passed smoke/probe but its mandatory full eval failed; "
-                "repair or rerun this same candidate before another evolution round."
-            )
+                output["status"] = "probe_requires_codex_feedback"
+                output["evolution_exit_code"] = 2
+            elif probe_gate.get("action") != "full_eval_candidate":
+                output["status"] = "unknown_probe_gate"
+                output["evolution_exit_code"] = 1
         else:
-            full_report_path = _find_full_eval_report(output["candidate_run"])
-            if not full_report_path:
-                raise RuntimeError(
-                    "full eval exited successfully without a persisted full_eval_report.json"
-                )
-            full_report = _read_json(full_report_path)
-            output["full_eval_report_path"] = full_report_path
-            output["post_full_eval_decision"] = full_report.get("post_full_eval_decision") or {}
-            memory = _annotate_and_record_candidate_history(
-                args,
-                iteration=iteration_index,
-                parent_report_path=reference_report_path,
-                parent_report=reference_report,
-                candidate_run=output["candidate_run"],
-                candidate_bundle_path=_candidate_artifact_path(output["candidate_run"]),
-                diagnosis_path=diagnosis_path,
-                research_report_path=(codex_research or {}).get("report_path", ""),
-                full_eval_report_path=full_report_path,
-            )
-            output["evolution_memory_index"] = memory.get("path", "")
+            output["status"] = "evolve_failed"
+            output["evolution_exit_code"] = 1
+            output["error"] = "The coding stage completed without a candidate artifact."
     if args.stage == "full_eval":
         full_exit = _run_full_eval_subprocess(
             args, reference_report_path
         )
         output["full_eval_exit_code"] = full_exit
+        if full_exit != 0:
+            output["status"] = "full_eval_failed"
         if not args.check_only and args.candidate_run:
             full_report_path = _find_full_eval_report(args.candidate_run)
+            if full_exit == 0 and not full_report_path:
+                raise RuntimeError("Full evaluation completed without its results report.")
             if full_report_path:
                 output["full_eval_report_path"] = full_report_path
                 full_report = _read_json(full_report_path)
@@ -3370,8 +2509,9 @@ def run(args: argparse.Namespace) -> Dict:
             )
             output["review_path"] = review_path
             output["evolution_memory_index"] = memory.get("path", "")
-        elif output["review_exit_code"] != 0 or (review_path and not review_is_consumable(_read_json(review_path))):
+        elif not args.check_only:
             output["status"] = "review_failed"
+            output["review_exit_code"] = output["review_exit_code"] or 1
             output["review_path"] = review_path
     output.setdefault(
         "status",
@@ -3383,15 +2523,15 @@ def run(args: argparse.Namespace) -> Dict:
     return output
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run staged, from-scratch MetaVideoAgent evolution")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run staged MetaVideoAgent initialization and automatic evolution")
     parser.add_argument("--workspace", default=DEFAULT_METAVIDEOAGENT_WORKSPACE)
     parser.add_argument("--distribution-manifest", required=True)
     parser.add_argument(
         "--stage",
         choices=(
             "initial", "diagnose", "codex_deep_research", "evolve",
-            "full_eval", "post_decision", "review", "all", "automatic",
+            "full_eval", "review", "automatic",
         ),
         default="initial",
     )
@@ -3400,17 +2540,15 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--output-root", default="",
                         help="Output root; defaults to ./metavideoagent_outputs")
+    parser.add_argument("--restart-from", choices=("diagnosis", "research", "codegen", "smoke", "probe", "full_eval"), default="")
     parser.add_argument("--iteration-index", type=int, default=0,
                         help=(
-                            "Explicit evolution iteration for staged recovery runs. "
-                            "Required when paths cannot identify the intended iter_N; "
-                            "prevents silent writes to iter_1."
+                            "Select iter_N explicitly; otherwise continue from run.json."
                         ))
     parser.add_argument("--reference-label", default="")
     parser.add_argument("--video-id", default="ALL")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--first-n", type=int, default=0)
-    parser.add_argument("--exec-llm-model", default=DEFAULT_EXECUTION_LLM_MODEL)
     parser.add_argument("--rebuild-structure", action="store_true")
     parser.add_argument("--structure-workers", type=int, default=4)
     parser.add_argument("--combo-id", default="")
@@ -3426,24 +2564,6 @@ def main() -> int:
                             "Persisted static/runtime-smoke candidate to resume with no-label "
                             "automatic engineering feedback. Used only by --stage evolve."
                         ))
-    parser.add_argument("--probe-feedback-round", type=int, default=1)
-    parser.add_argument("--attempt-tag", default="",
-                        help=(
-                            "Optional isolated subdirectory for a staged "
-                            "--probe-failed-run evolve attempt. It preserves the "
-                            "formal iter_N handoff while isolating new context, "
-                            "authoring output, and stage report."
-                        ))
-    parser.add_argument("--candidate-rejection-run", default="",
-                        help=(
-                            "Runnable candidate/probe run rejected by probe behavior. "
-                            "Used by --stage evolve as negative next-round context, "
-                            "not as same-candidate repair input."
-                        ))
-    parser.add_argument("--candidate-rejection-context", default="",
-                        help="Prebuilt candidate_rejection_context.json passed to candidate evolution")
-    parser.add_argument("--write-candidate-rejection-context", default="",
-                        help="Optional output path for context built from --candidate-rejection-run")
     parser.add_argument("--diagnosis-report", default="")
     parser.add_argument("--previous-diagnosis", default="",
                         help=(
@@ -3459,27 +2579,23 @@ def main() -> int:
     parser.add_argument("--review-out-dir", default="")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-post-eval-decision", action="store_true",
-                        help="Use heuristic post-full-eval decision instead of calling the LLM judge")
+                        help="Skip the optional model explanation of the train-selection result")
     parser.add_argument("--profile", default="")
+    parser.add_argument("--initialization", choices=("observe", "map"), default="observe",
+                        help="Initialize from distribution observations or map an existing agent; evolution is shared.")
+    parser.add_argument("--source-agent", default="", help="Curated existing-agent source directory for --initialization map.")
     parser.add_argument("--refresh-profile", action="store_true",
-                        help="Rebuild channel_profile.json even if it already exists")
+                        help="Repeat observation and rebuild initialization/profile.json.")
     parser.add_argument("--semantic-observer-mode", choices=("none", "plan", "observe"), default="observe",
                         help="Five-frame profile observer. observe calls the configured VLM; plan only extracts frames.")
     parser.add_argument("--semantic-observer-dir", default="")
     parser.add_argument("--semantic-video-budget", type=int, default=0)
     parser.add_argument("--semantic-observe-workers", type=int, default=1)
-    parser.add_argument(
-        "--vlm-model",
-        default=DEFAULT_EXECUTION_VLM_MODEL,
-        help="Execution VLM model; defaults to the paper-reproduction model.",
-    )
-    parser.add_argument("--asr-model", default="")
     parser.add_argument("--api-key", default="", help="Per-run provider API key; not persisted")
     parser.add_argument("--base-url", default="")
     parser.add_argument("--combo-plan", default="")
     parser.add_argument("--initial-baseline-bundle", default="")
     parser.add_argument("--out-dir", default="")
-    parser.add_argument("--skip-profile", action="store_true")
     parser.add_argument("--deep-research-summary", default="")
     parser.add_argument("--deep-research-report", default="")
     parser.add_argument("--skip-deep-research", action="store_true")
@@ -3492,32 +2608,21 @@ def main() -> int:
     parser.add_argument("--deep-research-max-queries", type=int, default=5)
     parser.add_argument("--research-min-sources", type=int, default=2,
                         help="Minimum verifiable sources required for deep research")
-    parser.add_argument("--auto-rounds", type=int, default=4,
-                        help="Number of evolution rounds for --stage automatic.")
+    parser.add_argument("--auto-rounds", type=int, default=None,
+                        help=("Total evolution-round budget for this run; new runs default to 4. "
+                              "Resuming without this option keeps the saved budget; a larger value extends it."))
     parser.add_argument("--codex-cli", default="",
                         help="Codex executable or a wrapper implementing the same command contract.")
     parser.add_argument("--research-codex-cli", default="",
                         help="Optional compatible executable used for Deep Research.")
     parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL,
-                        help=f"Codex model; reproduction default: {DEFAULT_CODEX_MODEL}.")
+                        help=f"Default coding model: {DEFAULT_CODEX_MODEL}.")
     parser.add_argument("--codex-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
-                        help=f"Codex reasoning effort; reproduction default: {DEFAULT_REASONING_EFFORT}.")
+                        help=f"Default coding reasoning effort: {DEFAULT_REASONING_EFFORT}.")
     parser.add_argument("--repair-attempts", type=int, default=3,
-                        help="Maximum automatic generate/repair attempts before probe")
+                        help="Additional source-assembly or smoke repair attempts before probe.")
     parser.add_argument("--probe-repair-attempts", type=int, default=2,
                         help="Bounded automatic repair attempts for failed probe outcomes")
-    parser.add_argument("--probe-feedback-rounds", type=int, default=None,
-                        help=(
-                            "Preferred name for probe-failed outer feedback rounds. "
-                            "Each round feeds the failed candidate and probe audit "
-                            "back to the coding-agent adapter for repair or regeneration."
-                        ))
-    parser.add_argument("--candidate-rounds", type=int, default=0,
-                        help=(
-                            "Maximum outer candidate+probe rounds. N implies at "
-                            "least N-1 probe feedback rounds unless explicitly "
-                            "overridden by --probe-feedback-rounds."
-                        ))
     parser.add_argument("--skip-probe-verification", action="store_true",
                         help="Stop candidate validation after assembly and smoke; do not run probe")
     parser.add_argument("--run", action="store_true",
@@ -3529,8 +2634,20 @@ def main() -> int:
         initial_codex_cli="",
         codegen_timeout=900,
     )
-    args = parser.parse_args()
-    codex_stages = {"initial", "evolve", "automatic", "all"}
+    return parser
+
+
+def _report_exit_code(report: Dict) -> int:
+    for key in ("automatic_exit_code", "full_eval_exit_code", "evolution_exit_code", "review_exit_code"):
+        code = int(report.get(key) or 0)
+        if code:
+            return code
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    codex_stages = {"initial", "evolve", "automatic"}
     if args.stage in codex_stages:
         try:
             args.codex_runtime_settings = resolve_codex_runtime_settings(
@@ -3543,14 +2660,6 @@ def main() -> int:
         os.environ["CODEX_REASONING_EFFORT"] = args.codex_runtime_settings["reasoning_effort"]
     else:
         args.codex_runtime_settings = {}
-    if args.probe_feedback_rounds is not None:
-        args.probe_repair_attempts = args.probe_feedback_rounds
-    if args.candidate_rounds and args.probe_feedback_rounds is None:
-        args.probe_repair_attempts = max(
-            int(args.probe_repair_attempts or 0),
-            max(0, int(args.candidate_rounds) - 1),
-        )
-
     from run_journal import append_operation
     started_at = time.time()
     try:
@@ -3560,28 +2669,17 @@ def main() -> int:
                          args=args, started_at=started_at, status="failed", error=str(exc))
         raise
     operation_status = "checked" if args.check_only else "completed"
-    if int(report.get("automatic_exit_code") or 0) != 0:
-        operation_status = str(report.get("automatic_outcome") or "failed")
+    exit_code = _report_exit_code(report)
+    if exit_code:
+        operation_status = str(report.get("automatic_outcome") or ("incomplete" if exit_code == 2 else "failed"))
     append_operation(output_root=args.output_root, run_id=args.run_id, stage=args.stage,
                      args=args, started_at=started_at,
                      status=operation_status, report=report)
-    exit_code = 0
-    exit_label = ""
-    if "full_eval_exit_code" in report and int(report.get("full_eval_exit_code") or 0) != 0:
-        exit_code = int(report.get("full_eval_exit_code") or 1)
-        exit_label = "full_eval_exit_code"
-    elif "evolution_exit_code" in report:
-        exit_code = int(report.get("evolution_exit_code") or 0)
-        exit_label = "evolution_exit_code"
-    elif "automatic_exit_code" in report:
-        exit_code = int(report.get("automatic_exit_code") or 0)
-        exit_label = "automatic_exit_code"
     print("METAVIDEOAGENT_EVOLUTION_DONE" if exit_code == 0 else "METAVIDEOAGENT_EVOLUTION_STOPPED")
     print(f"report_path={report.get('report_path')}")
     print(f"reference_report_path={report.get('reference_report_path')}")
     print(f"reference_results_path={report.get('reference_results_path')}")
-    if exit_label:
-        print(f"{exit_label}={exit_code}")
+    print(f"exit_code={exit_code}")
     return exit_code
 
 

@@ -6,7 +6,11 @@
   "modules": {
     "video_structuring": {
       "base_class": "VideoStructuringBase",
-      "base_import": "from video_structuring_modules import VideoStructuringBase",
+      "base_import": "from evolution.runtime_bases import VideoStructuringBase",
+      "optional_build_hook": {
+        "buildStructure": "(self, env)",
+        "effect": "Replaces the generic build and persists canonical time-bounded records or media references at self.db_path."
+      },
       "methods": {
         "__init__": "(self, workspace_dir, video_id, struct_type='', custom_config=None, requires_vector_db=False)",
         "addStructure": "(self, **kwargs)",
@@ -16,7 +20,7 @@
     },
     "localization": {
       "base_class": "LocalizationBase",
-      "base_import": "from localization_modules import LocalizationBase",
+      "base_import": "from evolution.runtime_bases import LocalizationBase",
       "methods": {
         "__init__": "(self, env, struct_db=None, custom_config=None)",
         "make_localization_result": "(self, tool_name, *, status, time_ranges=None, structure_records=None, perception_requests=None, evidence=None, error='', request=None)"
@@ -24,7 +28,7 @@
     },
     "perception": {
       "base_class": "PerceptionBase",
-      "base_import": "from perception_modules import PerceptionBase",
+      "base_import": "from evolution.runtime_bases import PerceptionBase",
       "methods": {
         "__init__": "(self, env, struct_db=None, custom_config=None)",
         "make_perception_result": "(self, tool_name, *, status, time_ranges=None, evidence=None, error='', request=None)",
@@ -33,7 +37,7 @@
     },
     "memory": {
       "base_class": "WorkMemoryBase",
-      "base_import": "from memory_modules import WorkMemoryBase",
+      "base_import": "from evolution.runtime_bases import WorkMemoryBase",
       "methods": {
         "__init__": "(self, workspace_dir, video_id, question, custom_config=None)",
         "set_combo": "(self, combo)",
@@ -46,12 +50,14 @@
     },
     "thinking": {
       "base_class": "ThinkingBase",
-      "base_import": "from thinking_module import ThinkingBase",
+      "base_import": "from evolution.runtime_bases import ThinkingBase",
       "methods": {
         "__init__": "(self, env, custom_config=None)",
         "__call__": "(*args, **kwargs)",
         "set_runtime_context": "(self, context)",
         "get_runtime_context": "(self)",
+        "normalize_plan": "(payload)",
+        "get_recent_module_results": "(self)",
         "finish_payload": "(self, answer, answer_type='unknown', confidence=0.0, evidence_summary='')"
       }
     }

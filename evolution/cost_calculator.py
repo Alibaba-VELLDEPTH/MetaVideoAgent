@@ -31,16 +31,13 @@ W_CALLS = 0.3
 W_TOKENS = 0.2
 W_LATENCY = 0.1
 
-# Hard constraint: the evolution cost must not exceed 1.2 times the baseline
-MAX_COST_RATIO = 1.2
-
 
 def _looks_like_visual_tool(action: str, observation: str = "") -> bool:
     text = f"{action} {observation[:500]}".lower()
     visual_terms = (
         "visual", "vision", "vlm", "ocr", "frame", "image", "video",
         "perception", "observe", "verify", "evidence_window",
-        "Vision", "picture", "frame extraction", "pictures", "video", "Review",
+        "picture", "review",
     )
     return any(term in text for term in visual_terms)
 
@@ -49,14 +46,14 @@ def _looks_like_retrieval_tool(action: str, observation: str = "") -> bool:
     text = f"{action} {observation[:500]}".lower()
     retrieval_terms = (
         "retrieve", "retrieval", "search", "localize", "locate", "window",
-        "structure", "semantic", "embedding", "Search", "Positioning", "structure",
+        "structure", "semantic", "embedding", "positioning",
     )
     return any(term in text for term in retrieval_terms)
 
 
 def _looks_like_audio_tool(action: str, observation: str = "") -> bool:
     text = f"{action} {observation[:500]}".lower()
-    audio_terms = ("audio", "asr", "speech", "transcript", "voice", "Audio", "Voice", "Transcribe")
+    audio_terms = ("audio", "asr", "speech", "transcript", "voice", "transcribe")
     return any(term in text for term in audio_terms)
 
 
@@ -172,9 +169,8 @@ def cost_score(metrics: Dict[str, float]) -> float:
     )
 
 
-
 def compute_reference_cost(reference_entries: List[dict]) -> Dict:
-    """Compute the same budget from explicit reference trajectories."""
+    """Compute per-question costs from the executed current-best reference."""
     entries = [entry for entry in reference_entries or [] if isinstance(entry, dict)]
     if not entries:
         return {"error": "reference trajectories are empty"}
@@ -192,32 +188,6 @@ def compute_reference_cost(reference_entries: List[dict]) -> Dict:
     return {
         "per_question_avg": avg_metrics,
         "cost_score_avg": round(avg_score, 4),
-        "cost_budget": round(avg_score * MAX_COST_RATIO, 4),
-        "max_cost_ratio": MAX_COST_RATIO,
         "sample_size": n,
         "source": "explicit_reference",
     }
-
-
-def format_cost_budget(baseline_result: Dict) -> str:
-    """Format the reference cost budget for a diagnosis prompt."""
-    if "error" in baseline_result:
-        return f"Cost data unavailable: {baseline_result['error']}"
-
-    avg = baseline_result["per_question_avg"]
-    score = baseline_result["cost_score_avg"]
-    budget = baseline_result["cost_budget"]
-    ratio = baseline_result["max_cost_ratio"]
-
-    return f"""## Cost reference
-
-Current reference average cost per question:
-- VLM frames: {avg['frames']:.0f} across {avg['vlm_calls']:.1f} calls
-- LLM calls: {avg['llm_calls']:.1f}
-- Estimated tokens: {avg['total_tokens']:.0f}
-- Latency: {avg['latency_sec']:.1f} seconds
-- Aggregate cost score: {score:.4f}
-
-Prioritize measurable effectiveness, then cost. A candidate may increase cost by
-at most {(ratio - 1) * 100:.0f}% (`cost_score <= {budget:.4f}`). Prefer the lower-cost
-candidate when effectiveness is otherwise equivalent."""

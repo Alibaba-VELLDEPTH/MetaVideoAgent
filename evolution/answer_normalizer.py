@@ -3,8 +3,8 @@
 The execution layer should keep a stable final-answer outlet, but benchmarks
 still differ: some store gold answers as option labels, some as option text,
 and some datasets store gold text under ``task_meta.answer`` while
-choices may span A-G or beyond.  This module centralizes answer parsing so
-evolution reports, probes, and reviews do not depend on stale A-D assumptions.
+choices may span A-G or beyond. This module shares answer parsing across
+evolution reports, probes and reviews.
 """
 
 from __future__ import annotations

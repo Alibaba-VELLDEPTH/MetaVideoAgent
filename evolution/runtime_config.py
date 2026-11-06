@@ -8,9 +8,6 @@ from typing import Iterable
 _CLI_ENV = {
     "--api-key": "METAVIDEOAGENT_API_KEY",
     "--base-url": "METAVIDEOAGENT_BASE_URL",
-    "--exec-llm-model": "METAVIDEOAGENT_LLM_MODEL",
-    "--llm-model": "METAVIDEOAGENT_LLM_MODEL",
-    "--asr-model": "METAVIDEOAGENT_ASR_MODEL",
 }
 
 

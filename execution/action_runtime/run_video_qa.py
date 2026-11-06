@@ -1,7 +1,6 @@
 import json
 import os
 import threading
-import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Lock
 
@@ -299,13 +298,21 @@ def _process_single_clip_full(clip_index, start_sec, end_sec, physics, api_cfg, 
                               asr_executor=None):
     """Extract frames, submit ASR and VLM independently, then merge evidence."""
     try:
-        frames_per_clip = physics.get("frames_per_clip_parallel", 10)
+        frames_per_clip = int(physics.get("frames_per_clip", 4))
+        if frames_per_clip < 1:
+            raise ValueError("physics.frames_per_clip must be positive")
         clip_frames = []
+        frame_assets = []
         step = (end_sec - start_sec) / frames_per_clip
         for i in range(frames_per_clip):
-            f_path = env.get_frame_at_timestamp(start_sec + i * step)
+            timestamp = start_sec + i * step
+            f_path = env.get_frame_at_timestamp(timestamp)
             if f_path:
                 clip_frames.append(f_path)
+                frame_assets.append({
+                    "kind": "frame", "timestamp_sec": round(timestamp, 4),
+                    "path": f_path, "status": "available",
+                })
         if not clip_frames:
             print(f"      ⚠️ [Clip {clip_index}] No valid frame, skip")
             return (clip_index, start_sec, end_sec, False)
@@ -359,53 +366,9 @@ def _process_single_clip_full(clip_index, start_sec, end_sec, physics, api_cfg, 
             except Exception as exc:
                 asr_status, asr_error = "api_error", str(exc)
                 print(f"      ⚠️ [Clip {clip_index}] ASR worker failed: {exc}")
-        frame_assets = [
-            {"kind": "frame", "timestamp_sec": round(start_sec + i * step, 4), "path": path, "status": "available"}
-            for i, path in enumerate(clip_frames)
-        ]
         if vlm_status != "ok":
-            # A provider safety filter is not evidence about the video.  In
-            # an explicitly enabled formal-recovery pass, retain the bounded
-            # media provenance and any independently collected ASR result,
-            # but never manufacture a visual description or treat this as a
-            # successful VLM observation.  The thinking module can then use
-            # the explicit limitation as context rather than silently losing
-            # the time range altogether.
-            safety_blocked = "datainspectionfailed" in response_text.lower()
-            persist_blocked = os.environ.get(
-                "METAVIDEOAGENT_PERSIST_VLM_SAFETY_BLOCKED", ""
-            ).lower() in ("1", "true", "yes")
-            if not (safety_blocked and persist_blocked):
-                print(f"      ⚠️ [Clip {clip_index}] VLM returned {vlm_status}; evidence record not persisted")
-                return (clip_index, start_sec, end_sec, False)
-            with _jsonl_write_lock:
-                struct_db.addStructure(
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    multimodal_narration=(
-                        "Visual perception unavailable for this bounded clip: "
-                        "the VLM provider safety filter blocked the response. "
-                        "No visual claim is recorded; do not infer visual details "
-                        "from this placeholder."
-                    ),
-                    asr_text=transcript,
-                    asr_status=asr_status,
-                    asr_error=asr_error,
-                    media_assets=frame_assets,
-                    builder_request={
-                        "artifact_type": "metavideoagent_structure_build_request", "schema_version": 1,
-                        "window": {"start_sec": start_sec, "end_sec": end_sec},
-                        "requested_modalities": ["frames"] + (["audio_asr"] if needs_asr else []),
-                        "vlm_profile_id": utils.DEFAULT_PROFILE_IDS["vlm"],
-                        "asr_profile_id": utils.DEFAULT_PROFILE_IDS["asr"] if needs_asr else "",
-                        "vlm_status": "provider_safety_blocked",
-                        "vlm_error": response_text,
-                        "sensor_execution": "asr_vlm_independent_then_merged",
-                    },
-                    source="generated_segment_builder_provider_safety_fallback",
-                )
-            print(f"      ⚠️ [Clip {clip_index}] VLM provider safety block persisted without visual inference")
-            return (clip_index, start_sec, end_sec, True)
+            print(f"      ⚠️ [Clip {clip_index}] VLM returned {vlm_status}; evidence record not persisted")
+            return (clip_index, start_sec, end_sec, False)
         with _jsonl_write_lock:
             struct_db.addStructure(
                 start_sec=start_sec, end_sec=end_sec, multimodal_narration=res,
@@ -466,23 +429,6 @@ def _build_generated_segment_structure(env, struct_db):
         max_workers = max(int(max_workers or 1), configured_inflight_workers)
     video_length = env.video_length_secs
     build_windows = _structure_build_windows(video_length)
-    resume_build = os.environ.get("VIDEO_STRUCT_RESUME_BUILD", "").lower() in ("1", "true", "yes")
-    existing_ranges = set()
-    if resume_build and os.path.exists(struct_db.db_path):
-        try:
-            with open(struct_db.db_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    r = json.loads(line)
-                    existing_ranges.add((round(float(r.get("start_sec", -1)), 3),
-                                         round(float(r.get("end_sec", -1)), 3)))
-            if existing_ranges:
-                print(f"   [Generated Build] Resuming after {len(existing_ranges)} completed clips.")
-        except Exception as e:
-            print(f"   [Generated Build] Could not read the existing JSONL; rebuilding normally: {e}")
-            existing_ranges = set()
-
     # Step 1: Generate clip interval list
     print("[Generated Build] Preparing clip intervals...")
     clip_ranges = []
@@ -490,9 +436,6 @@ def _build_generated_segment_structure(env, struct_db):
     for start_sec, end_sec in _iter_window_clip_ranges(build_windows, interval):
         if end_sec <= start_sec:
             break
-        key = (round(float(start_sec), 3), round(float(end_sec), 3))
-        if key in existing_ranges:
-            continue
         clip_idx += 1
         clip_ranges.append((clip_idx, start_sec, end_sec))
 
@@ -596,28 +539,10 @@ def build_video_structure(env, struct_db):
     modality = api_cfg.get("input_modality", "clip_frames")
 
     # Check whether records already exist to avoid repeated database creation
-    resume_build = os.environ.get("VIDEO_STRUCT_RESUME_BUILD", "").lower() in ("1", "true", "yes")
-    if os.path.exists(struct_db.db_path) and os.path.getsize(struct_db.db_path) > 0 and not resume_build:
-        # Rebuild an artifact containing only failed provider responses.
-        try:
-            with open(struct_db.db_path, "r", encoding="utf-8") as _f:
-                _lines = [line.strip() for line in _f if line.strip()]
-            _all_error = (
-                all("Error calling VLM API" in line or '"Error' in line for line in _lines)
-                if _lines else False
-            )
-            if not _all_error:
-                print(f"[Structure] Reusing existing {struct_type} records.")
-                _finish_cost_capture()
-                return
-            print(f"[Structure] Existing {struct_type} records contain only errors; rebuilding.")
-            backup_path = f"{struct_db.db_path}.error_backup.{int(time.time())}"
-            os.replace(struct_db.db_path, backup_path)
-            print(f"   Preserved the failed JSONL at: {backup_path}")
-        except Exception:
-            print(f"[Structure] Reusing existing {struct_type} records.")
-            _finish_cost_capture()
-            return
+    if os.path.exists(struct_db.db_path) and os.path.getsize(struct_db.db_path) > 0:
+        print(f"[Structure] Reusing existing {struct_type} records.")
+        _finish_cost_capture()
+        return
 
     print(f"[Structure] Building records | type={struct_type} | modality={modality}")
 

@@ -5,9 +5,25 @@ generated modules. It does not prescribe an algorithm or default policy. Every
 bundle must provide `video_structuring`, `localization`, `perception`, `memory`,
 and `thinking` implementations.
 
-The exact Python signatures, default arguments, return shapes, and minimal call
-examples in `generated_runtime_abi_witness.json` are authoritative. If this
-document and that witness differ, follow the witness.
+See `generated_runtime_abi_witness.json` for Python signatures, default
+arguments, return shapes and minimal call examples.
+
+Import shared base classes from `evolution.runtime_bases`. The authoring
+workspace includes this module alongside the execution SDK. Strategy source
+files can then be imported and checked independently of the runtime's module
+registries.
+
+Module records select an exact class and contain the complete source file.
+Shared helpers, prompts and configuration travel in `support_files` under
+`agent/`, with package-relative imports and resource paths. Evolution uses
+`agent.json` to retain or change the selected entrypoints and `implementation.md`
+to carry implementation reasoning and pending checks.
+Each module record and its `agent.json` entry declares `resources`, listing
+the helper/resource files it uses, including transitive imports and package
+initializers. Shared files are listed by each consumer. Per-class
+`custom_configs` affect that module; `custom_configs.agent` belongs to thinking.
+The structure cache follows video_structuring's source, declared resources
+and configuration rather than unrelated files in the bundle.
 
 ## Data flow
 
@@ -24,6 +40,14 @@ manages the context of one question; it is not a substitute for the structure
 store. Persist the request, normalized result, capability events, consumption
 events, and final decision in the trajectory. Smoke repair, probe feedback, and
 review all depend on this complete trajectory.
+
+Handoff checks use linked runtime consumption events. For localization to
+perception, a successful perception request within the produced time ranges
+also records delivery of those ranges. Structure reads record the store and
+the consumer that received the retrieval result. Invoking the downstream module alone
+does not establish a handoff, and delivery does not prove how its evidence
+affected the final answer. Conditional paths absent from a trajectory are
+reported as not exercised.
 
 ## Shared time, status, and provider rules
 
@@ -58,6 +82,12 @@ _get_api_params(...)
 
 These methods may be inherited from `VideoStructuringBase`; an implementation
 only needs to override the behavior required by its generated strategy.
+
+Optional build hook: `buildStructure(env) -> None`. When present, the runtime
+calls it instead of its generic segment builder. It must use bounded inputs
+through registered runtime adapters and persist canonical time-bounded records
+or media references at `self.db_path`. `addStructure` remains the persistence
+and indexing boundary; it must not initiate another model call.
 
 `retrieveStructure` accepts `query`, `top_k`, `start_sec`, and `end_sec` as
 keyword arguments and returns search evidence as text. An override must retain
@@ -138,7 +168,10 @@ adapters and must preserve raw responses and parsed claims.
 
 Construction ABI: `__init__(env, struct_db=None, custom_config=None)`. Public
 tool methods use `tool_<name>`. Parse requested ranges with
-`self._parse_time_ranges` so they remain inside the active media window.
+`self._parse_time_ranges` to normalize their format. Use
+`runtime_evidence.inspect_time_ranges` or `runtime_evidence.transcribe_time_ranges`
+for localized media access; these adapters intersect the requested ranges with
+the active media window.
 
 Return `self.make_perception_result(...)` or an equivalent envelope:
 
@@ -171,9 +204,9 @@ get_context_packet, export_trajectory, save_session
 ```
 
 `get_context_packet()` returns a structured object containing
-`protocol_version`, `kind="memory_context"`, `recent_events`, and
-`latest_module_results`. New thinking modules should consume the structured
-memory available through `get_runtime_context()["memory"]`.
+`protocol_version`, `kind="memory_context"` and `recent_events`. Thinking reads
+this packet through `get_runtime_context()["memory"]`; the complete results of
+the latest tool batch are available through `get_recent_module_results()`.
 
 ## 5. thinking
 
@@ -194,6 +227,14 @@ with `localization_request(...)` or `perception_request(...)`. Construct a
 `finish` payload with `finish_payload(...)` or an equivalent object containing
 at least `answer`; it may also include `answer_type`, `answer_confidence`, and
 `evidence_summary`.
+
+`normalize_plan` accepts a list or an object with a `plan` list and preserves
+each item's metadata. For a source agent using native tool calling, keep the
+assistant message and each call's ID in `native_assistant_message` and
+`native_tool_call` on the corresponding plan item. The next thinking context
+contains every result from that tool batch, with those fields attached, so the
+agent can reconstruct its original tool messages without losing call IDs or
+truncating the batch. Native chat is exposed by `runtime_evidence.call_chat_llm`.
 
 ## Candidate verification
 

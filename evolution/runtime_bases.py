@@ -1,10 +1,8 @@
 """Stable five-module ABI bases for dynamically injected MetaVideoAgent bundles.
 
-Candidate bundles are data artifacts. They must never replace the runtime
-modules that provide their base classes: doing so makes a normal import such
-as ``from memory_modules import WorkMemoryBase`` import the candidate file
-itself.  These neutral bases keep the execution ABI separate from generated
-strategy code for smoke, repair, probe, and full evaluation alike.
+Generated strategies inherit these interfaces for smoke, repair, probe and
+full evaluation. Candidate source packages carry the strategy implementation;
+the runtime provides persistence, protocol and dispatch helpers.
 """
 
 from __future__ import annotations
@@ -333,6 +331,10 @@ class ThinkingBase:
 
     def get_recent_module_results(self):
         return list(self._runtime_context.get("recent_module_results") or [])
+
+    @staticmethod
+    def normalize_plan(payload):
+        return list(payload.get("plan") or []) if isinstance(payload, dict) else list(payload or [])
 
     def parse_runtime_options(self, question):
         text = str(question or "")
